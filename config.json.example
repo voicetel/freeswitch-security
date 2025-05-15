@@ -1,0 +1,55 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": "8080",
+    "log_requests": false,
+    "log_responses": false
+  },
+  "freeswitch": {
+    "default_domain": "example.com"
+  },
+  "cache": {
+    "enabled": true,
+    "security_ttl": "5m",
+    "cleanup_interval": "5m",
+    "max_entries_in_window": 10000,
+    "max_entry_size": 500,
+    "shard_count": 1024
+  },
+  "security": {
+    "enabled": true,
+    "esl_host": "127.0.0.1",
+    "esl_port": "8021",
+    "esl_password": "ClueCon",
+    "max_failed_attempts": 5,
+    "failed_attempts_window": "10m",
+    "auto_block_enabled": true,
+    "block_duration": "1h",
+    "whitelist_enabled": true,
+    "whitelist_ttl": "24h",
+    "trusted_networks": [
+      "127.0.0.1/8",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ],
+    "untrusted_networks": ["1.1.1.1","ec2-1-1-1-1.IP.PTR.compute.amazonaws.com"],
+    "iptables_chain": "FREESWITCH",
+    "auto_whitelist_on_success": true,
+    "esl_log_level": "info",
+    "reconnect_backoff": "5s",
+    "max_wrong_call_states": 5,
+    "wrong_call_state_window": "10m",
+    "rate_limit": {
+      "enabled": true,
+      "call_rate_limit": 20,
+      "call_rate_interval": "1m",
+      "registration_limit": 10,
+      "registration_window": "1m",
+      "auto_block_on_exceed": true,
+      "block_duration": "15m",
+      "whitelist_bypass": true,
+      "cleanup_interval": "5m"
+    }
+  }
+}

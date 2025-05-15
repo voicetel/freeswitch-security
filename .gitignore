@@ -20,6 +20,14 @@
 # Go workspace file
 go.work
 go.work.sum
+go.mod
+go.sum
 
 # env file
 .env
+
+# bin as per instructions
+freeswitch-security
+
+# config file
+config.json

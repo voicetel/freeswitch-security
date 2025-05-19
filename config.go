@@ -47,14 +47,14 @@ type AppConfig struct {
 		MaxWrongCallStates     int      `json:"max_wrong_call_states"`
 		WrongCallStateWindow   string   `json:"wrong_call_state_window"`
 		RateLimit              struct {
-			Enabled            *bool  `json:"enabled"`
+			Enabled            bool   `json:"enabled"`
 			CallRateLimit      int    `json:"call_rate_limit"`
 			CallRateInterval   string `json:"call_rate_interval"`
 			RegistrationLimit  int    `json:"registration_limit"`
 			RegistrationWindow string `json:"registration_window"`
-			AutoBlockOnExceed  *bool  `json:"auto_block_on_exceed"`
+			AutoBlockOnExceed  bool   `json:"auto_block_on_exceed"`
 			BlockDuration      string `json:"block_duration"`
-			WhitelistBypass    *bool  `json:"whitelist_bypass"`
+			WhitelistBypass    bool   `json:"whitelist_bypass"`
 			CleanupInterval    string `json:"cleanup_interval"`
 		} `json:"rate_limit"`
 	} `json:"security"`
@@ -106,12 +106,24 @@ func LoadConfig(path string) (*AppConfig, error) {
 			"172.16.0.0/12",
 			"192.168.0.0/16",
 		}
+		config.Security.UntrustedNetworks = []string{}
 		config.Security.IPTablesChain = "FREESWITCH"
 		config.Security.AutoWhitelistOnSuccess = true
 		config.Security.ESLLogLevel = "info"
 		config.Security.ReconnectBackoff = "5s"
 		config.Security.MaxWrongCallStates = 5
 		config.Security.WrongCallStateWindow = "10m"
+
+		// Rate Limit defaults - centralized here
+		config.Security.RateLimit.Enabled = true
+		config.Security.RateLimit.CallRateLimit = 20
+		config.Security.RateLimit.CallRateInterval = "1m"
+		config.Security.RateLimit.RegistrationLimit = 10
+		config.Security.RateLimit.RegistrationWindow = "1m"
+		config.Security.RateLimit.AutoBlockOnExceed = true
+		config.Security.RateLimit.BlockDuration = "15m"
+		config.Security.RateLimit.WhitelistBypass = true
+		config.Security.RateLimit.CleanupInterval = "5m"
 
 		// Check if config file exists
 		if _, err := os.Stat(path); err == nil {
@@ -269,5 +281,46 @@ func loadEnvironmentVariables(config *AppConfig) {
 		if err := json.Unmarshal([]byte(trustedNetworks), &networks); err == nil {
 			config.Security.TrustedNetworks = networks
 		}
+	}
+
+	// Added environment variable for untrusted networks
+	if untrustedNetworks := os.Getenv("SECURITY_UNTRUSTED_NETWORKS"); untrustedNetworks != "" {
+		var networks []string
+		if err := json.Unmarshal([]byte(untrustedNetworks), &networks); err == nil {
+			config.Security.UntrustedNetworks = networks
+		}
+	}
+
+	// Rate Limit environment variables
+	if rateLimitEnabled := os.Getenv("SECURITY_RATE_LIMIT_ENABLED"); rateLimitEnabled != "" {
+		config.Security.RateLimit.Enabled = (rateLimitEnabled == "true" || rateLimitEnabled == "1" || rateLimitEnabled == "yes")
+	}
+	if callRateLimit := os.Getenv("SECURITY_RATE_LIMIT_CALL_LIMIT"); callRateLimit != "" {
+		if val, err := strconv.Atoi(callRateLimit); err == nil {
+			config.Security.RateLimit.CallRateLimit = val
+		}
+	}
+	if callRateInterval := os.Getenv("SECURITY_RATE_LIMIT_CALL_INTERVAL"); callRateInterval != "" {
+		config.Security.RateLimit.CallRateInterval = callRateInterval
+	}
+	if registrationLimit := os.Getenv("SECURITY_RATE_LIMIT_REG_LIMIT"); registrationLimit != "" {
+		if val, err := strconv.Atoi(registrationLimit); err == nil {
+			config.Security.RateLimit.RegistrationLimit = val
+		}
+	}
+	if registrationWindow := os.Getenv("SECURITY_RATE_LIMIT_REG_WINDOW"); registrationWindow != "" {
+		config.Security.RateLimit.RegistrationWindow = registrationWindow
+	}
+	if autoBlockOnExceed := os.Getenv("SECURITY_RATE_LIMIT_AUTO_BLOCK"); autoBlockOnExceed != "" {
+		config.Security.RateLimit.AutoBlockOnExceed = true
+	}
+	if rateLimitBlockDuration := os.Getenv("SECURITY_RATE_LIMIT_BLOCK_DURATION"); rateLimitBlockDuration != "" {
+		config.Security.RateLimit.BlockDuration = rateLimitBlockDuration
+	}
+	if whitelistBypass := os.Getenv("SECURITY_RATE_LIMIT_WHITELIST_BYPASS"); whitelistBypass != "" {
+		config.Security.RateLimit.WhitelistBypass = (whitelistBypass == "true" || whitelistBypass == "1" || whitelistBypass == "yes")
+	}
+	if rateLimitCleanupInterval := os.Getenv("SECURITY_RATE_LIMIT_CLEANUP_INTERVAL"); rateLimitCleanupInterval != "" {
+		config.Security.RateLimit.CleanupInterval = rateLimitCleanupInterval
 	}
 }

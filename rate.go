@@ -56,21 +56,21 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 	}
 
 	// Override with config if available
-	if config.Security.RateLimit.Enabled != nil {
-		rateConfig.Enabled = *config.Security.RateLimit.Enabled
+	if config.Security.RateLimit.Enabled == true {
+		rateConfig.Enabled = config.Security.RateLimit.Enabled
 		rateConfig.CallRateLimit = config.Security.RateLimit.CallRateLimit
 		rateConfig.CallRateInterval = config.Security.RateLimit.CallRateInterval
 		rateConfig.RegistrationLimit = config.Security.RateLimit.RegistrationLimit
 		rateConfig.RegistrationWindow = config.Security.RateLimit.RegistrationWindow
 
-		if config.Security.RateLimit.AutoBlockOnExceed != nil {
-			rateConfig.AutoBlockOnExceed = *config.Security.RateLimit.AutoBlockOnExceed
+		if config.Security.RateLimit.AutoBlockOnExceed == true {
+			rateConfig.AutoBlockOnExceed = config.Security.RateLimit.AutoBlockOnExceed
 		}
 
 		rateConfig.BlockDuration = config.Security.RateLimit.BlockDuration
 
-		if config.Security.RateLimit.WhitelistBypass != nil {
-			rateConfig.WhitelistBypass = *config.Security.RateLimit.WhitelistBypass
+		if config.Security.RateLimit.WhitelistBypass == true {
+			rateConfig.WhitelistBypass = config.Security.RateLimit.WhitelistBypass
 		}
 
 		rateConfig.CleanupInterval = config.Security.RateLimit.CleanupInterval

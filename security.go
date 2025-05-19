@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os/exec"
 	"strings"
@@ -102,6 +101,7 @@ var (
 func InitSecurityManager() error {
 	var err error
 	secManagerOnce.Do(func() {
+		logger := GetLogger()
 		config := GetConfig()
 
 		// Initialize the security configuration with defaults if not present
@@ -121,12 +121,15 @@ func InitSecurityManager() error {
 			WrongCallStateWindow:   config.Security.WrongCallStateWindow,
 		}
 
+		// Initialize logger with config
+		logger.SetLogLevelFromString(config.Security.ESLLogLevel)
+
 		// Parse trusted networks
 		var trustedNetworks []*net.IPNet
 		for _, networkStr := range secConfig.TrustedNetworks {
 			_, network, err := net.ParseCIDR(networkStr)
 			if err != nil {
-				log.Printf("Error parsing trusted network %s: %v", networkStr, err)
+				logger.Error("Error parsing trusted network %s: %v", networkStr, err)
 				continue
 			}
 			trustedNetworks = append(trustedNetworks, network)
@@ -149,34 +152,34 @@ func InitSecurityManager() error {
 		}
 
 		// Log initialization info
-		log.Printf("Security manager initialized")
-		log.Printf("Whitelist settings - Enabled: %t, TTL: %s, Auto-whitelist: %t",
+		logger.Info("Security manager initialized")
+		logger.Info("Whitelist settings - Enabled: %t, TTL: %s, Auto-whitelist: %t",
 			secConfig.WhitelistEnabled, secConfig.WhitelistTTL, secConfig.AutoWhitelistOnSuccess)
-		log.Printf("Blacklist settings - Auto-block: %t, Max attempts: %d, Window: %s, Duration: %s",
+		logger.Info("Blacklist settings - Auto-block: %t, Max attempts: %d, Window: %s, Duration: %s",
 			secConfig.AutoBlockEnabled, secConfig.MaxFailedAttempts, secConfig.FailedAttemptsWindow, secConfig.BlockDuration)
 
 		// Log untrusted networks
 		if len(secConfig.UntrustedNetworks) > 0 {
-			log.Printf("Untrusted networks loaded - Count: %d", len(secConfig.UntrustedNetworks))
+			logger.Info("Untrusted networks loaded - Count: %d", len(secConfig.UntrustedNetworks))
 			for i, pattern := range secConfig.UntrustedNetworks {
-				log.Printf("  Untrusted pattern #%d: %s", i+1, pattern)
+				logger.Info("  Untrusted pattern #%d: %s", i+1, pattern)
 			}
 		} else {
-			log.Printf("No untrusted networks configured")
+			logger.Info("No untrusted networks configured")
 		}
 
 		// Ensure the iptables chain exists
 		if secConfig.AutoBlockEnabled {
 			err = ensureIPTablesChain(secConfig.IPTablesChain)
 			if err != nil {
-				log.Printf("Warning: Failed to set up iptables chain: %v", err)
+				logger.Error("Warning: Failed to set up iptables chain: %v", err)
 			} else {
-				log.Printf("Successfully configured iptables chain: %s", secConfig.IPTablesChain)
+				logger.Info("Successfully configured iptables chain: %s", secConfig.IPTablesChain)
 			}
 		}
 
 		// Start cleanup routine
-		log.Println("Starting periodic cleanup routine")
+		logger.Info("Starting periodic cleanup routine")
 		go securityManager.startCleanupRoutine()
 	})
 
@@ -187,7 +190,7 @@ func InitSecurityManager() error {
 func GetSecurityManager() *SecurityManager {
 	if securityManager == nil {
 		if err := InitSecurityManager(); err != nil {
-			log.Printf("Error initializing security manager: %v", err)
+			GetLogger().Error("Error initializing security manager: %v", err)
 		}
 	}
 	return securityManager
@@ -195,6 +198,8 @@ func GetSecurityManager() *SecurityManager {
 
 // AddToWhitelist adds an IP address to the whitelist
 func (sm *SecurityManager) AddToWhitelist(ipAddress, userId, domain string, permanent bool) error {
+	logger := GetLogger()
+
 	// Validate IP address
 	if net.ParseIP(ipAddress) == nil {
 		return fmt.Errorf("invalid IP address: %s", ipAddress)
@@ -203,7 +208,7 @@ func (sm *SecurityManager) AddToWhitelist(ipAddress, userId, domain string, perm
 	now := time.Now()
 	whitelistTTL, err := time.ParseDuration(sm.securityConfig.WhitelistTTL)
 	if err != nil {
-		log.Printf("Error parsing whitelist TTL: %v, using default 24h", err)
+		logger.Error("Error parsing whitelist TTL: %v, using default 24h", err)
 		whitelistTTL = 24 * time.Hour
 	}
 
@@ -228,7 +233,7 @@ func (sm *SecurityManager) AddToWhitelist(ipAddress, userId, domain string, perm
 	sm.statistics.ActiveWhitelistEntries = count
 	sm.statsMutex.Unlock()
 
-	log.Printf("Added IP %s to whitelist for user %s@%s (expires: %s, permanent: %t)",
+	logger.Info("Added IP %s to whitelist for user %s@%s (expires: %s, permanent: %t)",
 		ipAddress, userId, domain, entry.ExpiresAt.Format(time.RFC3339), permanent)
 
 	// Remove from blacklist if present
@@ -249,6 +254,8 @@ func (sm *SecurityManager) AddToWhitelist(ipAddress, userId, domain string, perm
 
 // RemoveFromWhitelist removes an IP address from the whitelist
 func (sm *SecurityManager) RemoveFromWhitelist(ipAddress string) error {
+	logger := GetLogger()
+
 	sm.mutex.Lock()
 	entry, exists := sm.whitelist[ipAddress]
 	delete(sm.whitelist, ipAddress)
@@ -261,9 +268,9 @@ func (sm *SecurityManager) RemoveFromWhitelist(ipAddress string) error {
 	sm.statsMutex.Unlock()
 
 	if exists {
-		log.Printf("Removed IP %s from whitelist (was for user %s@%s)", ipAddress, entry.UserID, entry.Domain)
+		logger.Info("Removed IP %s from whitelist (was for user %s@%s)", ipAddress, entry.UserID, entry.Domain)
 	} else {
-		log.Printf("Removed IP %s from whitelist", ipAddress)
+		logger.Info("Removed IP %s from whitelist", ipAddress)
 	}
 
 	// Remove from cache if caching is enabled
@@ -278,6 +285,8 @@ func (sm *SecurityManager) RemoveFromWhitelist(ipAddress string) error {
 
 // AddToBlacklist adds an IP address to the blacklist and blocks it using iptables
 func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bool) error {
+	logger := GetLogger()
+
 	// Validate IP address
 	if net.ParseIP(ipAddress) == nil {
 		return fmt.Errorf("invalid IP address: %s", ipAddress)
@@ -289,7 +298,7 @@ func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bo
 	sm.mutex.RUnlock()
 
 	if isWhitelisted {
-		log.Printf("Cannot blacklist a whitelisted IP: %s", ipAddress)
+		logger.Error("Cannot blacklist a whitelisted IP: %s", ipAddress)
 		return fmt.Errorf("cannot blacklist a whitelisted IP: %s", ipAddress)
 	}
 
@@ -297,7 +306,7 @@ func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bo
 	ip := net.ParseIP(ipAddress)
 	for _, network := range sm.whitelistNetworks {
 		if network.Contains(ip) {
-			log.Printf("Cannot blacklist an IP in trusted network %s: %s", network, ipAddress)
+			logger.Error("Cannot blacklist an IP in trusted network %s: %s", network, ipAddress)
 			return fmt.Errorf("cannot blacklist an IP in trusted network %s: %s", network, ipAddress)
 		}
 	}
@@ -305,7 +314,7 @@ func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bo
 	now := time.Now()
 	blockDuration, err := time.ParseDuration(sm.securityConfig.BlockDuration)
 	if err != nil {
-		log.Printf("Error parsing block duration: %v, using default 1h", err)
+		logger.Error("Error parsing block duration: %v, using default 1h", err)
 		blockDuration = time.Hour
 	}
 
@@ -343,13 +352,13 @@ func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bo
 	if sm.securityConfig.AutoBlockEnabled {
 		err := blockIPWithIptables(ipAddress, sm.securityConfig.IPTablesChain)
 		if err != nil {
-			log.Printf("Failed to block IP %s with iptables: %v", ipAddress, err)
+			logger.Error("Failed to block IP %s with iptables: %v", ipAddress, err)
 		} else {
-			log.Printf("Blocked IP %s with iptables in chain %s", ipAddress, sm.securityConfig.IPTablesChain)
+			logger.Info("Blocked IP %s with iptables in chain %s", ipAddress, sm.securityConfig.IPTablesChain)
 		}
 	}
 
-	log.Printf("Added IP %s to blacklist: %s (expires: %s, permanent: %t)",
+	logger.Info("Added IP %s to blacklist: %s (expires: %s, permanent: %t)",
 		ipAddress, reason, entry.ExpiresAt.Format(time.RFC3339), permanent)
 
 	// Cache the blacklist entry if caching is enabled
@@ -367,6 +376,8 @@ func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bo
 
 // RemoveFromBlacklist removes an IP address from the blacklist and unblocks it using iptables
 func (sm *SecurityManager) RemoveFromBlacklist(ipAddress string) error {
+	logger := GetLogger()
+
 	sm.mutex.Lock()
 	_, wasBlacklisted := sm.blacklist[ipAddress]
 	delete(sm.blacklist, ipAddress)
@@ -382,13 +393,13 @@ func (sm *SecurityManager) RemoveFromBlacklist(ipAddress string) error {
 	if wasBlacklisted && sm.securityConfig.AutoBlockEnabled {
 		err := unblockIPWithIptables(ipAddress, sm.securityConfig.IPTablesChain)
 		if err != nil {
-			log.Printf("Failed to unblock IP %s with iptables: %v", ipAddress, err)
+			logger.Error("Failed to unblock IP %s with iptables: %v", ipAddress, err)
 		} else {
-			log.Printf("Unblocked IP %s with iptables in chain %s", ipAddress, sm.securityConfig.IPTablesChain)
+			logger.Info("Unblocked IP %s with iptables in chain %s", ipAddress, sm.securityConfig.IPTablesChain)
 		}
 	}
 
-	log.Printf("Removed IP %s from blacklist", ipAddress)
+	logger.Info("Removed IP %s from blacklist", ipAddress)
 
 	// Remove from cache if caching is enabled
 	cache := GetCacheManager()
@@ -490,6 +501,8 @@ func (sm *SecurityManager) IsIPBlacklisted(ipAddress string) bool {
 
 // Check if a domain matches any untrusted pattern
 func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
+	logger := GetLogger()
+
 	if domain == "" || len(sm.untrustedPatterns) == 0 {
 		return false
 	}
@@ -497,7 +510,7 @@ func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
 	for _, pattern := range sm.untrustedPatterns {
 		// If the pattern is an exact match
 		if pattern == domain {
-			log.Printf("pattern '%s' matched in untrusted networks", domain)
+			logger.Debug("pattern '%s' matched in untrusted networks", domain)
 			return true
 		}
 	}
@@ -506,6 +519,8 @@ func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
 
 // AddUntrustedNetwork adds to untrusted networks list
 func (sm *SecurityManager) AddUntrustedNetwork(pattern string) error {
+	logger := GetLogger()
+
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
@@ -518,12 +533,14 @@ func (sm *SecurityManager) AddUntrustedNetwork(pattern string) error {
 
 	// Add to the list
 	sm.untrustedPatterns = append(sm.untrustedPatterns, pattern)
-	log.Printf("Added pattern '%s' to untrusted networks", pattern)
+	logger.Info("Added pattern '%s' to untrusted networks", pattern)
 	return nil
 }
 
 // RemoveUntrustedNetwork removes from untrusted networks list
 func (sm *SecurityManager) RemoveUntrustedNetwork(pattern string) error {
+	logger := GetLogger()
+
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
@@ -532,7 +549,7 @@ func (sm *SecurityManager) RemoveUntrustedNetwork(pattern string) error {
 			// Remove by replacing with last element and truncating
 			sm.untrustedPatterns[i] = sm.untrustedPatterns[len(sm.untrustedPatterns)-1]
 			sm.untrustedPatterns = sm.untrustedPatterns[:len(sm.untrustedPatterns)-1]
-			log.Printf("Removed pattern '%s' from untrusted networks", pattern)
+			logger.Info("Removed pattern '%s' from untrusted networks", pattern)
 			return nil
 		}
 	}
@@ -559,24 +576,26 @@ func (sm *SecurityManager) startCleanupRoutine() {
 
 	for {
 		<-ticker.C
-		log.Println("Running scheduled cleanup of expired entries")
+		GetLogger().Info("Running scheduled cleanup of expired entries")
 		sm.cleanupExpiredEntries()
 	}
 }
 
 // cleanupExpiredEntries removes expired entries from whitelist and blacklist
 func (sm *SecurityManager) cleanupExpiredEntries() {
+	logger := GetLogger()
 	now := time.Now()
+
 	failedWindow, err := time.ParseDuration(sm.securityConfig.FailedAttemptsWindow)
 	if err != nil {
-		log.Printf("Error parsing failed attempts window: %v, using default 10m", err)
+		logger.Error("Error parsing failed attempts window: %v, using default 10m", err)
 		failedWindow = 10 * time.Minute
 	}
 
 	// Parse wrong call state window
 	wrongCallStateWindow, err := time.ParseDuration(sm.securityConfig.WrongCallStateWindow)
 	if err != nil {
-		log.Printf("Error parsing wrong call state window: %v, using default 10m", err)
+		logger.Error("Error parsing wrong call state window: %v, using default 10m", err)
 		wrongCallStateWindow = 10 * time.Minute
 	}
 
@@ -591,7 +610,7 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	sm.mutex.RUnlock()
 
 	for _, ip := range whitelistToRemove {
-		log.Printf("Cleanup: Removing expired whitelist entry for IP %s", ip)
+		logger.Debug("Cleanup: Removing expired whitelist entry for IP %s", ip)
 		sm.RemoveFromWhitelist(ip)
 	}
 
@@ -606,7 +625,7 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	sm.mutex.RUnlock()
 
 	for _, ip := range blacklistToRemove {
-		log.Printf("Cleanup: Removing expired blacklist entry for IP %s", ip)
+		logger.Debug("Cleanup: Removing expired blacklist entry for IP %s", ip)
 		sm.RemoveFromBlacklist(ip)
 	}
 
@@ -623,7 +642,7 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	if len(failedToRemove) > 0 {
 		sm.mutex.Lock()
 		for _, ip := range failedToRemove {
-			log.Printf("Cleanup: Removing stale failed attempts record for IP %s", ip)
+			logger.Debug("Cleanup: Removing stale failed attempts record for IP %s", ip)
 			delete(sm.failedAttempts, ip)
 		}
 		sm.mutex.Unlock()
@@ -642,13 +661,13 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	if len(wrongCallStatesToRemove) > 0 {
 		sm.mutex.Lock()
 		for _, ip := range wrongCallStatesToRemove {
-			log.Printf("Cleanup: Removing stale wrong call state record for IP %s", ip)
+			logger.Debug("Cleanup: Removing stale wrong call state record for IP %s", ip)
 			delete(sm.wrongCallStates, ip)
 		}
 		sm.mutex.Unlock()
 	}
 
-	log.Printf("Cleanup: removed %d expired whitelist entries, %d expired blacklist entries, %d expired failed attempts, %d expired wrong call states",
+	logger.Info("Cleanup: removed %d expired whitelist entries, %d expired blacklist entries, %d expired failed attempts, %d expired wrong call states",
 		len(whitelistToRemove), len(blacklistToRemove), len(failedToRemove), len(wrongCallStatesToRemove))
 }
 
@@ -720,26 +739,28 @@ func (sm *SecurityManager) GetWrongCallStates() map[string]WrongCallStateEntry {
 
 // ensureIPTablesChain ensures that the iptables chain exists
 func ensureIPTablesChain(chain string) error {
+	logger := GetLogger()
+
 	// Check if chain exists
 	checkCmd := exec.Command("iptables", "-L", chain)
 	err := checkCmd.Run()
 
 	if err != nil {
 		// Chain doesn't exist, create it
-		log.Printf("Creating iptables chain %s", chain)
+		logger.Info("Creating iptables chain %s", chain)
 		createCmd := exec.Command("iptables", "-N", chain)
 		if err := createCmd.Run(); err != nil {
 			return fmt.Errorf("failed to create iptables chain %s: %v", chain, err)
 		}
 
 		// Add a jump from INPUT to our chain
-		log.Printf("Adding jump from INPUT to chain %s", chain)
+		logger.Info("Adding jump from INPUT to chain %s", chain)
 		linkCmd := exec.Command("iptables", "-A", "INPUT", "-j", chain)
 		if err := linkCmd.Run(); err != nil {
 			return fmt.Errorf("failed to link iptables chain %s to INPUT: %v", chain, err)
 		}
 	} else {
-		log.Printf("Iptables chain %s already exists", chain)
+		logger.Info("Iptables chain %s already exists", chain)
 	}
 
 	return nil
@@ -747,14 +768,16 @@ func ensureIPTablesChain(chain string) error {
 
 // blockIPWithIptables blocks an IP address using iptables
 func blockIPWithIptables(ip, chain string) error {
+	logger := GetLogger()
+
 	// First check if the rule already exists
 	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
 	if checkCmd.Run() == nil {
-		log.Printf("IP %s is already blocked in chain %s", ip, chain)
+		logger.Info("IP %s is already blocked in chain %s", ip, chain)
 		return nil
 	}
 
-	log.Printf("Adding iptables rule to block IP %s in chain %s", ip, chain)
+	logger.Info("Adding iptables rule to block IP %s in chain %s", ip, chain)
 	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -765,7 +788,9 @@ func blockIPWithIptables(ip, chain string) error {
 
 // unblockIPWithIptables unblocks an IP address using iptables
 func unblockIPWithIptables(ip, chain string) error {
-	log.Printf("Removing iptables rule to unblock IP %s in chain %s", ip, chain)
+	logger := GetLogger()
+
+	logger.Info("Removing iptables rule to unblock IP %s in chain %s", ip, chain)
 	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -776,7 +801,9 @@ func unblockIPWithIptables(ip, chain string) error {
 
 // getIPTablesRules gets the current iptables rules for the chain
 func getIPTablesRules(chain string) ([]string, error) {
-	log.Printf("Fetching iptables rules for chain %s", chain)
+	logger := GetLogger()
+
+	logger.Debug("Fetching iptables rules for chain %s", chain)
 	cmd := exec.Command("iptables", "-S", chain)
 	output, err := cmd.Output()
 	if err != nil {
@@ -792,7 +819,7 @@ func getIPTablesRules(chain string) ([]string, error) {
 		}
 	}
 
-	log.Printf("Found %d rules in iptables chain %s", len(result), chain)
+	logger.Debug("Found %d rules in iptables chain %s", len(result), chain)
 	return result, nil
 }
 
@@ -807,6 +834,8 @@ func (sm *SecurityManager) UpdateRegistrationStats(ipAddress, userId, domain str
 
 // ProcessWrongCallState processes a wrong call state event
 func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
+	logger := GetLogger()
+
 	// Update statistics
 	sm.statsMutex.Lock()
 	sm.statistics.WrongCallStates++
@@ -819,7 +848,7 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 	sm.mutex.RUnlock()
 
 	if isWhitelisted {
-		log.Printf("IP %s is whitelisted, ignoring wrong call state", ipAddress)
+		logger.Debug("IP %s is whitelisted, ignoring wrong call state", ipAddress)
 		return
 	}
 
@@ -827,7 +856,7 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 	ip := net.ParseIP(ipAddress)
 	for _, network := range sm.whitelistNetworks {
 		if network.Contains(ip) {
-			log.Printf("IP %s is in trusted network %s, ignoring wrong call state", ipAddress, network)
+			logger.Debug("IP %s is in trusted network %s, ignoring wrong call state", ipAddress, network)
 			return
 		}
 	}
@@ -842,11 +871,11 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 			LastAttempt:  time.Now(),
 			UserIDs:      []string{userId},
 		}
-		log.Printf("First wrong call state from IP %s", ipAddress)
+		logger.Debug("First wrong call state from IP %s", ipAddress)
 	} else {
 		attempt.Count++
 		attempt.LastAttempt = time.Now()
-		log.Printf("Incrementing wrong call states for IP %s to %d", ipAddress, attempt.Count)
+		logger.Debug("Incrementing wrong call states for IP %s to %d", ipAddress, attempt.Count)
 
 		// Add userId to the list if not already present
 		userExists := false
@@ -858,7 +887,7 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 		}
 		if !userExists && userId != "unknown" {
 			attempt.UserIDs = append(attempt.UserIDs, userId)
-			log.Printf("Added new user ID %s to wrong call states for IP %s", userId, ipAddress)
+			logger.Debug("Added new user ID %s to wrong call states for IP %s", userId, ipAddress)
 		}
 	}
 	sm.wrongCallStates[ipAddress] = attempt
@@ -867,13 +896,15 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 	// Check if we should block this IP
 	if sm.securityConfig.AutoBlockEnabled && attempt.Count >= sm.securityConfig.MaxWrongCallStates {
 		reason := fmt.Sprintf("Exceeded max wrong call states (%d)", sm.securityConfig.MaxWrongCallStates)
-		log.Printf("Threshold exceeded: Auto-blocking IP %s - %s", ipAddress, reason)
+		logger.Info("Threshold exceeded: Auto-blocking IP %s - %s", ipAddress, reason)
 		sm.AddToBlacklist(ipAddress, reason, false)
 	}
 }
 
 // ProcessFailedRegistration processes a failed registration event
 func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain string) {
+	logger := GetLogger()
+
 	// Update statistics
 	sm.statsMutex.Lock()
 	sm.statistics.FailedRegistrations++
@@ -886,7 +917,7 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 	sm.mutex.RUnlock()
 
 	if isWhitelisted {
-		log.Printf("IP %s is whitelisted, ignoring failed registration", ipAddress)
+		logger.Debug("IP %s is whitelisted, ignoring failed registration", ipAddress)
 		return
 	}
 
@@ -894,7 +925,7 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 	ip := net.ParseIP(ipAddress)
 	for _, network := range sm.whitelistNetworks {
 		if network.Contains(ip) {
-			log.Printf("IP %s is in trusted network %s, ignoring failed registration", ipAddress, network)
+			logger.Debug("IP %s is in trusted network %s, ignoring failed registration", ipAddress, network)
 			return
 		}
 	}
@@ -910,11 +941,11 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 			UserIDs:      []string{userId},
 			Domains:      []string{domain},
 		}
-		log.Printf("First failed attempt from IP %s", ipAddress)
+		logger.Debug("First failed attempt from IP %s", ipAddress)
 	} else {
 		attempt.Count++
 		attempt.LastAttempt = time.Now()
-		log.Printf("Incrementing failed attempts for IP %s to %d", ipAddress, attempt.Count)
+		logger.Debug("Incrementing failed attempts for IP %s to %d", ipAddress, attempt.Count)
 
 		// Add userId to the list if not already present
 		userExists := false
@@ -926,7 +957,7 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 		}
 		if !userExists && userId != "unknown" {
 			attempt.UserIDs = append(attempt.UserIDs, userId)
-			log.Printf("Added new user ID %s to failed attempts for IP %s", userId, ipAddress)
+			logger.Debug("Added new user ID %s to failed attempts for IP %s", userId, ipAddress)
 		}
 
 		// Add domain to the list if not already present
@@ -939,7 +970,7 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 		}
 		if !domainExists && domain != "" {
 			attempt.Domains = append(attempt.Domains, domain)
-			log.Printf("Added new domain %s to failed attempts for IP %s", domain, ipAddress)
+			logger.Debug("Added new domain %s to failed attempts for IP %s", domain, ipAddress)
 		}
 	}
 	sm.failedAttempts[ipAddress] = attempt
@@ -948,13 +979,13 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 	// Check if we should block this IP
 	if sm.securityConfig.AutoBlockEnabled && attempt.Count >= sm.securityConfig.MaxFailedAttempts {
 		reason := fmt.Sprintf("Exceeded max failed registrations (%d)", sm.securityConfig.MaxFailedAttempts)
-		log.Printf("Threshold exceeded: Auto-blocking IP %s - %s", ipAddress, reason)
+		logger.Info("Threshold exceeded: Auto-blocking IP %s - %s", ipAddress, reason)
 		sm.AddToBlacklist(ipAddress, reason, false)
 	}
 
 	// Check if domain matches any untrusted pattern
 	if sm.IsUntrustedDomain(domain) {
-		log.Printf("Failed registration from IP %s for domain %s blocked (untrusted domain)",
+		logger.Info("Failed registration from IP %s for domain %s blocked (untrusted domain)",
 			ipAddress, domain)
 		reason := fmt.Sprintf("Failed registration attempt from untrusted domain '%s'", domain)
 		sm.AddToBlacklist(ipAddress, reason, false)

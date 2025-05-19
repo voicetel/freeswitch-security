@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
 )
@@ -40,6 +39,7 @@ type RateCounter struct {
 
 // NewRateManager creates a new rate manager
 func NewRateManager(securityManager *SecurityManager) *RateManager {
+	logger := GetLogger()
 	config := GetConfig()
 
 	// Set default values
@@ -89,7 +89,7 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 		go rm.startRateLimitCleanupRoutine()
 	}
 
-	log.Printf("Rate limiting initialized - Enabled: %t, Call limit: %d per %s, Registration limit: %d per %s",
+	logger.Info("Rate limiting initialized - Enabled: %t, Call limit: %d per %s, Registration limit: %d per %s",
 		rateConfig.Enabled,
 		rateConfig.CallRateLimit,
 		rateConfig.CallRateInterval,
@@ -101,25 +101,27 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 
 // CheckCallRate checks if an IP is exceeding the call rate limit
 func (rm *RateManager) CheckCallRate(ipAddress, userId, domain string) bool {
+	logger := GetLogger()
+
 	if !rm.rateLimitConfig.Enabled {
 		return true // Rate limiting disabled, always allowed
 	}
 
 	// Check if IP is whitelisted and if whitelist bypass is enabled
 	if rm.rateLimitConfig.WhitelistBypass && rm.securityManager.IsIPWhitelisted(ipAddress) {
-		log.Printf("IP %s is whitelisted, bypassing call rate limit", ipAddress)
+		logger.Debug("IP %s is whitelisted, bypassing call rate limit", ipAddress)
 		return true
 	}
 
 	// Check if IP is already blacklisted
 	if rm.securityManager.IsIPBlacklisted(ipAddress) {
-		log.Printf("IP %s is blacklisted, call not allowed", ipAddress)
+		logger.Debug("IP %s is blacklisted, call not allowed", ipAddress)
 		return false
 	}
 
 	callRateInterval, err := time.ParseDuration(rm.rateLimitConfig.CallRateInterval)
 	if err != nil {
-		log.Printf("Error parsing call rate interval: %v, using default 1m", err)
+		logger.Error("Error parsing call rate interval: %v, using default 1m", err)
 		callRateInterval = time.Minute
 	}
 
@@ -188,7 +190,7 @@ func (rm *RateManager) CheckCallRate(ipAddress, userId, domain string) bool {
 
 	// Check if rate exceeds limit
 	if rate.Count > rm.rateLimitConfig.CallRateLimit {
-		log.Printf("Call rate limit exceeded for IP %s: %d calls in %s",
+		logger.Info("Call rate limit exceeded for IP %s: %d calls in %s",
 			ipAddress, rate.Count, callRateInterval)
 
 		// Auto block if enabled
@@ -206,27 +208,29 @@ func (rm *RateManager) CheckCallRate(ipAddress, userId, domain string) bool {
 
 // CheckRegistrationRate checks if an IP is exceeding the registration rate limit
 func (rm *RateManager) CheckRegistrationRate(ipAddress, userId, domain string) bool {
+	logger := GetLogger()
+
 	// Check if Rate limiting is enabled
 	if !rm.rateLimitConfig.Enabled {
-		log.Printf("Rate limiting is disabled, bypassing registration rate limit for IP %s", ipAddress)
+		logger.Debug("Rate limiting is disabled, bypassing registration rate limit for IP %s", ipAddress)
 		return true
 	}
 
 	// Check if IP is whitelisted and if whitelist bypass is enabled
 	if rm.rateLimitConfig.WhitelistBypass && rm.securityManager.IsIPWhitelisted(ipAddress) {
-		log.Printf("IP %s is whitelisted, bypassing registration rate limit", ipAddress)
+		logger.Info("IP %s is whitelisted, bypassing registration rate limit", ipAddress)
 		return true
 	}
 
 	// Check if IP is already blacklisted
 	if rm.securityManager.IsIPBlacklisted(ipAddress) {
-		log.Printf("IP %s is blacklisted, registration not allowed", ipAddress)
+		logger.Debug("IP %s is blacklisted, registration not allowed", ipAddress)
 		return false
 	}
 
 	regWindow, err := time.ParseDuration(rm.rateLimitConfig.RegistrationWindow)
 	if err != nil {
-		log.Printf("Error parsing registration window: %v, using default 1m", err)
+		logger.Error("Error parsing registration window: %v, using default 1m", err)
 		regWindow = time.Minute
 	}
 
@@ -295,7 +299,7 @@ func (rm *RateManager) CheckRegistrationRate(ipAddress, userId, domain string) b
 
 	// Check if rate exceeds limit
 	if rate.Count > rm.rateLimitConfig.RegistrationLimit {
-		log.Printf("Registration rate limit exceeded for IP %s: %d registrations in %s",
+		logger.Info("Registration rate limit exceeded for IP %s: %d registrations in %s",
 			ipAddress, rate.Count, regWindow)
 
 		// Auto block if enabled
@@ -341,15 +345,17 @@ func (rm *RateManager) GetRegistrationRates() map[string]RateCounter {
 
 // cleanupRateLimits cleans up expired rate counters
 func (rm *RateManager) cleanupRateLimits() {
+	logger := GetLogger()
+
 	callRateInterval, err := time.ParseDuration(rm.rateLimitConfig.CallRateInterval)
 	if err != nil {
-		log.Printf("Error parsing call rate interval: %v, using default 1m", err)
+		logger.Error("Error parsing call rate interval: %v, using default 1m", err)
 		callRateInterval = time.Minute
 	}
 
 	regWindow, err := time.ParseDuration(rm.rateLimitConfig.RegistrationWindow)
 	if err != nil {
-		log.Printf("Error parsing registration window: %v, using default 1m", err)
+		logger.Error("Error parsing registration window: %v, using default 1m", err)
 		regWindow = time.Minute
 	}
 
@@ -382,15 +388,17 @@ func (rm *RateManager) cleanupRateLimits() {
 		delete(rm.regRates, ip)
 	}
 
-	log.Printf("Rate limit cleanup completed: removed %d call rates and %d registration rates",
+	logger.Debug("Rate limit cleanup completed: removed %d call rates and %d registration rates",
 		len(callRatesToRemove), len(regRatesToRemove))
 }
 
 // startRateLimitCleanupRoutine periodically cleans up expired rate limits
 func (rm *RateManager) startRateLimitCleanupRoutine() {
+	logger := GetLogger()
+
 	cleanupInterval, err := time.ParseDuration(rm.rateLimitConfig.CleanupInterval)
 	if err != nil {
-		log.Printf("Error parsing rate limit cleanup interval: %v, using default 5m", err)
+		logger.Error("Error parsing rate limit cleanup interval: %v, using default 5m", err)
 		cleanupInterval = 5 * time.Minute
 	}
 
@@ -399,7 +407,7 @@ func (rm *RateManager) startRateLimitCleanupRoutine() {
 
 	for {
 		<-ticker.C
-		log.Printf("Running rate limit cleanup routine")
+		logger.Debug("Running rate limit cleanup routine")
 		rm.cleanupRateLimits()
 	}
 }

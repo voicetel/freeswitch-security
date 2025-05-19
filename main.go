@@ -17,6 +17,10 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// Initialize logging system
+	logger := GetLogger()
+	logger.SetLogLevelFromString(config.Security.ESLLogLevel)
+
 	// Initialize cache if enabled
 	if config.Cache.Enabled {
 		if err := InitCache(); err != nil {
@@ -33,14 +37,14 @@ func main() {
 		if err := InitSecurityManager(); err != nil {
 			log.Fatalf("Failed to initialize security manager: %v", err)
 		}
-		
+
 		// Initialize ESL manager after security manager
 		securityManager := GetSecurityManager()
 		_, err := InitESLManager(securityManager)
 		if err != nil {
 			log.Printf("Failed to initialize ESL manager: %v", err)
 		}
-		
+
 		log.Println("Security manager initialized")
 	} else {
 		log.Println("Security system is disabled")

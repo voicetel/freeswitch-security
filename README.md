@@ -12,6 +12,7 @@ This application provides security components for FreeSWITCH with integrated cac
 ├── esl.go            # FreeSWITCH Event Socket Layer integration
 ├── rate.go           # Rate limiting implementation
 ├── routes.go         # API route definitions
+├── logging.go        # Centralized logging system
 └── config.json       # Application configuration file
 ```
 

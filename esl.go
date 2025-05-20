@@ -579,7 +579,7 @@ func (em *ESLManager) SendCommand(command string) (string, error) {
 	}
 
 	logger.Debug("Sending command to ESL: %s", command)
-	ev, err := em.eslClient.Send(command)
+	ev, err := em.eslClient.Send(fmt.Sprintf("api %s", command))
 	if err != nil {
 		logger.Error("Error sending command to ESL: %v", err)
 		return "", err

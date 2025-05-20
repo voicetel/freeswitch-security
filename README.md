@@ -30,6 +30,7 @@ This application provides security components for FreeSWITCH with integrated cac
 - **Automatic Reconnection**: Maintain connection to FreeSWITCH with exponential backoff
 - **Comprehensive Event Handling**: Support for registration, call creation, and other events
 - **Configurable Logging**: Multiple verbosity levels for troubleshooting
+- **Command Interface**: Send commands to FreeSWITCH and receive responses via API
 
 ### Rate Limiting
 - **Call Rate Limiting**: Restrict the number of calls allowed from a single IP
@@ -121,6 +122,11 @@ The application uses a JSON configuration file with the following main sections:
   "esl_host": "127.0.0.1",
   "esl_port": "8021",
   "esl_password": "ClueCon",
+  "esl_allowed_commands": [
+    "status",
+    "uptime",
+    "version"
+  ],
   "max_failed_attempts": 5,
   "failed_attempts_window": "10m",
   "auto_block_enabled": true,
@@ -183,6 +189,7 @@ The application uses a JSON configuration file with the following main sections:
 - `GET /security/esl` - ESL connection status
 - `POST /security/esl/log_level` - Set ESL log level
 - `POST /security/esl/reconnect` - Force ESL reconnection
+- `POST /security/esl/command` - Send a command to FreeSWITCH and get the response
 
 ### Rate Limiting
 - `GET /security/rate-limit` - Rate limit configuration
@@ -216,6 +223,7 @@ The application supports configuration via environment variables, which override
 | SECURITY_ESL_HOST | ESL host address |
 | SECURITY_ESL_PORT | ESL port |
 | SECURITY_ESL_PASSWORD | ESL password |
+| SECURITY_ESL_ALLOWED_COMMANDS | Allowed ESL commands (JSON array) |
 | SECURITY_MAX_FAILED_ATTEMPTS | Max failed attempts before blocking |
 | SECURITY_FAILED_WINDOW | Failed attempts window |
 | SECURITY_AUTO_BLOCK | Enable auto-blocking |
@@ -239,6 +247,28 @@ To use this application with FreeSWITCH, ensure the Event Socket module is enabl
     <param name="password" value="ClueCon"/>
   </settings>
 </configuration>
+```
+
+## ESL Command API
+
+The ESL Command API allows you to send commands directly to FreeSWITCH via the Event Socket Layer. Only commands that are explicitly allowed in the configuration can be executed.
+
+### Usage Example
+
+```bash
+# Send a command to FreeSWITCH
+curl -X POST http://127.0.0.1:8080/security/esl/command \
+  -H "Content-Type: application/json" \
+  -d '{"command":"status"}'
+```
+
+### Response Example
+
+```json
+{
+  "command": "status",
+  "response": "UP 0 years, 0 days, 2 hours, 15 minutes, 30 seconds, 950 milliseconds, 560 microseconds\nFreeSWITCH (Version 1.10.7 -release- 64bit) is ready\n..."
+}
 ```
 
 ## Integrations

@@ -554,3 +554,43 @@ func (em *ESLManager) ReconnectESL() {
 		em.eslDisconnected <- true
 	}
 }
+
+// SendCommand sends a command to FreeSWITCH ESL and returns the response
+func (em *ESLManager) SendCommand(command string) (string, error) {
+	logger := GetLogger()
+	config := GetConfig()
+
+	if !em.eslConnected || em.eslClient == nil {
+		return "", fmt.Errorf("not connected to FreeSWITCH ESL")
+	}
+
+	// Check if command is in the whitelist
+	isAllowed := false
+	for _, allowedCmd := range config.Security.ESLAllowedCommands {
+		if strings.HasPrefix(command, allowedCmd) {
+			isAllowed = true
+			break
+		}
+	}
+
+	if !isAllowed {
+		logger.Error("Command not allowed: %s", command)
+		return "", fmt.Errorf("command not allowed: %s", command)
+	}
+
+	logger.Debug("Sending command to ESL: %s", command)
+	ev, err := em.eslClient.Send(command)
+	if err != nil {
+		logger.Error("Error sending command to ESL: %v", err)
+		return "", err
+	}
+
+	// Extract the response text from the Event object
+	response := ev.Get("Reply-Text")
+	if response == "" {
+		response = ev.Body
+	}
+
+	logger.Debug("Received response from ESL: %s", response)
+	return response, nil
+}

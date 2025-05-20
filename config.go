@@ -32,6 +32,7 @@ type AppConfig struct {
 		ESLHost                string   `json:"esl_host"`
 		ESLPort                string   `json:"esl_port"`
 		ESLPassword            string   `json:"esl_password"`
+		ESLAllowedCommands     []string `json:"esl_allowed_commands"`
 		MaxFailedAttempts      int      `json:"max_failed_attempts"`
 		FailedAttemptsWindow   string   `json:"failed_attempts_window"`
 		AutoBlockEnabled       bool     `json:"auto_block_enabled"`
@@ -94,6 +95,12 @@ func LoadConfig(path string) (*AppConfig, error) {
 		config.Security.ESLHost = "127.0.0.1"
 		config.Security.ESLPort = "8021"
 		config.Security.ESLPassword = "ClueCon"
+		// Default allowed ESL commands (common, safe commands)
+		config.Security.ESLAllowedCommands = []string{
+			"status",
+			"uptime",
+			"version",
+		}
 		config.Security.MaxFailedAttempts = 5
 		config.Security.FailedAttemptsWindow = "10m"
 		config.Security.AutoBlockEnabled = true
@@ -235,6 +242,13 @@ func loadEnvironmentVariables(config *AppConfig) {
 	}
 	if eslPassword := os.Getenv("SECURITY_ESL_PASSWORD"); eslPassword != "" {
 		config.Security.ESLPassword = eslPassword
+	}
+	// Add environment variable for ESL allowed commands
+	if eslAllowedCommands := os.Getenv("SECURITY_ESL_ALLOWED_COMMANDS"); eslAllowedCommands != "" {
+		var commands []string
+		if err := json.Unmarshal([]byte(eslAllowedCommands), &commands); err == nil {
+			config.Security.ESLAllowedCommands = commands
+		}
 	}
 	if maxFailedStr := os.Getenv("SECURITY_MAX_FAILED_ATTEMPTS"); maxFailedStr != "" {
 		if maxFailed, err := strconv.Atoi(maxFailedStr); err == nil {

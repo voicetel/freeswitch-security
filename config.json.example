@@ -21,6 +21,11 @@
     "esl_host": "127.0.0.1",
     "esl_port": "8021",
     "esl_password": "ClueCon",
+    "esl_allowed_commands": [
+      "status",
+      "uptime",
+      "version"
+    ],
     "max_failed_attempts": 5,
     "failed_attempts_window": "10m",
     "auto_block_enabled": true,

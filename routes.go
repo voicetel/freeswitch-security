@@ -225,6 +225,29 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 					"message": "ESL reconnection initiated",
 				})
 			})
+
+			// Send command to ESL
+			esl.POST("/command", func(c *gin.Context) {
+				var req struct {
+					Command string `json:"command" binding:"required"`
+				}
+
+				if err := c.ShouldBindJSON(&req); err != nil {
+					c.JSON(400, gin.H{"error": err.Error()})
+					return
+				}
+
+				response, err := eslManager.SendCommand(req.Command)
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+
+				c.JSON(200, gin.H{
+					"command":  req.Command,
+					"response": response,
+				})
+			})
 		}
 
 		// Rate limiting management

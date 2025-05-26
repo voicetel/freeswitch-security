@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -26,6 +27,13 @@ type ESLManager struct {
 	statsMutex    sync.RWMutex
 	rateManager   *RateManager
 	rateManagerMu sync.Mutex
+
+	// Add shutdown mechanism
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	shutdown   bool
+	shutdownMu sync.RWMutex
 }
 
 // ESLConfig holds ESL-related configuration
@@ -77,6 +85,9 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 		// Initialize rate manager
 		rateManager := NewRateManager(securityManager)
 
+		// Create context for shutdown
+		ctx, cancel := context.WithCancel(context.Background())
+
 		// Initialize ESL manager
 		eslManager = &ESLManager{
 			securityManager: securityManager,
@@ -84,10 +95,14 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			eslDisconnected: make(chan bool, 1),
 			eslLogLevel:     logLevel,
 			rateManager:     rateManager,
+			ctx:             ctx,
+			cancel:          cancel,
+			shutdown:        false,
 		}
 
 		// Start ESL connection
 		logger.Info("Starting ESL connection")
+		eslManager.wg.Add(1)
 		go eslManager.startESLConnection()
 	})
 
@@ -106,8 +121,46 @@ func GetESLManager() *ESLManager {
 	return eslManager
 }
 
+// Shutdown gracefully shuts down the ESL manager
+func (em *ESLManager) Shutdown() {
+	logger := GetLogger()
+	logger.Info("Shutting down ESL manager...")
+
+	// Set shutdown flag
+	em.shutdownMu.Lock()
+	em.shutdown = true
+	em.shutdownMu.Unlock()
+
+	// Cancel the context to signal shutdown
+	em.cancel()
+
+	// Close ESL connection if connected
+	if em.eslConnected && em.eslClient != nil {
+		em.eslClient.Close()
+	}
+
+	// Shutdown rate manager
+	if em.rateManager != nil {
+		em.rateManager.Shutdown()
+	}
+
+	// Wait for all goroutines to finish
+	em.wg.Wait()
+
+	logger.Info("ESL manager shutdown complete")
+}
+
+// isShuttingDown checks if we're in shutdown mode
+func (em *ESLManager) isShuttingDown() bool {
+	em.shutdownMu.RLock()
+	defer em.shutdownMu.RUnlock()
+	return em.shutdown
+}
+
 // startESLConnection connects to the FreeSWITCH ESL interface and listens for events
 func (em *ESLManager) startESLConnection() {
+	defer em.wg.Done()
+
 	logger := GetLogger()
 
 	backoffDuration, err := time.ParseDuration(em.eslConfig.ReconnectBackoff)
@@ -135,6 +188,21 @@ func (em *ESLManager) startESLConnection() {
 	}
 
 	for {
+		// Check if we're shutting down
+		select {
+		case <-em.ctx.Done():
+			logger.Info("ESL connection routine shutting down")
+			return
+		default:
+			// Continue with connection attempt
+		}
+
+		// Don't try to reconnect if we're shutting down
+		if em.isShuttingDown() {
+			logger.Info("ESL manager is shutting down, stopping reconnection attempts")
+			return
+		}
+
 		logger.Info("Attempting to connect to FreeSWITCH ESL (Attempt #%d) at %s:%s",
 			reconnectAttempt+1, em.eslConfig.Host, em.eslConfig.Port)
 
@@ -163,8 +231,14 @@ func (em *ESLManager) startESLConnection() {
 				logger.Error("Current password: %s", em.eslConfig.Password)
 			}
 
-			time.Sleep(currentBackoff)
-			continue
+			// Wait with backoff, but check for shutdown
+			select {
+			case <-em.ctx.Done():
+				logger.Info("ESL connection routine shutting down during backoff")
+				return
+			case <-time.After(currentBackoff):
+				continue
+			}
 		}
 
 		connectionDuration := time.Since(connectionStartTime)
@@ -213,14 +287,31 @@ func (em *ESLManager) startESLConnection() {
 		}
 
 		// Start event processing
+		em.wg.Add(1)
 		go em.handleEvents()
 
-		// Wait until connection is closed
-		<-em.eslDisconnected
-		logger.Info("Disconnected from FreeSWITCH ESL")
+		// Wait until connection is closed or shutdown is requested
+		select {
+		case <-em.eslDisconnected:
+			logger.Info("Disconnected from FreeSWITCH ESL")
+		case <-em.ctx.Done():
+			logger.Info("ESL connection routine shutting down")
+			if em.eslClient != nil {
+				em.eslClient.Close()
+			}
+			return
+		}
 
 		em.eslConnected = false
-		time.Sleep(currentBackoff)
+
+		// Check if we're shutting down before waiting for backoff
+		select {
+		case <-em.ctx.Done():
+			logger.Info("ESL connection routine shutting down after disconnect")
+			return
+		case <-time.After(currentBackoff):
+			// Continue with next connection attempt
+		}
 
 		// Update statistics for next reconnection attempt
 		em.statsMutex.Lock()
@@ -232,10 +323,19 @@ func (em *ESLManager) startESLConnection() {
 
 // handleEvents processes events from FreeSWITCH's Event Socket Layer
 func (em *ESLManager) handleEvents() {
+	defer em.wg.Done()
+
 	logger := GetLogger()
 	logger.Debug("Event handler started, processing events")
 
 	for {
+		// Check if we're shutting down
+		if em.isShuttingDown() {
+			logger.Info("Event handler shutting down")
+			em.eslDisconnected <- true
+			return
+		}
+
 		logger.Trace("Waiting for next event")
 		ev, err := em.eslClient.ReadEvent()
 		if err != nil {
@@ -551,7 +651,12 @@ func (em *ESLManager) ReconnectESL() {
 		logger.Info("Manually triggering ESL reconnection")
 		em.eslClient.Close()
 		em.eslConnected = false
-		em.eslDisconnected <- true
+		select {
+		case em.eslDisconnected <- true:
+			// Sent disconnect signal
+		default:
+			// Channel is full or closed, ignore
+		}
 	}
 }
 

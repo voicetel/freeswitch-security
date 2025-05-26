@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -22,6 +23,11 @@ type SecurityManager struct {
 	statistics        SecurityStats
 	statsMutex        sync.RWMutex
 	wrongCallStates   map[string]WrongCallStateEntry
+
+	// Add shutdown mechanism
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // SecurityConfig holds security-related configuration
@@ -135,6 +141,9 @@ func InitSecurityManager() error {
 			trustedNetworks = append(trustedNetworks, network)
 		}
 
+		// Create context for shutdown
+		ctx, cancel := context.WithCancel(context.Background())
+
 		// Initialize the security manager
 		securityManager = &SecurityManager{
 			whitelist:         make(map[string]WhitelistEntry),
@@ -149,6 +158,8 @@ func InitSecurityManager() error {
 				LastFailedTime:         time.Time{},
 				LastWrongCallStateTime: time.Time{},
 			},
+			ctx:    ctx,
+			cancel: cancel,
 		}
 
 		// Log initialization info
@@ -180,10 +191,25 @@ func InitSecurityManager() error {
 
 		// Start cleanup routine
 		logger.Info("Starting periodic cleanup routine")
+		securityManager.wg.Add(1)
 		go securityManager.startCleanupRoutine()
 	})
 
 	return err
+}
+
+// Shutdown gracefully shuts down the security manager
+func (sm *SecurityManager) Shutdown() {
+	logger := GetLogger()
+	logger.Info("Shutting down security manager...")
+
+	// Cancel the context to signal shutdown
+	sm.cancel()
+
+	// Wait for all goroutines to finish
+	sm.wg.Wait()
+
+	logger.Info("Security manager shutdown complete")
 }
 
 // GetSecurityManager returns the security manager instance
@@ -571,13 +597,20 @@ func (sm *SecurityManager) GetUntrustedNetworks() []string {
 
 // startCleanupRoutine periodically cleans up expired whitelist and blacklist entries
 func (sm *SecurityManager) startCleanupRoutine() {
+	defer sm.wg.Done()
+
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		GetLogger().Info("Running scheduled cleanup of expired entries")
-		sm.cleanupExpiredEntries()
+		select {
+		case <-sm.ctx.Done():
+			GetLogger().Info("Cleanup routine shutting down")
+			return
+		case <-ticker.C:
+			GetLogger().Info("Running scheduled cleanup of expired entries")
+			sm.cleanupExpiredEntries()
+		}
 	}
 }
 

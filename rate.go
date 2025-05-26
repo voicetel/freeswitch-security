@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,11 @@ type RateManager struct {
 	regRates        map[string]RateCounter
 	rateMutex       sync.RWMutex
 	rateLimitConfig RateLimitConfig
+
+	// Add shutdown mechanism
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // RateLimitConfig holds rate limiting configuration
@@ -76,16 +82,22 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 		rateConfig.CleanupInterval = config.Security.RateLimit.CleanupInterval
 	}
 
+	// Create context for shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create rate manager
 	rm := &RateManager{
 		securityManager: securityManager,
 		callRates:       make(map[string]RateCounter),
 		regRates:        make(map[string]RateCounter),
 		rateLimitConfig: rateConfig,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	// Start cleanup routine
 	if rateConfig.Enabled {
+		rm.wg.Add(1)
 		go rm.startRateLimitCleanupRoutine()
 	}
 
@@ -97,6 +109,20 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 		rateConfig.RegistrationWindow)
 
 	return rm
+}
+
+// Shutdown gracefully shuts down the rate manager
+func (rm *RateManager) Shutdown() {
+	logger := GetLogger()
+	logger.Info("Shutting down rate manager...")
+
+	// Cancel the context to signal shutdown
+	rm.cancel()
+
+	// Wait for all goroutines to finish
+	rm.wg.Wait()
+
+	logger.Info("Rate manager shutdown complete")
 }
 
 // CheckCallRate checks if an IP is exceeding the call rate limit
@@ -394,6 +420,8 @@ func (rm *RateManager) cleanupRateLimits() {
 
 // startRateLimitCleanupRoutine periodically cleans up expired rate limits
 func (rm *RateManager) startRateLimitCleanupRoutine() {
+	defer rm.wg.Done()
+
 	logger := GetLogger()
 
 	cleanupInterval, err := time.ParseDuration(rm.rateLimitConfig.CleanupInterval)
@@ -406,8 +434,13 @@ func (rm *RateManager) startRateLimitCleanupRoutine() {
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		logger.Debug("Running rate limit cleanup routine")
-		rm.cleanupRateLimits()
+		select {
+		case <-rm.ctx.Done():
+			logger.Info("Rate limit cleanup routine shutting down")
+			return
+		case <-ticker.C:
+			logger.Debug("Running rate limit cleanup routine")
+			rm.cleanupRateLimits()
+		}
 	}
 }

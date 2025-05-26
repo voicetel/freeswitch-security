@@ -1,13 +1,21 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
+)
+
+var (
+	// Global server instance for graceful shutdown
+	httpServer *http.Server
 )
 
 func main() {
@@ -26,21 +34,25 @@ func main() {
 		if err := InitCache(); err != nil {
 			log.Fatalf("Failed to initialize cache: %v", err)
 		}
-		defer CloseCache()
 		log.Println("Cache system initialized")
 	} else {
 		log.Println("Cache system is disabled")
 	}
 
 	// Initialize security manager if enabled
+	var securityManager *SecurityManager
+	var eslManager *ESLManager
+
 	if config.Security.Enabled {
 		if err := InitSecurityManager(); err != nil {
 			log.Fatalf("Failed to initialize security manager: %v", err)
 		}
 
+		// Get security manager instance
+		securityManager = GetSecurityManager()
+
 		// Initialize ESL manager after security manager
-		securityManager := GetSecurityManager()
-		_, err := InitESLManager(securityManager)
+		eslManager, err = InitESLManager(securityManager)
 		if err != nil {
 			log.Printf("Failed to initialize ESL manager: %v", err)
 		}
@@ -61,30 +73,57 @@ func main() {
 	// Register routes
 	registerRoutes(router)
 
-	// Handle graceful shutdown
-	go func() {
-		// Create channel to listen for OS signals
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-		// Block until a signal is received
-		sig := <-c
-		log.Printf("Received signal %s, shutting down...", sig)
-
-		// Cleanup resources
-		CloseCache()
-		os.Exit(0)
-	}()
-
-	// Start the server
+	// Create HTTP server
 	host := config.Server.Host
 	port := config.Server.Port
-	fmt.Printf("Starting FreeSWITCH Security server on %s:%s...\n", host, port)
-
-	// Listen and serve
-	if err := router.Run(fmt.Sprintf("%s:%s", host, port)); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	httpServer = &http.Server{
+		Addr:    fmt.Sprintf("%s:%s", host, port),
+		Handler: router,
 	}
+
+	// Start server in a goroutine
+	go func() {
+		fmt.Printf("Starting FreeSWITCH Security server on %s:%s...\n", host, port)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// Handle graceful shutdown
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+
+	// Block until a signal is received
+	sig := <-shutdownChan
+	log.Printf("Received signal %s, initiating graceful shutdown...", sig)
+
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Shutdown sequence
+	log.Println("Shutting down HTTP server...")
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server forced to shutdown: %v", err)
+	}
+
+	// Shutdown ESL manager if initialized
+	if eslManager != nil {
+		log.Println("Shutting down ESL manager...")
+		eslManager.Shutdown()
+	}
+
+	// Shutdown security manager if initialized
+	if securityManager != nil {
+		log.Println("Shutting down security manager...")
+		securityManager.Shutdown()
+	}
+
+	// Close cache
+	log.Println("Closing cache...")
+	CloseCache()
+
+	log.Println("Graceful shutdown complete")
 }
 
 // registerRoutes sets up all API routes

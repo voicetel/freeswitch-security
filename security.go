@@ -771,14 +771,14 @@ func blockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	// First check if the rule already exists
-	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
+	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
 	if checkCmd.Run() == nil {
 		logger.Info("IP %s is already blocked in chain %s", ip, chain)
 		return nil
 	}
 
 	logger.Info("Adding iptables rule to block IP %s in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
+	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "DROP")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
@@ -791,7 +791,7 @@ func unblockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	logger.Info("Removing iptables rule to unblock IP %s in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
+	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "DROP")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))

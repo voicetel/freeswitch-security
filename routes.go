@@ -1,12 +1,158 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-// RegisterSecurityRoutes registers security-related API routes
+// RequestProcessor handles API requests using channels
+type RequestProcessor struct {
+	securityManager *SecurityManager
+	eslManager      *ESLManager
+
+	// Request channels
+	statusRequests  chan StatusRequest
+	commandRequests chan CommandRequest
+
+	// Worker pool
+	workerCount int
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+}
+
+// Request types
+type StatusRequest struct {
+	Type     string
+	Response chan StatusResponse
+}
+
+type StatusResponse struct {
+	Data  interface{}
+	Error error
+}
+
+type CommandRequest struct {
+	Command  string
+	Response chan CommandResponse
+}
+
+type CommandResponse struct {
+	Result string
+	Error  error
+}
+
+var (
+	requestProcessor *RequestProcessor
+	processorOnce    sync.Once
+)
+
+// InitRequestProcessor initializes the request processor
+func InitRequestProcessor(sm *SecurityManager, em *ESLManager) *RequestProcessor {
+	processorOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		requestProcessor = &RequestProcessor{
+			securityManager: sm,
+			eslManager:      em,
+			statusRequests:  make(chan StatusRequest, 100),
+			commandRequests: make(chan CommandRequest, 50),
+			workerCount:     4,
+			ctx:             ctx,
+			cancel:          cancel,
+		}
+
+		// Start workers
+		for i := 0; i < requestProcessor.workerCount; i++ {
+			requestProcessor.wg.Add(2)
+			go requestProcessor.processStatusRequests()
+			go requestProcessor.processCommandRequests()
+		}
+	})
+
+	return requestProcessor
+}
+
+// processStatusRequests handles status requests
+func (rp *RequestProcessor) processStatusRequests() {
+	defer rp.wg.Done()
+
+	for {
+		select {
+		case <-rp.ctx.Done():
+			return
+
+		case req := <-rp.statusRequests:
+			var response StatusResponse
+
+			switch req.Type {
+			case "security":
+				response.Data = rp.securityManager.GetSecurityStats()
+			case "esl":
+				response.Data = rp.eslManager.GetESLStats()
+			case "whitelist":
+				response.Data = rp.securityManager.GetWhitelistedIPs()
+			case "blacklist":
+				response.Data = rp.securityManager.GetBlacklistedIPs()
+			case "failed":
+				response.Data = rp.securityManager.GetFailedAttempts()
+			case "wrong-states":
+				response.Data = rp.securityManager.GetWrongCallStates()
+			default:
+				response.Error = fmt.Errorf("unknown status type: %s", req.Type)
+			}
+
+			// Send response
+			select {
+			case req.Response <- response:
+			case <-time.After(5 * time.Second):
+				// Timeout sending response
+			}
+		}
+	}
+}
+
+// processCommandRequests handles ESL command requests
+func (rp *RequestProcessor) processCommandRequests() {
+	defer rp.wg.Done()
+
+	for {
+		select {
+		case <-rp.ctx.Done():
+			return
+
+		case req := <-rp.commandRequests:
+			var response CommandResponse
+
+			// Execute command
+			result, err := rp.eslManager.SendCommand(req.Command)
+			response.Result = result
+			response.Error = err
+
+			// Send response
+			select {
+			case req.Response <- response:
+			case <-time.After(10 * time.Second):
+				// Timeout sending response
+			}
+		}
+	}
+}
+
+// Shutdown shuts down the request processor
+func (rp *RequestProcessor) Shutdown() {
+	rp.cancel()
+	close(rp.statusRequests)
+	close(rp.commandRequests)
+	rp.wg.Wait()
+}
+
+// RegisterSecurityRoutes registers security-related API routes with channel-based processing
 func RegisterSecurityRoutes(router *gin.Engine) {
 	// Initialize security manager if not already initialized
 	sm := GetSecurityManager()
@@ -16,6 +162,9 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 
 	// Initialize rate manager
 	rm := eslManager.rateManager
+
+	// Initialize request processor
+	processor := InitRequestProcessor(sm, eslManager)
 
 	// Security group
 	security := router.Group("/security")
@@ -33,12 +182,31 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 			})
 		})
 
-		// Get security statistics
+		// Get security statistics with caching
 		security.GET("/stats", func(c *gin.Context) {
-			c.JSON(200, sm.GetSecurityStats())
+			// Check cache first
+			cache := GetCacheManager()
+			cacheKey := "stats:security"
+
+			if cache.enabled {
+				if data, found := cache.GetSecurityItem(cacheKey); found {
+					c.Data(200, "application/json", data)
+					return
+				}
+			}
+
+			stats := sm.GetSecurityStats()
+			c.JSON(200, stats)
+
+			// Cache the result asynchronously
+			if cache.enabled {
+				if data, err := json.Marshal(stats); err == nil {
+					cache.CacheSecurityItemAsync(cacheKey, data)
+				}
+			}
 		})
 
-		// Whitelist management
+		// Whitelist management with batch operations
 		whitelist := security.Group("/whitelist")
 		{
 			// Get whitelisted IPs
@@ -73,6 +241,52 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 				}
 
 				c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s added to whitelist for %s@%s", req.IP, req.UserID, req.Domain)})
+			})
+
+			// Batch add to whitelist
+			whitelist.POST("/batch", func(c *gin.Context) {
+				var batch []struct {
+					IP        string `json:"ip" binding:"required"`
+					UserID    string `json:"user_id"`
+					Domain    string `json:"domain"`
+					Permanent bool   `json:"permanent"`
+				}
+
+				if err := c.ShouldBindJSON(&batch); err != nil {
+					c.JSON(400, gin.H{"error": err.Error()})
+					return
+				}
+
+				// Process batch asynchronously
+				results := make([]gin.H, len(batch))
+				var wg sync.WaitGroup
+
+				for i, req := range batch {
+					wg.Add(1)
+					go func(idx int, r struct {
+						IP        string `json:"ip" binding:"required"`
+						UserID    string `json:"user_id"`
+						Domain    string `json:"domain"`
+						Permanent bool   `json:"permanent"`
+					}) {
+						defer wg.Done()
+
+						if r.Domain == "" {
+							config := GetConfig()
+							r.Domain = config.FreeSWITCH.DefaultDomain
+						}
+
+						err := sm.AddToWhitelist(r.IP, r.UserID, r.Domain, r.Permanent)
+						if err != nil {
+							results[idx] = gin.H{"ip": r.IP, "error": err.Error()}
+						} else {
+							results[idx] = gin.H{"ip": r.IP, "status": "success"}
+						}
+					}(i, req)
+				}
+
+				wg.Wait()
+				c.JSON(200, gin.H{"results": results})
 			})
 
 			// Remove IP from whitelist
@@ -143,6 +357,45 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 				c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s added to blacklist", req.IP)})
 			})
 
+			// Batch add to blacklist
+			blacklist.POST("/batch", func(c *gin.Context) {
+				var batch []struct {
+					IP        string `json:"ip" binding:"required"`
+					Reason    string `json:"reason"`
+					Permanent bool   `json:"permanent"`
+				}
+
+				if err := c.ShouldBindJSON(&batch); err != nil {
+					c.JSON(400, gin.H{"error": err.Error()})
+					return
+				}
+
+				// Process batch asynchronously
+				results := make([]gin.H, len(batch))
+				var wg sync.WaitGroup
+
+				for i, req := range batch {
+					wg.Add(1)
+					go func(idx int, r struct {
+						IP        string `json:"ip" binding:"required"`
+						Reason    string `json:"reason"`
+						Permanent bool   `json:"permanent"`
+					}) {
+						defer wg.Done()
+
+						err := sm.AddToBlacklist(r.IP, r.Reason, r.Permanent)
+						if err != nil {
+							results[idx] = gin.H{"ip": r.IP, "error": err.Error()}
+						} else {
+							results[idx] = gin.H{"ip": r.IP, "status": "success"}
+						}
+					}(i, req)
+				}
+
+				wg.Wait()
+				c.JSON(200, gin.H{"results": results})
+			})
+
 			// Remove IP from blacklist
 			blacklist.DELETE("/:ip", func(c *gin.Context) {
 				ip := c.Param("ip")
@@ -191,7 +444,7 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 			})
 		})
 
-		// ESL management
+		// ESL management with channel-based command processing
 		esl := security.Group("/esl")
 		{
 			// Get ESL status
@@ -226,7 +479,7 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 				})
 			})
 
-			// Send command to ESL
+			// Send command with timeout using channels
 			esl.POST("/command", func(c *gin.Context) {
 				var req struct {
 					Command string `json:"command" binding:"required"`
@@ -237,16 +490,32 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 					return
 				}
 
-				response, err := eslManager.SendCommand(req.Command)
-				if err != nil {
-					c.JSON(500, gin.H{"error": err.Error()})
-					return
-				}
+				ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+				defer cancel()
 
-				c.JSON(200, gin.H{
-					"command":  req.Command,
-					"response": response,
-				})
+				respChan := make(chan CommandResponse, 1)
+
+				select {
+				case processor.commandRequests <- CommandRequest{
+					Command:  req.Command,
+					Response: respChan,
+				}:
+					select {
+					case resp := <-respChan:
+						if resp.Error != nil {
+							c.JSON(500, gin.H{"error": resp.Error.Error()})
+						} else {
+							c.JSON(200, gin.H{
+								"command":  req.Command,
+								"response": resp.Result,
+							})
+						}
+					case <-ctx.Done():
+						c.JSON(504, gin.H{"error": "command execution timeout"})
+					}
+				case <-ctx.Done():
+					c.JSON(504, gin.H{"error": "command queue timeout"})
+				}
 			})
 		}
 

@@ -275,7 +275,32 @@ curl -X POST http://127.0.0.1:8080/security/esl/command \
 
 ### IPTables Integration
 
-The application uses iptables for automatic IP blocking. It creates a dedicated chain (default: `FREESWITCH`) and adds rules to block malicious IPs. Ensure your system has iptables installed and the application has sufficient permissions to manage iptables rules. Additional instructions can be found [here](iptables.md).
+The application uses iptables for automatic IP blocking with the `DROP` action for enhanced security. It creates a dedicated chain (default: `FREESWITCH`) and adds rules to silently drop packets from malicious IPs.
+
+#### Why DROP instead of REJECT?
+
+The application uses the `DROP` action in iptables instead of `REJECT` for several important security reasons:
+
+- **Stealth**: `DROP` silently discards packets without sending any response, making it harder for attackers to detect that their traffic is being blocked
+- **Resource Conservation**: No CPU time is wasted generating ICMP error messages for malicious traffic
+- **Reduced Attack Surface**: Attackers cannot use the ICMP responses to gather information about your firewall configuration
+- **Better Security Posture**: Silent dropping is generally considered a security best practice for blocking malicious traffic
+
+When an IP is blocked with `DROP`:
+- Packets from the blocked IP are simply discarded
+- No response is sent back to the source
+- The attacker's connection attempts will timeout rather than immediately fail
+- This makes reconnaissance and automated attacks more difficult
+
+#### IPTables Rules Example
+
+When an IP is blocked, the application creates rules like:
+```bash
+# Block IP 192.0.2.1 (packets are silently dropped)
+iptables -A FREESWITCH -s 192.0.2.1 -j DROP
+```
+
+Ensure your system has iptables installed and the application has sufficient permissions to manage iptables rules. Additional instructions can be found [here](iptables.md).
 
 ## 🙌 Contributors
 

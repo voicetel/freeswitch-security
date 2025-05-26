@@ -36,6 +36,9 @@ type ESLManager struct {
 	workerCount  int
 	maxQueueSize int
 
+	// Event pool for memory efficiency
+	eventPool *EventPool
+
 	// Shutdown mechanism
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -60,6 +63,60 @@ type EventWorker struct {
 	id      int
 	manager *ESLManager
 	logger  *Logger
+}
+
+// ProcessedEvent is a reusable event object for the pool
+type ProcessedEvent struct {
+	EventName     string
+	EventSubclass string
+	IPAddress     string
+	UserID        string
+	Domain        string
+	Status        string
+	CallUUID      string
+	Headers       map[string]string
+}
+
+// EventPool manages a pool of reusable ProcessedEvent objects
+type EventPool struct {
+	pool sync.Pool
+}
+
+// NewEventPool creates a new event pool
+func NewEventPool() *EventPool {
+	return &EventPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &ProcessedEvent{
+					Headers: make(map[string]string, 20), // Pre-allocate common size
+				}
+			},
+		},
+	}
+}
+
+// Get retrieves a ProcessedEvent from the pool
+func (ep *EventPool) Get() *ProcessedEvent {
+	return ep.pool.Get().(*ProcessedEvent)
+}
+
+// Put returns a ProcessedEvent to the pool after clearing it
+func (ep *EventPool) Put(e *ProcessedEvent) {
+	// Clear the event
+	e.EventName = ""
+	e.EventSubclass = ""
+	e.IPAddress = ""
+	e.UserID = ""
+	e.Domain = ""
+	e.Status = ""
+	e.CallUUID = ""
+
+	// Clear headers map
+	for k := range e.Headers {
+		delete(e.Headers, k)
+	}
+
+	ep.pool.Put(e)
 }
 
 var (
@@ -125,12 +182,13 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			eventQueue:      make(chan *eventsocket.Event, eslConfig.MaxQueueSize),
 			workerCount:     eslConfig.WorkerCount,
 			maxQueueSize:    eslConfig.MaxQueueSize,
+			eventPool:       NewEventPool(), // Initialize event pool
 			ctx:             ctx,
 			cancel:          cancel,
 			shutdown:        false,
 		}
 
-		logger.Info("Initializing ESL manager with %d workers, queue size: %d",
+		logger.Info("Initializing ESL manager with %d workers, queue size: %d, with memory pool",
 			eslConfig.WorkerCount, eslConfig.MaxQueueSize)
 
 		// Start worker pool
@@ -181,8 +239,8 @@ func (w *EventWorker) run() {
 				return
 			}
 
-			// Process the event
-			w.processEvent(event)
+			// Process the event using the memory pool
+			w.processEventWithPool(event)
 
 			// Update statistics
 			atomic.AddInt64(&w.manager.statistics.EventsProcessed, 1)
@@ -190,43 +248,238 @@ func (w *EventWorker) run() {
 	}
 }
 
-// processEvent handles a single event
-func (w *EventWorker) processEvent(ev *eventsocket.Event) {
+// processEventWithPool processes an event using the memory pool
+func (w *EventWorker) processEventWithPool(ev *eventsocket.Event) {
 	startTime := time.Now()
+
+	// Get a processed event from the pool
+	processedEvent := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(processedEvent) // Return to pool when done
+
+	// Extract and store event data in the pooled object
+	processedEvent.EventName = ev.Get("Event-Name")
+	processedEvent.EventSubclass = ev.Get("Event-Subclass")
 
 	// Log event processing in trace mode
 	if w.logger.GetLogLevel() >= LogLevelTrace {
-		w.logger.Trace("Worker #%d processing event", w.id)
+		w.logger.Trace("Worker #%d processing event: %s/%s",
+			w.id, processedEvent.EventName, processedEvent.EventSubclass)
 	}
 
-	// Extract event type
-	eventName := ev.Get("Event-Name")
-	eventSubclass := ev.Get("Event-Subclass")
-
 	// Process based on event type
-	switch eventName {
+	switch processedEvent.EventName {
 	case "CUSTOM":
-		switch eventSubclass {
+		switch processedEvent.EventSubclass {
 		case "sofia::register":
-			w.handleSuccessfulRegistration(ev)
+			w.extractRegistrationData(ev, processedEvent)
+			w.handleSuccessfulRegistrationPooled(processedEvent)
 		case "sofia::register_failure":
-			w.handleFailedRegistration(ev)
+			w.extractFailedRegistrationData(ev, processedEvent)
+			w.handleFailedRegistrationPooled(processedEvent)
 		case "sofia::wrong_call_state":
-			w.handleWrongCallState(ev)
+			w.extractWrongCallStateData(ev, processedEvent)
+			w.handleWrongCallStatePooled(processedEvent)
 		default:
-			w.logger.Debug("Worker #%d: Unhandled CUSTOM event subclass: %s", w.id, eventSubclass)
+			w.logger.Debug("Worker #%d: Unhandled CUSTOM event subclass: %s",
+				w.id, processedEvent.EventSubclass)
 		}
 	case "CHANNEL_CREATE":
-		w.handleChannelCreate(ev)
+		w.extractChannelCreateData(ev, processedEvent)
+		w.handleChannelCreatePooled(processedEvent)
 	default:
-		w.logger.Debug("Worker #%d: Unhandled event type: %s", w.id, eventName)
+		w.logger.Debug("Worker #%d: Unhandled event type: %s", w.id, processedEvent.EventName)
 	}
 
 	// Log processing time in debug mode
 	if w.logger.GetLogLevel() >= LogLevelDebug {
 		processingTime := time.Since(startTime)
-		w.logger.Debug("Worker #%d processed %s event in %v", w.id, eventName, processingTime)
+		w.logger.Debug("Worker #%d processed %s event in %v",
+			w.id, processedEvent.EventName, processingTime)
 	}
+}
+
+// extractRegistrationData extracts registration data into the pooled event
+func (w *EventWorker) extractRegistrationData(ev *eventsocket.Event, pe *ProcessedEvent) {
+	pe.IPAddress = ev.Get("Network-Ip")
+
+	pe.UserID = ev.Get("From-User")
+	if pe.UserID == "" {
+		pe.UserID = ev.Get("Username")
+	}
+	if pe.UserID == "" {
+		pe.UserID = ev.Get("User_Name")
+	}
+
+	pe.Domain = ev.Get("From-Host")
+	if pe.Domain == "" {
+		pe.Domain = ev.Get("Domain_Name")
+	}
+	if pe.Domain == "" {
+		pe.Domain = ev.Get("Realm")
+	}
+
+	pe.Status = ev.Get("Status")
+}
+
+// extractFailedRegistrationData extracts failed registration data into the pooled event
+func (w *EventWorker) extractFailedRegistrationData(ev *eventsocket.Event, pe *ProcessedEvent) {
+	pe.IPAddress = ev.Get("Network-Ip")
+
+	pe.UserID = ev.Get("To-User")
+	if pe.UserID == "" {
+		pe.UserID = ev.Get("From-User")
+	}
+	if pe.UserID == "" {
+		pe.UserID = ev.Get("Username")
+	}
+	if pe.UserID == "" {
+		pe.UserID = ev.Get("User_Name")
+	}
+
+	pe.Domain = ev.Get("To-Host")
+	if pe.Domain == "" {
+		pe.Domain = ev.Get("From-Host")
+	}
+	if pe.Domain == "" {
+		pe.Domain = ev.Get("Domain_Name")
+	}
+	if pe.Domain == "" {
+		pe.Domain = ev.Get("Realm")
+	}
+}
+
+// extractWrongCallStateData extracts wrong call state data into the pooled event
+func (w *EventWorker) extractWrongCallStateData(ev *eventsocket.Event, pe *ProcessedEvent) {
+	pe.IPAddress = ev.Get("Network_Ip")
+	pe.UserID = ev.Get("From_User")
+}
+
+// extractChannelCreateData extracts channel create data into the pooled event
+func (w *EventWorker) extractChannelCreateData(ev *eventsocket.Event, pe *ProcessedEvent) {
+	pe.IPAddress = ev.Get("Variable_sip_network_ip")
+	if pe.IPAddress == "" {
+		pe.IPAddress = ev.Get("Variable_sip_from_host")
+	}
+
+	pe.UserID = ev.Get("Variable_sip_from_user")
+	pe.Domain = ev.Get("Variable_sip_from_host")
+	pe.CallUUID = ev.Get("Unique-ID")
+}
+
+// handleSuccessfulRegistrationPooled handles successful registration with pooled event
+func (w *EventWorker) handleSuccessfulRegistrationPooled(pe *ProcessedEvent) {
+	w.logger.Debug("Worker #%d: Registration info - IP: %s, User: %s, Domain: %s, Status: %s",
+		w.id, pe.IPAddress, pe.UserID, pe.Domain, pe.Status)
+
+	if pe.IPAddress == "" {
+		w.logger.Error("Worker #%d: Failed to extract IP address from registration event", w.id)
+		return
+	}
+
+	if pe.UserID == "" {
+		pe.UserID = "unknown"
+	}
+
+	if pe.Domain == "" {
+		config := GetConfig()
+		pe.Domain = config.FreeSWITCH.DefaultDomain
+	}
+
+	// Check rate limits
+	if !w.manager.rateManager.CheckRegistrationRate(pe.IPAddress, pe.UserID, pe.Domain) {
+		w.logger.Info("Worker #%d: Registration from IP %s blocked due to rate limiting",
+			w.id, pe.IPAddress)
+		return
+	}
+
+	w.logger.Info("Worker #%d: Successful registration from IP %s for user %s@%s",
+		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+
+	// Update statistics
+	w.manager.securityManager.UpdateRegistrationStats(pe.IPAddress, pe.UserID, pe.Domain)
+
+	// Auto-whitelist if enabled
+	if w.manager.securityManager.securityConfig.AutoWhitelistOnSuccess {
+		w.logger.Debug("Worker #%d: Auto-whitelisting IP %s for user %s@%s",
+			w.id, pe.IPAddress, pe.UserID, pe.Domain)
+		w.manager.securityManager.AddToWhitelist(pe.IPAddress, pe.UserID, pe.Domain, false)
+	}
+}
+
+// handleFailedRegistrationPooled handles failed registration with pooled event
+func (w *EventWorker) handleFailedRegistrationPooled(pe *ProcessedEvent) {
+	w.logger.Debug("Worker #%d: Failed registration info - IP: %s, User: %s, Domain: %s",
+		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+
+	if pe.IPAddress == "" {
+		w.logger.Error("Worker #%d: Failed to extract IP address from failed registration event", w.id)
+		return
+	}
+
+	if pe.UserID == "" {
+		pe.UserID = "unknown"
+	}
+
+	if pe.Domain == "" {
+		config := GetConfig()
+		pe.Domain = config.FreeSWITCH.DefaultDomain
+	}
+
+	w.logger.Info("Worker #%d: Failed registration from IP %s for user %s@%s",
+		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+
+	w.manager.securityManager.ProcessFailedRegistration(pe.IPAddress, pe.UserID, pe.Domain)
+}
+
+// handleWrongCallStatePooled handles wrong call state with pooled event
+func (w *EventWorker) handleWrongCallStatePooled(pe *ProcessedEvent) {
+	if pe.IPAddress == "" {
+		w.logger.Error("Worker #%d: Failed to extract IP address from wrong call state event", w.id)
+		return
+	}
+
+	if pe.UserID == "" {
+		pe.UserID = "unknown"
+	}
+
+	w.logger.Info("Worker #%d: Wrong call state event from IP %s for user %s",
+		w.id, pe.IPAddress, pe.UserID)
+
+	w.manager.securityManager.ProcessWrongCallState(pe.IPAddress, pe.UserID)
+}
+
+// handleChannelCreatePooled handles channel create with pooled event
+func (w *EventWorker) handleChannelCreatePooled(pe *ProcessedEvent) {
+	if pe.IPAddress == "" {
+		w.logger.Debug("Worker #%d: Could not determine source IP for channel create event", w.id)
+		return
+	}
+
+	allowed := w.manager.rateManager.CheckCallRate(pe.IPAddress, pe.UserID, pe.Domain)
+
+	if !allowed {
+		w.logger.Info("Worker #%d: Call from IP %s blocked due to rate limiting", w.id, pe.IPAddress)
+
+		if pe.CallUUID != "" && w.manager.eslClient != nil && w.manager.eslConnected {
+			hangupCmd := fmt.Sprintf("uuid_kill %s", pe.CallUUID)
+			_, err := w.manager.eslClient.Send(hangupCmd)
+			if err != nil {
+				w.logger.Error("Worker #%d: Error hanging up rate-limited call %s: %v",
+					w.id, pe.CallUUID, err)
+			} else {
+				w.logger.Info("Worker #%d: Successfully terminated rate-limited call %s",
+					w.id, pe.CallUUID)
+			}
+		}
+	} else {
+		w.logger.Debug("Worker #%d: Call from IP %s allowed (within rate limits)", w.id, pe.IPAddress)
+	}
+}
+
+// Legacy process methods - kept for compatibility but deprecated
+func (w *EventWorker) processEvent(ev *eventsocket.Event) {
+	// This method is deprecated - use processEventWithPool instead
+	w.processEventWithPool(ev)
 }
 
 // GetESLManager returns the ESL manager instance
@@ -457,164 +710,37 @@ func (em *ESLManager) readEvents() {
 	}
 }
 
-// Event processing methods moved to EventWorker
-
+// Legacy event processing methods kept for backward compatibility
 func (w *EventWorker) handleSuccessfulRegistration(ev *eventsocket.Event) {
-	ipAddress := ev.Get("Network-Ip")
-	userId := ev.Get("From-User")
-	if userId == "" {
-		userId = ev.Get("Username")
-	}
-	if userId == "" {
-		userId = ev.Get("User_Name")
-	}
+	pe := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(pe)
 
-	domain := ev.Get("From-Host")
-	if domain == "" {
-		domain = ev.Get("Domain_Name")
-	}
-	if domain == "" {
-		domain = ev.Get("Realm")
-	}
-
-	status := ev.Get("Status")
-
-	w.logger.Debug("Worker #%d: Registration info - IP: %s, User: %s, Domain: %s, Status: %s",
-		w.id, ipAddress, userId, domain, status)
-
-	if ipAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from registration event", w.id)
-		return
-	}
-
-	if userId == "" {
-		userId = "unknown"
-	}
-
-	if domain == "" {
-		config := GetConfig()
-		domain = config.FreeSWITCH.DefaultDomain
-	}
-
-	// Check rate limits
-	if !w.manager.rateManager.CheckRegistrationRate(ipAddress, userId, domain) {
-		w.logger.Info("Worker #%d: Registration from IP %s blocked due to rate limiting", w.id, ipAddress)
-		return
-	}
-
-	w.logger.Info("Worker #%d: Successful registration from IP %s for user %s@%s",
-		w.id, ipAddress, userId, domain)
-
-	// Update statistics
-	w.manager.securityManager.UpdateRegistrationStats(ipAddress, userId, domain)
-
-	// Auto-whitelist if enabled
-	if w.manager.securityManager.securityConfig.AutoWhitelistOnSuccess {
-		w.logger.Debug("Worker #%d: Auto-whitelisting IP %s for user %s@%s",
-			w.id, ipAddress, userId, domain)
-		w.manager.securityManager.AddToWhitelist(ipAddress, userId, domain, false)
-	}
+	w.extractRegistrationData(ev, pe)
+	w.handleSuccessfulRegistrationPooled(pe)
 }
 
 func (w *EventWorker) handleWrongCallState(ev *eventsocket.Event) {
-	ipAddress := ev.Get("Network_Ip")
-	userId := ev.Get("From_User")
+	pe := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(pe)
 
-	if ipAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from wrong call state event", w.id)
-		return
-	}
-
-	if userId == "" {
-		userId = "unknown"
-	}
-
-	w.logger.Info("Worker #%d: Wrong call state event from IP %s for user %s",
-		w.id, ipAddress, userId)
-
-	w.manager.securityManager.ProcessWrongCallState(ipAddress, userId)
+	w.extractWrongCallStateData(ev, pe)
+	w.handleWrongCallStatePooled(pe)
 }
 
 func (w *EventWorker) handleFailedRegistration(ev *eventsocket.Event) {
-	ipAddress := ev.Get("Network-Ip")
-	userId := ev.Get("To-User")
-	if userId == "" {
-		userId = ev.Get("From-User")
-	}
-	if userId == "" {
-		userId = ev.Get("Username")
-	}
-	if userId == "" {
-		userId = ev.Get("User_Name")
-	}
+	pe := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(pe)
 
-	domain := ev.Get("To-Host")
-	if domain == "" {
-		domain = ev.Get("From-Host")
-	}
-	if domain == "" {
-		domain = ev.Get("Domain_Name")
-	}
-	if domain == "" {
-		domain = ev.Get("Realm")
-	}
-
-	w.logger.Debug("Worker #%d: Failed registration info - IP: %s, User: %s, Domain: %s",
-		w.id, ipAddress, userId, domain)
-
-	if ipAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from failed registration event", w.id)
-		return
-	}
-
-	if userId == "" {
-		userId = "unknown"
-	}
-
-	if domain == "" {
-		config := GetConfig()
-		domain = config.FreeSWITCH.DefaultDomain
-	}
-
-	w.logger.Info("Worker #%d: Failed registration from IP %s for user %s@%s",
-		w.id, ipAddress, userId, domain)
-
-	w.manager.securityManager.ProcessFailedRegistration(ipAddress, userId, domain)
+	w.extractFailedRegistrationData(ev, pe)
+	w.handleFailedRegistrationPooled(pe)
 }
 
 func (w *EventWorker) handleChannelCreate(ev *eventsocket.Event) {
-	ipAddress := ev.Get("Variable_sip_network_ip")
-	if ipAddress == "" {
-		ipAddress = ev.Get("Variable_sip_from_host")
-		if ipAddress == "" {
-			w.logger.Debug("Worker #%d: Could not determine source IP for channel create event", w.id)
-			return
-		}
-	}
+	pe := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(pe)
 
-	userId := ev.Get("Variable_sip_from_user")
-	domain := ev.Get("Variable_sip_from_host")
-
-	allowed := w.manager.rateManager.CheckCallRate(ipAddress, userId, domain)
-
-	if !allowed {
-		w.logger.Info("Worker #%d: Call from IP %s blocked due to rate limiting", w.id, ipAddress)
-
-		callUUID := ev.Get("Unique-ID")
-		if callUUID != "" && w.manager.eslClient != nil && w.manager.eslConnected {
-			hangupCmd := fmt.Sprintf("uuid_kill %s", callUUID)
-			_, err := w.manager.eslClient.Send(hangupCmd)
-			if err != nil {
-				w.logger.Error("Worker #%d: Error hanging up rate-limited call %s: %v",
-					w.id, callUUID, err)
-			} else {
-				w.logger.Info("Worker #%d: Successfully terminated rate-limited call %s",
-					w.id, callUUID)
-			}
-		}
-	} else {
-		w.logger.Debug("Worker #%d: Call from IP %s allowed (within rate limits)", w.id, ipAddress)
-	}
+	w.extractChannelCreateData(ev, pe)
+	w.handleChannelCreatePooled(pe)
 }
 
 // SetESLLogLevel sets the logging level for ESL operations
@@ -654,6 +780,7 @@ func (em *ESLManager) GetESLStats() map[string]interface{} {
 		"worker_count":        em.workerCount,
 		"queue_size":          em.maxQueueSize,
 		"queue_length":        len(em.eventQueue),
+		"memory_pool_enabled": true, // New field to indicate pool usage
 	}
 }
 

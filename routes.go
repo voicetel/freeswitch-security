@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -165,6 +166,24 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 
 	// Initialize request processor
 	processor := InitRequestProcessor(sm, eslManager)
+
+	// Add system stats endpoint
+	router.GET("/system/stats", func(c *gin.Context) {
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+
+		c.JSON(200, gin.H{
+			"goroutines": runtime.NumGoroutine(),
+			"memory": gin.H{
+				"alloc_mb":       memStats.Alloc / 1024 / 1024,
+				"total_alloc_mb": memStats.TotalAlloc / 1024 / 1024,
+				"sys_mb":         memStats.Sys / 1024 / 1024,
+				"gc_runs":        memStats.NumGC,
+				"heap_objects":   memStats.HeapObjects,
+			},
+			"cpu_cores": runtime.NumCPU(),
+		})
+	})
 
 	// Security group
 	security := router.Group("/security")
@@ -447,7 +466,7 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 		// ESL management with channel-based command processing
 		esl := security.Group("/esl")
 		{
-			// Get ESL status
+			// Get ESL status - now includes memory pool stats
 			esl.GET("", func(c *gin.Context) {
 				c.JSON(200, eslManager.GetESLStats())
 			})

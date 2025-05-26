@@ -39,6 +39,10 @@ type ESLManager struct {
 	// Event pool for memory efficiency
 	eventPool *EventPool
 
+	// Dynamic channel sizing
+	channelResizer *ChannelResizer
+	lastQueueSize  int
+
 	// Shutdown mechanism
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -56,6 +60,19 @@ type ESLConfig struct {
 	ReconnectBackoff string
 	WorkerCount      int // Number of worker goroutines
 	MaxQueueSize     int // Maximum events in queue
+}
+
+// ChannelResizer manages dynamic channel buffer sizes
+type ChannelResizer struct {
+	baseSize       int
+	currentSize    int
+	maxSize        int
+	lastResize     time.Time
+	resizeInterval time.Duration
+	loadThreshold  float64
+	highLoadCount  int
+	lowLoadCount   int
+	mutex          sync.RWMutex
 }
 
 // EventWorker processes events from the queue
@@ -119,6 +136,94 @@ func (ep *EventPool) Put(e *ProcessedEvent) {
 	ep.pool.Put(e)
 }
 
+// NewChannelResizer creates a new channel resizer
+func NewChannelResizer(baseSize, maxSize int) *ChannelResizer {
+	return &ChannelResizer{
+		baseSize:       baseSize,
+		currentSize:    baseSize,
+		maxSize:        maxSize,
+		lastResize:     time.Now(),
+		resizeInterval: 30 * time.Second, // Check every 30 seconds
+		loadThreshold:  0.7,              // 70% utilization triggers resize
+	}
+}
+
+// CalculateSize determines the appropriate channel size based on load
+func (cr *ChannelResizer) CalculateSize(currentLoad, capacity int64) int {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+
+	// Don't resize too frequently
+	if time.Since(cr.lastResize) < cr.resizeInterval {
+		return cr.currentSize
+	}
+
+	utilization := float64(currentLoad) / float64(capacity)
+
+	// High load detection
+	if utilization > cr.loadThreshold {
+		cr.highLoadCount++
+		cr.lowLoadCount = 0
+
+		// After 3 consecutive high load detections, increase size
+		if cr.highLoadCount >= 3 {
+			newSize := cr.currentSize * 2
+			if newSize > cr.maxSize {
+				newSize = cr.maxSize
+			}
+			if newSize != cr.currentSize {
+				cr.currentSize = newSize
+				cr.lastResize = time.Now()
+				cr.highLoadCount = 0
+			}
+		}
+	} else if utilization < 0.3 { // Low load
+		cr.lowLoadCount++
+		cr.highLoadCount = 0
+
+		// After 5 consecutive low load detections, decrease size
+		if cr.lowLoadCount >= 5 {
+			newSize := cr.currentSize / 2
+			if newSize < cr.baseSize {
+				newSize = cr.baseSize
+			}
+			if newSize != cr.currentSize {
+				cr.currentSize = newSize
+				cr.lastResize = time.Now()
+				cr.lowLoadCount = 0
+			}
+		}
+	} else {
+		// Normal load, reset counters
+		cr.highLoadCount = 0
+		cr.lowLoadCount = 0
+	}
+
+	return cr.currentSize
+}
+
+// GetCurrentSize returns the current channel size
+func (cr *ChannelResizer) GetCurrentSize() int {
+	cr.mutex.RLock()
+	defer cr.mutex.RUnlock()
+	return cr.currentSize
+}
+
+// GetStats returns resizer statistics
+func (cr *ChannelResizer) GetStats() map[string]interface{} {
+	cr.mutex.RLock()
+	defer cr.mutex.RUnlock()
+
+	return map[string]interface{}{
+		"base_size":       cr.baseSize,
+		"current_size":    cr.currentSize,
+		"max_size":        cr.maxSize,
+		"high_load_count": cr.highLoadCount,
+		"low_load_count":  cr.lowLoadCount,
+		"last_resize":     cr.lastResize.Format(time.RFC3339),
+	}
+}
+
 var (
 	eslManager     *ESLManager
 	eslManagerOnce sync.Once
@@ -155,6 +260,10 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			workerCount = 8 // Cap at 8 workers
 		}
 
+		// Initial queue size - will be dynamically adjusted
+		initialQueueSize := 1000
+		maxQueueSize := 10000
+
 		// Create ESL config
 		eslConfig := ESLConfig{
 			Host:             config.Security.ESLHost,
@@ -163,7 +272,7 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			LogLevel:         config.Security.ESLLogLevel,
 			ReconnectBackoff: config.Security.ReconnectBackoff,
 			WorkerCount:      workerCount,
-			MaxQueueSize:     1000, // Default queue size
+			MaxQueueSize:     maxQueueSize,
 		}
 
 		// Initialize rate manager
@@ -179,20 +288,26 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			eslDisconnected: make(chan bool, 1),
 			eslLogLevel:     logLevel,
 			rateManager:     rateManager,
-			eventQueue:      make(chan *eventsocket.Event, eslConfig.MaxQueueSize),
+			eventQueue:      make(chan *eventsocket.Event, initialQueueSize),
 			workerCount:     eslConfig.WorkerCount,
 			maxQueueSize:    eslConfig.MaxQueueSize,
-			eventPool:       NewEventPool(), // Initialize event pool
+			eventPool:       NewEventPool(),
+			channelResizer:  NewChannelResizer(initialQueueSize, maxQueueSize),
+			lastQueueSize:   initialQueueSize,
 			ctx:             ctx,
 			cancel:          cancel,
 			shutdown:        false,
 		}
 
-		logger.Info("Initializing ESL manager with %d workers, queue size: %d, with memory pool",
-			eslConfig.WorkerCount, eslConfig.MaxQueueSize)
+		logger.Info("Initializing ESL manager with %d workers, initial queue size: %d, max queue size: %d",
+			eslConfig.WorkerCount, initialQueueSize, maxQueueSize)
 
 		// Start worker pool
 		eslManager.startWorkerPool()
+
+		// Start channel resizer monitor
+		eslManager.wg.Add(1)
+		go eslManager.monitorChannelSize()
 
 		// Start ESL connection
 		logger.Info("Starting ESL connection")
@@ -201,6 +316,66 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 	})
 
 	return eslManager, err
+}
+
+// monitorChannelSize monitors and adjusts channel sizes based on load
+func (em *ESLManager) monitorChannelSize() {
+	defer em.wg.Done()
+
+	logger := GetLogger()
+	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-em.ctx.Done():
+			logger.Info("Channel size monitor shutting down")
+			return
+
+		case <-ticker.C:
+			// Calculate current load
+			queueLen := len(em.eventQueue)
+			capacity := cap(em.eventQueue)
+			eventsQueued := atomic.LoadInt64(&em.statistics.EventsQueued)
+
+			// Calculate new size
+			newSize := em.channelResizer.CalculateSize(int64(queueLen), int64(capacity))
+
+			// If size needs to change, recreate the channel
+			if newSize != em.lastQueueSize {
+				logger.Info("Adjusting event queue size from %d to %d (current load: %d/%d)",
+					em.lastQueueSize, newSize, queueLen, capacity)
+
+				// Create new channel
+				newQueue := make(chan *eventsocket.Event, newSize)
+
+				// Transfer existing events
+				close(em.eventQueue)
+				transferred := 0
+				for event := range em.eventQueue {
+					select {
+					case newQueue <- event:
+						transferred++
+					default:
+						// New queue is full, drop event
+						atomic.AddInt64(&em.statistics.EventsDropped, 1)
+					}
+				}
+
+				em.eventQueue = newQueue
+				em.lastQueueSize = newSize
+
+				logger.Info("Channel resize complete, transferred %d events", transferred)
+			}
+
+			// Log statistics periodically
+			if logger.GetLogLevel() >= LogLevelDebug {
+				logger.Debug("Channel monitor - Queue: %d/%d, Events queued: %d, Dropped: %d",
+					queueLen, capacity, eventsQueued,
+					atomic.LoadInt64(&em.statistics.EventsDropped))
+			}
+		}
+	}
 }
 
 // startWorkerPool starts the event processing workers
@@ -512,8 +687,7 @@ func (em *ESLManager) Shutdown() {
 		em.eslClient.Close()
 	}
 
-	// Close event queue to signal workers to exit
-	close(em.eventQueue)
+	// Don't close event queue here as it might be recreated by monitor
 
 	// Shutdown rate manager
 	if em.rateManager != nil {
@@ -522,6 +696,9 @@ func (em *ESLManager) Shutdown() {
 
 	// Wait for all goroutines to finish
 	em.wg.Wait()
+
+	// Now safe to close the queue
+	close(em.eventQueue)
 
 	logger.Info("ESL manager shutdown complete")
 }
@@ -765,8 +942,10 @@ func (em *ESLManager) SetESLLogLevel(level string) {
 	logger.Info("ESL log level set to: %s", level)
 }
 
-// GetESLStats returns current ESL statistics
+// GetESLStats returns current ESL statistics including channel sizing info
 func (em *ESLManager) GetESLStats() map[string]interface{} {
+	channelStats := em.channelResizer.GetStats()
+
 	return map[string]interface{}{
 		"connected":           em.eslConnected,
 		"host":                em.eslConfig.Host,
@@ -778,9 +957,12 @@ func (em *ESLManager) GetESLStats() map[string]interface{} {
 		"events_dropped":      atomic.LoadInt64(&em.statistics.EventsDropped),
 		"log_level":           em.eslConfig.LogLevel,
 		"worker_count":        em.workerCount,
-		"queue_size":          em.maxQueueSize,
+		"queue_size":          em.lastQueueSize,
 		"queue_length":        len(em.eventQueue),
-		"memory_pool_enabled": true, // New field to indicate pool usage
+		"queue_capacity":      cap(em.eventQueue),
+		"memory_pool_enabled": true,
+		"dynamic_sizing":      true,
+		"channel_stats":       channelStats,
 	}
 }
 

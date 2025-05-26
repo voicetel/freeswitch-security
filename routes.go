@@ -104,6 +104,8 @@ func (rp *RequestProcessor) processStatusRequests() {
 				response.Data = rp.securityManager.GetFailedAttempts()
 			case "wrong-states":
 				response.Data = rp.securityManager.GetWrongCallStates()
+			case "channel-stats":
+				response.Data = rp.securityManager.GetChannelStats()
 			default:
 				response.Error = fmt.Errorf("unknown status type: %s", req.Type)
 			}
@@ -222,6 +224,30 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 				if data, err := json.Marshal(stats); err == nil {
 					cache.CacheSecurityItemAsync(cacheKey, data)
 				}
+			}
+		})
+
+		// Get dynamic channel statistics
+		security.GET("/channels", func(c *gin.Context) {
+			respChan := make(chan StatusResponse, 1)
+
+			select {
+			case processor.statusRequests <- StatusRequest{
+				Type:     "channel-stats",
+				Response: respChan,
+			}:
+				select {
+				case resp := <-respChan:
+					if resp.Error != nil {
+						c.JSON(500, gin.H{"error": resp.Error.Error()})
+					} else {
+						c.JSON(200, resp.Data)
+					}
+				case <-time.After(5 * time.Second):
+					c.JSON(504, gin.H{"error": "timeout getting channel stats"})
+				}
+			case <-time.After(1 * time.Second):
+				c.JSON(504, gin.H{"error": "status queue timeout"})
 			}
 		})
 
@@ -466,7 +492,7 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 		// ESL management with channel-based command processing
 		esl := security.Group("/esl")
 		{
-			// Get ESL status - now includes memory pool stats
+			// Get ESL status - now includes memory pool and dynamic channel stats
 			esl.GET("", func(c *gin.Context) {
 				c.JSON(200, eslManager.GetESLStats())
 			})

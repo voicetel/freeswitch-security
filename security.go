@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,10 +35,30 @@ type SecurityManager struct {
 	batchSize     int
 	batchInterval time.Duration
 
+	// Dynamic channel sizing
+	channelResizers map[string]*DynamicChannelManager
+	channelMutex    sync.RWMutex
+
 	// Shutdown mechanism
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// DynamicChannelManager manages dynamic sizing for a specific channel
+type DynamicChannelManager struct {
+	name           string
+	baseSize       int
+	currentSize    int
+	maxSize        int
+	minSize        int
+	lastResize     time.Time
+	resizeInterval time.Duration
+	highLoadCount  int
+	lowLoadCount   int
+	totalProcessed int64
+	totalDropped   int64
+	mutex          sync.RWMutex
 }
 
 // SecurityConfig holds security-related configuration
@@ -140,6 +161,98 @@ var (
 	secManagerOnce  sync.Once
 )
 
+// NewDynamicChannelManager creates a new dynamic channel manager
+func NewDynamicChannelManager(name string, baseSize, minSize, maxSize int) *DynamicChannelManager {
+	return &DynamicChannelManager{
+		name:           name,
+		baseSize:       baseSize,
+		currentSize:    baseSize,
+		minSize:        minSize,
+		maxSize:        maxSize,
+		lastResize:     time.Now(),
+		resizeInterval: 30 * time.Second,
+	}
+}
+
+// ShouldResize determines if a channel should be resized based on current load
+func (dcm *DynamicChannelManager) ShouldResize(currentLength, currentCapacity int) (bool, int) {
+	dcm.mutex.Lock()
+	defer dcm.mutex.Unlock()
+
+	// Don't resize too frequently
+	if time.Since(dcm.lastResize) < dcm.resizeInterval {
+		return false, dcm.currentSize
+	}
+
+	utilization := float64(currentLength) / float64(currentCapacity)
+
+	// High load: > 80% utilization
+	if utilization > 0.8 {
+		dcm.highLoadCount++
+		dcm.lowLoadCount = 0
+
+		if dcm.highLoadCount >= 3 {
+			newSize := dcm.currentSize * 2
+			if newSize > dcm.maxSize {
+				newSize = dcm.maxSize
+			}
+			if newSize != dcm.currentSize {
+				dcm.currentSize = newSize
+				dcm.lastResize = time.Now()
+				dcm.highLoadCount = 0
+				return true, newSize
+			}
+		}
+	} else if utilization < 0.2 { // Low load: < 20% utilization
+		dcm.lowLoadCount++
+		dcm.highLoadCount = 0
+
+		if dcm.lowLoadCount >= 5 {
+			newSize := dcm.currentSize / 2
+			if newSize < dcm.minSize {
+				newSize = dcm.minSize
+			}
+			if newSize != dcm.currentSize {
+				dcm.currentSize = newSize
+				dcm.lastResize = time.Now()
+				dcm.lowLoadCount = 0
+				return true, newSize
+			}
+		}
+	} else {
+		// Normal load, reset counters
+		dcm.highLoadCount = 0
+		dcm.lowLoadCount = 0
+	}
+
+	return false, dcm.currentSize
+}
+
+// UpdateStats updates the channel statistics
+func (dcm *DynamicChannelManager) UpdateStats(processed, dropped int64) {
+	atomic.AddInt64(&dcm.totalProcessed, processed)
+	atomic.AddInt64(&dcm.totalDropped, dropped)
+}
+
+// GetStats returns channel statistics
+func (dcm *DynamicChannelManager) GetStats() map[string]interface{} {
+	dcm.mutex.RLock()
+	defer dcm.mutex.RUnlock()
+
+	return map[string]interface{}{
+		"name":            dcm.name,
+		"current_size":    dcm.currentSize,
+		"base_size":       dcm.baseSize,
+		"min_size":        dcm.minSize,
+		"max_size":        dcm.maxSize,
+		"high_load_count": dcm.highLoadCount,
+		"low_load_count":  dcm.lowLoadCount,
+		"last_resize":     dcm.lastResize.Format(time.RFC3339),
+		"total_processed": atomic.LoadInt64(&dcm.totalProcessed),
+		"total_dropped":   atomic.LoadInt64(&dcm.totalDropped),
+	}
+}
+
 // InitSecurityManager initializes the security manager
 func InitSecurityManager() error {
 	var err error
@@ -180,7 +293,14 @@ func InitSecurityManager() error {
 		// Create context for shutdown
 		ctx, cancel := context.WithCancel(context.Background())
 
-		// Initialize the security manager
+		// Initialize channel resizers
+		channelResizers := make(map[string]*DynamicChannelManager)
+		channelResizers["blacklist"] = NewDynamicChannelManager("blacklist", 1000, 500, 5000)
+		channelResizers["whitelist"] = NewDynamicChannelManager("whitelist", 1000, 500, 5000)
+		channelResizers["failed"] = NewDynamicChannelManager("failed", 5000, 1000, 20000)
+		channelResizers["wrongstate"] = NewDynamicChannelManager("wrongstate", 5000, 1000, 20000)
+
+		// Initialize the security manager with dynamic channel sizes
 		securityManager = &SecurityManager{
 			whitelist:         make(map[string]WhitelistEntry),
 			blacklist:         make(map[string]BlacklistEntry),
@@ -194,18 +314,24 @@ func InitSecurityManager() error {
 				LastFailedTime:         time.Time{},
 				LastWrongCallStateTime: time.Time{},
 			},
-			// Channel initialization
-			blacklistQueue:  make(chan BlacklistRequest, 1000),
-			whitelistQueue:  make(chan WhitelistRequest, 1000),
-			failedQueue:     make(chan FailedAttemptRequest, 5000),
-			wrongStateQueue: make(chan WrongStateRequest, 5000),
+			// Channel initialization with dynamic sizes
+			blacklistQueue:  make(chan BlacklistRequest, channelResizers["blacklist"].currentSize),
+			whitelistQueue:  make(chan WhitelistRequest, channelResizers["whitelist"].currentSize),
+			failedQueue:     make(chan FailedAttemptRequest, channelResizers["failed"].currentSize),
+			wrongStateQueue: make(chan WrongStateRequest, channelResizers["wrongstate"].currentSize),
 			batchSize:       10,
 			batchInterval:   100 * time.Millisecond,
+			channelResizers: channelResizers,
 			ctx:             ctx,
 			cancel:          cancel,
 		}
 
-		logger.Info("Security manager initialized with channel-based processing")
+		logger.Info("Security manager initialized with dynamic channel sizing")
+		logger.Info("Initial channel sizes - Blacklist: %d, Whitelist: %d, Failed: %d, WrongState: %d",
+			channelResizers["blacklist"].currentSize,
+			channelResizers["whitelist"].currentSize,
+			channelResizers["failed"].currentSize,
+			channelResizers["wrongstate"].currentSize)
 		logger.Info("Whitelist settings - Enabled: %t, TTL: %s, Auto-whitelist: %t",
 			secConfig.WhitelistEnabled, secConfig.WhitelistTTL, secConfig.AutoWhitelistOnSuccess)
 		logger.Info("Blacklist settings - Auto-block: %t, Max attempts: %d, Window: %s, Duration: %s",
@@ -238,6 +364,10 @@ func InitSecurityManager() error {
 		go securityManager.processFailedAttemptQueue()
 		go securityManager.processWrongStateQueue()
 
+		// Start channel monitor
+		securityManager.wg.Add(1)
+		go securityManager.monitorChannelSizes()
+
 		// Start cleanup routine
 		logger.Info("Starting periodic cleanup routine")
 		securityManager.wg.Add(1)
@@ -245,6 +375,157 @@ func InitSecurityManager() error {
 	})
 
 	return err
+}
+
+// monitorChannelSizes monitors and adjusts channel sizes based on load
+func (sm *SecurityManager) monitorChannelSizes() {
+	defer sm.wg.Done()
+
+	logger := GetLogger()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			logger.Info("Channel size monitor shutting down")
+			return
+
+		case <-ticker.C:
+			// Check each channel and resize if needed
+			sm.checkAndResizeChannel("blacklist", sm.blacklistQueue)
+			sm.checkAndResizeChannel("whitelist", sm.whitelistQueue)
+			sm.checkAndResizeChannel("failed", sm.failedQueue)
+			sm.checkAndResizeChannel("wrongstate", sm.wrongStateQueue)
+		}
+	}
+}
+
+// checkAndResizeChannel checks a specific channel and resizes if needed
+func (sm *SecurityManager) checkAndResizeChannel(name string, currentChannel interface{}) {
+	logger := GetLogger()
+
+	sm.channelMutex.RLock()
+	resizer, exists := sm.channelResizers[name]
+	sm.channelMutex.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	var length, capacity int
+	var needsResize bool
+	var newSize int
+
+	// Get channel metrics based on type
+	switch ch := currentChannel.(type) {
+	case chan BlacklistRequest:
+		length = len(ch)
+		capacity = cap(ch)
+		needsResize, newSize = resizer.ShouldResize(length, capacity)
+		if needsResize {
+			sm.resizeBlacklistChannel(newSize)
+		}
+	case chan WhitelistRequest:
+		length = len(ch)
+		capacity = cap(ch)
+		needsResize, newSize = resizer.ShouldResize(length, capacity)
+		if needsResize {
+			sm.resizeWhitelistChannel(newSize)
+		}
+	case chan FailedAttemptRequest:
+		length = len(ch)
+		capacity = cap(ch)
+		needsResize, newSize = resizer.ShouldResize(length, capacity)
+		if needsResize {
+			sm.resizeFailedChannel(newSize)
+		}
+	case chan WrongStateRequest:
+		length = len(ch)
+		capacity = cap(ch)
+		needsResize, newSize = resizer.ShouldResize(length, capacity)
+		if needsResize {
+			sm.resizeWrongStateChannel(newSize)
+		}
+	}
+
+	if needsResize {
+		logger.Info("Resized %s channel from %d to %d (was %d/%d full)",
+			name, capacity, newSize, length, capacity)
+	}
+}
+
+// Channel resize methods
+func (sm *SecurityManager) resizeBlacklistChannel(newSize int) {
+	newChan := make(chan BlacklistRequest, newSize)
+	oldChan := sm.blacklistQueue
+	sm.blacklistQueue = newChan
+
+	// Transfer existing items
+	go func() {
+		for req := range oldChan {
+			select {
+			case newChan <- req:
+			default:
+				// New channel full, send error response
+				if req.Response != nil {
+					req.Response <- fmt.Errorf("channel resize: queue full")
+				}
+				sm.channelResizers["blacklist"].UpdateStats(0, 1)
+			}
+		}
+	}()
+}
+
+func (sm *SecurityManager) resizeWhitelistChannel(newSize int) {
+	newChan := make(chan WhitelistRequest, newSize)
+	oldChan := sm.whitelistQueue
+	sm.whitelistQueue = newChan
+
+	go func() {
+		for req := range oldChan {
+			select {
+			case newChan <- req:
+			default:
+				if req.Response != nil {
+					req.Response <- fmt.Errorf("channel resize: queue full")
+				}
+				sm.channelResizers["whitelist"].UpdateStats(0, 1)
+			}
+		}
+	}()
+}
+
+func (sm *SecurityManager) resizeFailedChannel(newSize int) {
+	newChan := make(chan FailedAttemptRequest, newSize)
+	oldChan := sm.failedQueue
+	sm.failedQueue = newChan
+
+	go func() {
+		for req := range oldChan {
+			select {
+			case newChan <- req:
+			default:
+				sm.channelResizers["failed"].UpdateStats(0, 1)
+			}
+		}
+	}()
+}
+
+func (sm *SecurityManager) resizeWrongStateChannel(newSize int) {
+	newChan := make(chan WrongStateRequest, newSize)
+	oldChan := sm.wrongStateQueue
+	sm.wrongStateQueue = newChan
+
+	go func() {
+		for req := range oldChan {
+			select {
+			case newChan <- req:
+			default:
+				sm.channelResizers["wrongstate"].UpdateStats(0, 1)
+			}
+		}
+	}()
 }
 
 // Shutdown gracefully shuts down the security manager
@@ -319,6 +600,9 @@ func (sm *SecurityManager) processBlacklistQueue() {
 // processBatchBlacklist processes a batch of blacklist requests
 func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 	logger := GetLogger()
+
+	// Update channel statistics
+	sm.channelResizers["blacklist"].UpdateStats(int64(len(batch)), 0)
 
 	// Batch iptables commands
 	var iptablesCommands []string
@@ -476,6 +760,9 @@ func (sm *SecurityManager) processWhitelistQueue() {
 func (sm *SecurityManager) processBatchWhitelist(batch []WhitelistRequest) {
 	logger := GetLogger()
 
+	// Update channel statistics
+	sm.channelResizers["whitelist"].UpdateStats(int64(len(batch)), 0)
+
 	whitelistTTL, _ := time.ParseDuration(sm.securityConfig.WhitelistTTL)
 	if whitelistTTL == 0 {
 		whitelistTTL = 24 * time.Hour
@@ -577,6 +864,9 @@ func (sm *SecurityManager) processFailedAttemptQueue() {
 // processBatchFailedAttempts processes a batch of failed attempts
 func (sm *SecurityManager) processBatchFailedAttempts(batch []FailedAttemptRequest) {
 	logger := GetLogger()
+
+	// Update channel statistics
+	sm.channelResizers["failed"].UpdateStats(int64(len(batch)), 0)
 
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -682,6 +972,7 @@ func (sm *SecurityManager) processBatchFailedAttempts(batch []FailedAttemptReque
 		default:
 			// Queue is full, log error
 			logger.Error("Blacklist queue full, could not queue IP %s", req.IP)
+			sm.channelResizers["blacklist"].UpdateStats(0, 1)
 		}
 	}
 }
@@ -725,6 +1016,9 @@ func (sm *SecurityManager) processWrongStateQueue() {
 // processBatchWrongStates processes a batch of wrong call states
 func (sm *SecurityManager) processBatchWrongStates(batch []WrongStateRequest) {
 	logger := GetLogger()
+
+	// Update channel statistics
+	sm.channelResizers["wrongstate"].UpdateStats(int64(len(batch)), 0)
 
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -804,6 +1098,7 @@ func (sm *SecurityManager) processBatchWrongStates(batch []WrongStateRequest) {
 			logger.Info("Queued IP %s for blacklisting: %s", req.IP, req.Reason)
 		default:
 			logger.Error("Blacklist queue full, could not queue IP %s", req.IP)
+			sm.channelResizers["blacklist"].UpdateStats(0, 1)
 		}
 	}
 }
@@ -837,6 +1132,7 @@ func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain s
 		// Queue is full, drop the event
 		logger := GetLogger()
 		logger.Error("Failed attempt queue full, dropping event for IP %s", ipAddress)
+		sm.channelResizers["failed"].UpdateStats(0, 1)
 	}
 }
 
@@ -852,6 +1148,7 @@ func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
 		// Queue is full, drop the event
 		logger := GetLogger()
 		logger.Error("Wrong state queue full, dropping event for IP %s", ipAddress)
+		sm.channelResizers["wrongstate"].UpdateStats(0, 1)
 	}
 }
 
@@ -1229,6 +1526,27 @@ func (sm *SecurityManager) GetSecurityStats() SecurityStats {
 	sm.statsMutex.RLock()
 	stats := sm.statistics
 	sm.statsMutex.RUnlock()
+	return stats
+}
+
+// GetChannelStats returns dynamic channel statistics
+func (sm *SecurityManager) GetChannelStats() map[string]interface{} {
+	sm.channelMutex.RLock()
+	defer sm.channelMutex.RUnlock()
+
+	stats := make(map[string]interface{})
+	for name, resizer := range sm.channelResizers {
+		stats[name] = resizer.GetStats()
+	}
+
+	// Add current queue lengths
+	stats["current_queue_lengths"] = map[string]int{
+		"blacklist":  len(sm.blacklistQueue),
+		"whitelist":  len(sm.whitelistQueue),
+		"failed":     len(sm.failedQueue),
+		"wrongstate": len(sm.wrongStateQueue),
+	}
+
 	return stats
 }
 

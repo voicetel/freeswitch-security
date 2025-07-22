@@ -703,7 +703,7 @@ func (sm *SecurityManager) batchBlockIPs(ips []string) {
 	var commands []string
 	for _, ip := range ips {
 		// Check if already blocked
-		checkCmd := fmt.Sprintf("iptables -C %s -s %s --dport 5060 -j DROP 2>/dev/null || iptables -A %s -s %s --dport 5060 -j DROP",
+		checkCmd := fmt.Sprintf("iptables -C %s -s %s -j DROP 2>/dev/null || iptables -A %s -s %s -j DROP",
 			sm.securityConfig.IPTablesChain, ip, sm.securityConfig.IPTablesChain, ip)
 		commands = append(commands, checkCmd)
 	}
@@ -716,7 +716,7 @@ func (sm *SecurityManager) batchBlockIPs(ips []string) {
 	if err != nil {
 		logger.Error("Batch iptables error: %v, output: %s", err, string(output))
 	} else {
-		logger.Info("Successfully blocked %d IPs on port 5060 in batch", len(ips))
+		logger.Info("Successfully blocked %d IPs on port in batch", len(ips))
 	}
 }
 
@@ -1651,14 +1651,14 @@ func blockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	// First check if the rule already exists
-	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "--dport", "5060", "-j", "DROP")
+	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
 	if checkCmd.Run() == nil {
-		logger.Info("IP %s is already blocked on port 5060 in chain %s", ip, chain)
+		logger.Info("IP %s is already blocked on port  in chain %s", ip, chain)
 		return nil
 	}
 
-	logger.Info("Adding iptables rule to block IP %s on port 5060 in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "--dport", "5060", "-j", "DROP")
+	logger.Info("Adding iptables rule to block IP %s on port  in chain %s", ip, chain)
+	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "DROP")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
@@ -1670,8 +1670,8 @@ func blockIPWithIptables(ip, chain string) error {
 func unblockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
-	logger.Info("Removing iptables rule to unblock IP %s on port 5060 in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "--dport", "5060", "-j", "DROP")
+	logger.Info("Removing iptables rule to unblock IP %s on port  in chain %s", ip, chain)
+	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "DROP")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))

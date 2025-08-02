@@ -730,7 +730,7 @@ func (sm *SecurityManager) processBatchBlock(ips []string) {
 	// Build commands with existence checks
 	for _, ip := range ips {
 		// First check if rule already exists, then add if not
-		checkAndAdd := fmt.Sprintf("iptables -w 10 -C %s -s %s -j DROP 2>/dev/null || iptables -w 10 -A %s -s %s -j DROP",
+		checkAndAdd := fmt.Sprintf("iptables -C %s -s %s -j DROP 2>/dev/null || iptables -A %s -s %s -j DROP",
 			sm.securityConfig.IPTablesChain, ip, sm.securityConfig.IPTablesChain, ip)
 		commands = append(commands, checkAndAdd)
 		validIPs = append(validIPs, ip)
@@ -1694,7 +1694,7 @@ func ensureIPTablesChain(chain string) error {
 	logger := GetLogger()
 
 	// Check if chain exists
-	checkCmd := exec.Command("iptables", "-w", "10", "-L", chain)
+	checkCmd := exec.Command("iptables", "-L", chain)
 	err := checkCmd.Run()
 
 	if err != nil {
@@ -1703,7 +1703,7 @@ func ensureIPTablesChain(chain string) error {
 
 		maxRetries := 3
 		for attempt := 1; attempt <= maxRetries; attempt++ {
-			createCmd := exec.Command("iptables", "-w", "10", "-N", chain)
+			createCmd := exec.Command("iptables", "-N", chain)
 			output, err := createCmd.CombinedOutput()
 
 			if err == nil {
@@ -1733,7 +1733,7 @@ func ensureIPTablesChain(chain string) error {
 		// Add a jump from INPUT to our chain with retry logic
 		logger.Info("Adding jump from INPUT to chain %s", chain)
 		for attempt := 1; attempt <= maxRetries; attempt++ {
-			linkCmd := exec.Command("iptables", "-w", "10", "-A", "INPUT", "-j", chain)
+			linkCmd := exec.Command("iptables", "-A", "INPUT", "-j", chain)
 			output, err := linkCmd.CombinedOutput()
 
 			if err == nil {
@@ -1765,7 +1765,7 @@ func blockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	// First check if the rule already exists
-	checkCmd := exec.Command("iptables", "-w", "10", "-C", chain, "-s", ip, "-j", "DROP")
+	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
 	if checkCmd.Run() == nil {
 		logger.Info("IP %s is already blocked in chain %s", ip, chain)
 		return nil
@@ -1776,7 +1776,7 @@ func blockIPWithIptables(ip, chain string) error {
 	// Retry logic for xtables lock
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-w", "10", "-A", chain, "-s", ip, "-j", "DROP")
+		cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "DROP")
 		output, err := cmd.CombinedOutput()
 
 		if err == nil {
@@ -1805,7 +1805,7 @@ func unblockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	// First check if the rule exists before trying to remove it
-	checkCmd := exec.Command("iptables", "-w", "10", "-C", chain, "-s", ip, "-j", "DROP")
+	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
 	if checkCmd.Run() != nil {
 		logger.Debug("IP %s is not currently blocked in chain %s (rule doesn't exist)", ip, chain)
 		return nil // Not an error - the IP is already unblocked
@@ -1816,7 +1816,7 @@ func unblockIPWithIptables(ip, chain string) error {
 	// Retry logic for xtables lock
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-w", "10", "-D", chain, "-s", ip, "-j", "DROP")
+		cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "DROP")
 		output, err := cmd.CombinedOutput()
 
 		if err == nil {
@@ -1854,7 +1854,7 @@ func getIPTablesRules(chain string) ([]string, error) {
 
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-w", "10", "-S", chain)
+		cmd := exec.Command("iptables", "-S", chain)
 		output, err := cmd.CombinedOutput()
 
 		if err == nil {

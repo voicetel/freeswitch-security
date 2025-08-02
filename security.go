@@ -697,26 +697,88 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 
 // batchBlockIPs blocks multiple IPs using iptables in a single operation
 func (sm *SecurityManager) batchBlockIPs(ips []string) {
-	logger := GetLogger()
 
-	// Create a script for batch processing
-	var commands []string
-	for _, ip := range ips {
-		// Check if already blocked
-		checkCmd := fmt.Sprintf("iptables -C %s -s %s -j DROP 2>/dev/null || iptables -A %s -s %s -j DROP",
-			sm.securityConfig.IPTablesChain, ip, sm.securityConfig.IPTablesChain, ip)
-		commands = append(commands, checkCmd)
+	if len(ips) == 0 {
+		return
 	}
 
-	// Execute all commands in one shell invocation
-	script := strings.Join(commands, " && ")
-	cmd := exec.Command("sh", "-c", script)
+	// Process in smaller batches to reduce lock contention
+	batchSize := 5
+	for i := 0; i < len(ips); i += batchSize {
+		end := i + batchSize
+		if end > len(ips) {
+			end = len(ips)
+		}
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Error("Batch iptables error: %v, output: %s", err, string(output))
-	} else {
-		logger.Info("Successfully blocked %d IPs on port in batch", len(ips))
+		batch := ips[i:end]
+		sm.processBatchBlock(batch)
+
+		// Small delay between batches to reduce lock contention
+		if end < len(ips) {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+// processBatchBlock processes a small batch of IP blocks
+func (sm *SecurityManager) processBatchBlock(ips []string) {
+	logger := GetLogger()
+
+	var commands []string
+	var validIPs []string
+
+	// Build commands with existence checks
+	for _, ip := range ips {
+		// First check if rule already exists, then add if not
+		checkAndAdd := fmt.Sprintf("iptables -w 10 -C %s -s %s -j DROP 2>/dev/null || iptables -w 10 -A %s -s %s -j DROP",
+			sm.securityConfig.IPTablesChain, ip, sm.securityConfig.IPTablesChain, ip)
+		commands = append(commands, checkAndAdd)
+		validIPs = append(validIPs, ip)
+	}
+
+	if len(commands) == 0 {
+		return
+	}
+
+	// Execute batch with retry logic
+	script := strings.Join(commands, " && ")
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("sh", "-c", script)
+		output, err := cmd.CombinedOutput()
+
+		if err == nil {
+			logger.Info("Successfully processed batch block for %d IPs", len(validIPs))
+			return
+		}
+
+		// Check if it's a lock error
+		if strings.Contains(string(output), "xtables lock") {
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt) * 500 * time.Millisecond
+				logger.Debug("Batch iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+		}
+
+		// If batch failed, fall back to individual processing
+		logger.Info("Batch iptables failed, falling back to individual processing: %v", err)
+		sm.fallbackIndividualBlock(validIPs)
+		return
+	}
+
+	logger.Error("Batch iptables failed after %d attempts, falling back to individual processing", maxRetries)
+	sm.fallbackIndividualBlock(validIPs)
+}
+
+// fallbackIndividualBlock processes IPs individually when batch fails
+func (sm *SecurityManager) fallbackIndividualBlock(ips []string) {
+	for _, ip := range ips {
+		if err := blockIPWithIptables(ip, sm.securityConfig.IPTablesChain); err != nil {
+			GetLogger().Error("Failed to block IP %s individually: %v", ip, err)
+		}
 	}
 }
 
@@ -798,7 +860,11 @@ func (sm *SecurityManager) processBatchWhitelist(batch []WhitelistRequest) {
 			delete(sm.blacklist, req.IP)
 			// Unblock from iptables
 			if sm.securityConfig.AutoBlockEnabled {
-				go unblockIPWithIptables(req.IP, sm.securityConfig.IPTablesChain)
+				go func(ip, chain string) {
+					if err := unblockIPWithIptables(ip, chain); err != nil {
+						logger.Error("Failed to unblock IP %s: %v", ip, err)
+					}
+				}(req.IP, sm.securityConfig.IPTablesChain)
 			}
 		}
 
@@ -1115,7 +1181,9 @@ func (sm *SecurityManager) AddToBlacklistAsync(ipAddress, reason string, permane
 		// Queued successfully
 	case <-time.After(100 * time.Millisecond):
 		// Queue is full, fall back to synchronous
-		sm.AddToBlacklist(ipAddress, reason, permanent)
+		if err := sm.AddToBlacklist(ipAddress, reason, permanent); err != nil {
+			GetLogger().Error("Failed to add IP %s to blacklist: %v", ipAddress, err)
+		}
 	}
 }
 
@@ -1461,7 +1529,9 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 
 	for _, ip := range whitelistToRemove {
 		logger.Debug("Cleanup: Removing expired whitelist entry for IP %s", ip)
-		sm.RemoveFromWhitelist(ip)
+		if err := sm.RemoveFromWhitelist(ip); err != nil {
+			logger.Error("Failed to remove expired whitelist entry for IP %s: %v", ip, err)
+		}
 	}
 
 	// Clean up blacklist
@@ -1476,7 +1546,9 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 
 	for _, ip := range blacklistToRemove {
 		logger.Debug("Cleanup: Removing expired blacklist entry for IP %s", ip)
-		sm.RemoveFromBlacklist(ip)
+		if err := sm.RemoveFromBlacklist(ip); err != nil {
+			logger.Error("Failed to remove expired blacklist entry for IP %s: %v", ip, err)
+		}
 	}
 
 	// Clean up failed attempts
@@ -1617,27 +1689,69 @@ func (sm *SecurityManager) UpdateRegistrationStats(ipAddress, userId, domain str
 	sm.statistics.LastRegistrationTime = time.Now()
 }
 
-// ensureIPTablesChain ensures that the iptables chain exists
+// ensureIPTablesChain ensures that the iptables chain exists with improved error handling
 func ensureIPTablesChain(chain string) error {
 	logger := GetLogger()
 
 	// Check if chain exists
-	checkCmd := exec.Command("iptables", "-L", chain)
+	checkCmd := exec.Command("iptables", "-w", "10", "-L", chain)
 	err := checkCmd.Run()
 
 	if err != nil {
 		// Chain doesn't exist, create it
 		logger.Info("Creating iptables chain %s", chain)
-		createCmd := exec.Command("iptables", "-N", chain)
-		if err := createCmd.Run(); err != nil {
-			return fmt.Errorf("failed to create iptables chain %s: %v", chain, err)
+
+		maxRetries := 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			createCmd := exec.Command("iptables", "-w", "10", "-N", chain)
+			output, err := createCmd.CombinedOutput()
+
+			if err == nil {
+				break // Success
+			}
+
+			// Check if it's a lock error
+			if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
+				backoff := time.Duration(attempt) * time.Second
+				logger.Debug("iptables lock conflict creating chain, retrying in %v", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Check if chain already exists (race condition)
+			if strings.Contains(string(output), "Chain already exists") {
+				logger.Info("Chain %s already exists (created by another process)", chain)
+				break
+			}
+
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to create iptables chain %s after %d attempts: %v, output: %s",
+					chain, maxRetries, err, string(output))
+			}
 		}
 
-		// Add a jump from INPUT to our chain
+		// Add a jump from INPUT to our chain with retry logic
 		logger.Info("Adding jump from INPUT to chain %s", chain)
-		linkCmd := exec.Command("iptables", "-A", "INPUT", "-j", chain)
-		if err := linkCmd.Run(); err != nil {
-			return fmt.Errorf("failed to link iptables chain %s to INPUT: %v", chain, err)
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			linkCmd := exec.Command("iptables", "-w", "10", "-A", "INPUT", "-j", chain)
+			output, err := linkCmd.CombinedOutput()
+
+			if err == nil {
+				break // Success
+			}
+
+			// Check if it's a lock error
+			if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
+				backoff := time.Duration(attempt) * time.Second
+				logger.Debug("iptables lock conflict linking chain, retrying in %v", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to link iptables chain %s to INPUT after %d attempts: %v, output: %s",
+					chain, maxRetries, err, string(output))
+			}
 		}
 	} else {
 		logger.Info("Iptables chain %s already exists", chain)
@@ -1646,59 +1760,130 @@ func ensureIPTablesChain(chain string) error {
 	return nil
 }
 
-// blockIPWithIptables blocks an IP address using iptables
+// blockIPWithIptables blocks an IP address using iptables with retry logic
 func blockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
 	// First check if the rule already exists
-	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
+	checkCmd := exec.Command("iptables", "-w", "10", "-C", chain, "-s", ip, "-j", "DROP")
 	if checkCmd.Run() == nil {
-		logger.Info("IP %s is already blocked on port  in chain %s", ip, chain)
+		logger.Info("IP %s is already blocked in chain %s", ip, chain)
 		return nil
 	}
 
-	logger.Info("Adding iptables rule to block IP %s on port  in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "DROP")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
+	logger.Info("Adding iptables rule to block IP %s in chain %s", ip, chain)
+
+	// Retry logic for xtables lock
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("iptables", "-w", "10", "-A", chain, "-s", ip, "-j", "DROP")
+		output, err := cmd.CombinedOutput()
+
+		if err == nil {
+			logger.Info("Successfully blocked IP %s in chain %s", ip, chain)
+			return nil
+		}
+
+		// Check if it's a lock error
+		if strings.Contains(string(output), "xtables lock") {
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt) * time.Second
+				logger.Debug("iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+		}
+
+		return fmt.Errorf("iptables error after %d attempts: %v, output: %s", attempt, err, string(output))
 	}
-	return nil
+
+	return fmt.Errorf("failed to block IP %s after %d attempts", ip, maxRetries)
 }
 
-// unblockIPWithIptables unblocks an IP address using iptables
+// unblockIPWithIptables unblocks an IP address using iptables with existence check
 func unblockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
 
-	logger.Info("Removing iptables rule to unblock IP %s on port  in chain %s", ip, chain)
-	cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "DROP")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
+	// First check if the rule exists before trying to remove it
+	checkCmd := exec.Command("iptables", "-w", "10", "-C", chain, "-s", ip, "-j", "DROP")
+	if checkCmd.Run() != nil {
+		logger.Debug("IP %s is not currently blocked in chain %s (rule doesn't exist)", ip, chain)
+		return nil // Not an error - the IP is already unblocked
 	}
-	return nil
+
+	logger.Info("Removing iptables rule to unblock IP %s in chain %s", ip, chain)
+
+	// Retry logic for xtables lock
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("iptables", "-w", "10", "-D", chain, "-s", ip, "-j", "DROP")
+		output, err := cmd.CombinedOutput()
+
+		if err == nil {
+			logger.Info("Successfully unblocked IP %s in chain %s", ip, chain)
+			return nil
+		}
+
+		// Check if it's a lock error
+		if strings.Contains(string(output), "xtables lock") {
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt) * time.Second
+				logger.Debug("iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+		}
+
+		// Check if the rule doesn't exist (common when cleanup runs)
+		if strings.Contains(string(output), "Bad rule") || strings.Contains(string(output), "does a matching rule exist") {
+			logger.Debug("IP %s rule no longer exists in chain %s, considering unblocked", ip, chain)
+			return nil // Not an error - the rule is already gone
+		}
+
+		return fmt.Errorf("iptables error after %d attempts: %v, output: %s", attempt, err, string(output))
+	}
+
+	return fmt.Errorf("failed to unblock IP %s after %d attempts", ip, maxRetries)
 }
 
-// getIPTablesRules gets the current iptables rules for the chain
+// getIPTablesRules gets the current iptables rules for the chain with improved error handling
 func getIPTablesRules(chain string) ([]string, error) {
 	logger := GetLogger()
 
 	logger.Debug("Fetching iptables rules for chain %s", chain)
-	cmd := exec.Command("iptables", "-S", chain)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("error getting iptables rules: %v", err)
-	}
 
-	rules := strings.Split(string(output), "\n")
-	var result []string
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("iptables", "-w", "10", "-S", chain)
+		output, err := cmd.CombinedOutput()
 
-	for _, rule := range rules {
-		if rule != "" {
-			result = append(result, rule)
+		if err == nil {
+			rules := strings.Split(string(output), "\n")
+			var result []string
+
+			for _, rule := range rules {
+				if rule != "" {
+					result = append(result, rule)
+				}
+			}
+
+			logger.Debug("Found %d rules in iptables chain %s", len(result), chain)
+			return result, nil
+		}
+
+		// Check if it's a lock error
+		if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
+			backoff := time.Duration(attempt) * time.Second
+			logger.Debug("iptables lock conflict getting rules, retrying in %v", backoff)
+			time.Sleep(backoff)
+			continue
+		}
+
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("error getting iptables rules after %d attempts: %v, output: %s",
+				maxRetries, err, string(output))
 		}
 	}
 
-	logger.Debug("Found %d rules in iptables chain %s", len(result), chain)
-	return result, nil
+	return nil, fmt.Errorf("failed to get iptables rules after %d attempts", maxRetries)
 }

@@ -28,8 +28,7 @@ type ESLManager struct {
 		EventsQueued       int64
 		EventsDropped      int64
 	}
-	rateManager   *RateManager
-	rateManagerMu sync.Mutex
+	rateManager *RateManager
 
 	// Worker pool components
 	eventQueue   chan *eventsocket.Event
@@ -577,7 +576,9 @@ func (w *EventWorker) handleSuccessfulRegistrationPooled(pe *ProcessedEvent) {
 	if w.manager.securityManager.securityConfig.AutoWhitelistOnSuccess {
 		w.logger.Debug("Worker #%d: Auto-whitelisting IP %s for user %s@%s",
 			w.id, pe.IPAddress, pe.UserID, pe.Domain)
-		w.manager.securityManager.AddToWhitelist(pe.IPAddress, pe.UserID, pe.Domain, false)
+		if err := w.manager.securityManager.AddToWhitelist(pe.IPAddress, pe.UserID, pe.Domain, false); err != nil {
+			w.logger.Error("Worker #%d: Failed to add IP %s to whitelist: %v", w.id, pe.IPAddress, err)
+		}
 	}
 }
 
@@ -651,12 +652,6 @@ func (w *EventWorker) handleChannelCreatePooled(pe *ProcessedEvent) {
 	}
 }
 
-// Legacy process methods - kept for compatibility but deprecated
-func (w *EventWorker) processEvent(ev *eventsocket.Event) {
-	// This method is deprecated - use processEventWithPool instead
-	w.processEventWithPool(ev)
-}
-
 // GetESLManager returns the ESL manager instance
 func GetESLManager() *ESLManager {
 	if eslManager == nil {
@@ -722,13 +717,12 @@ func (em *ESLManager) startESLConnection() {
 		backoffDuration = 5 * time.Second
 	}
 
-	reconnectAttempt := atomic.LoadInt64(&em.statistics.ConnectionAttempts)
-
 	// Calculate dynamic backoff
 	currentBackoff := backoffDuration
-	if reconnectAttempt > 0 {
+	connectionAttempts := atomic.LoadInt64(&em.statistics.ConnectionAttempts)
+	if connectionAttempts > 0 {
 		maxBackoff := 60 * time.Second
-		calculatedBackoff := backoffDuration * time.Duration(1<<uint(reconnectAttempt-1))
+		calculatedBackoff := backoffDuration * time.Duration(1<<uint(connectionAttempts-1))
 		if calculatedBackoff > maxBackoff {
 			calculatedBackoff = maxBackoff
 		}
@@ -820,8 +814,6 @@ func (em *ESLManager) startESLConnection() {
 		case <-time.After(currentBackoff):
 			// Continue with next connection attempt
 		}
-
-		reconnectAttempt = atomic.LoadInt64(&em.statistics.ConnectionAttempts)
 	}
 }
 
@@ -885,39 +877,6 @@ func (em *ESLManager) readEvents() {
 			return
 		}
 	}
-}
-
-// Legacy event processing methods kept for backward compatibility
-func (w *EventWorker) handleSuccessfulRegistration(ev *eventsocket.Event) {
-	pe := w.manager.eventPool.Get()
-	defer w.manager.eventPool.Put(pe)
-
-	w.extractRegistrationData(ev, pe)
-	w.handleSuccessfulRegistrationPooled(pe)
-}
-
-func (w *EventWorker) handleWrongCallState(ev *eventsocket.Event) {
-	pe := w.manager.eventPool.Get()
-	defer w.manager.eventPool.Put(pe)
-
-	w.extractWrongCallStateData(ev, pe)
-	w.handleWrongCallStatePooled(pe)
-}
-
-func (w *EventWorker) handleFailedRegistration(ev *eventsocket.Event) {
-	pe := w.manager.eventPool.Get()
-	defer w.manager.eventPool.Put(pe)
-
-	w.extractFailedRegistrationData(ev, pe)
-	w.handleFailedRegistrationPooled(pe)
-}
-
-func (w *EventWorker) handleChannelCreate(ev *eventsocket.Event) {
-	pe := w.manager.eventPool.Get()
-	defer w.manager.eventPool.Put(pe)
-
-	w.extractChannelCreateData(ev, pe)
-	w.handleChannelCreatePooled(pe)
 }
 
 // SetESLLogLevel sets the logging level for ESL operations

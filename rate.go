@@ -62,20 +62,20 @@ func NewRateManager(securityManager *SecurityManager) *RateManager {
 	}
 
 	// Override with config if available
-	if config.Security.RateLimit.Enabled == true {
+	if config.Security.RateLimit.Enabled {
 		rateConfig.Enabled = config.Security.RateLimit.Enabled
 		rateConfig.CallRateLimit = config.Security.RateLimit.CallRateLimit
 		rateConfig.CallRateInterval = config.Security.RateLimit.CallRateInterval
 		rateConfig.RegistrationLimit = config.Security.RateLimit.RegistrationLimit
 		rateConfig.RegistrationWindow = config.Security.RateLimit.RegistrationWindow
 
-		if config.Security.RateLimit.AutoBlockOnExceed == true {
+		if config.Security.RateLimit.AutoBlockOnExceed {
 			rateConfig.AutoBlockOnExceed = config.Security.RateLimit.AutoBlockOnExceed
 		}
 
 		rateConfig.BlockDuration = config.Security.RateLimit.BlockDuration
 
-		if config.Security.RateLimit.WhitelistBypass == true {
+		if config.Security.RateLimit.WhitelistBypass {
 			rateConfig.WhitelistBypass = config.Security.RateLimit.WhitelistBypass
 		}
 
@@ -223,7 +223,11 @@ func (rm *RateManager) CheckCallRate(ipAddress, userId, domain string) bool {
 		if rm.rateLimitConfig.AutoBlockOnExceed {
 			reason := fmt.Sprintf("Call rate limit exceeded (%d calls in %s)",
 				rate.Count, callRateInterval)
-			go rm.securityManager.AddToBlacklist(ipAddress, reason, false)
+			go func(ip, reason string) {
+				if err := rm.securityManager.AddToBlacklist(ip, reason, false); err != nil {
+					logger.Error("Failed to add IP %s to blacklist: %v", ip, err)
+				}
+			}(ipAddress, reason)
 		}
 
 		return false
@@ -332,7 +336,12 @@ func (rm *RateManager) CheckRegistrationRate(ipAddress, userId, domain string) b
 		if rm.rateLimitConfig.AutoBlockOnExceed {
 			reason := fmt.Sprintf("Registration rate limit exceeded (%d registrations in %s)",
 				rate.Count, regWindow)
-			go rm.securityManager.AddToBlacklist(ipAddress, reason, false)
+			go func() {
+				if err := rm.securityManager.AddToBlacklist(ipAddress, reason, false); err != nil {
+					logger := GetLogger()
+					logger.Error("Failed to auto-block IP %s: %v", ipAddress, err)
+				}
+			}()
 		}
 
 		return false

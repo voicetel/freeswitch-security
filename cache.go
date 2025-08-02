@@ -269,7 +269,10 @@ func (cm *CacheManager) CacheSecurityItemAsync(key string, data []byte) {
 		// Queued successfully
 	case <-time.After(10 * time.Millisecond):
 		// Queue is full, fall back to synchronous write
-		cm.CacheSecurityItem(key, data)
+		if err := cm.CacheSecurityItem(key, data); err != nil {
+			logger := GetLogger() // Add this line to get the logger instance
+			logger.Error("Failed to cache security item: %v", err)
+		}
 	}
 }
 

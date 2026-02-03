@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"runtime"
 	"strconv"
 	"strings"
@@ -531,9 +532,7 @@ func (w *EventWorker) extractWrongCallStateData(ev *eventsocket.Event, pe *Proce
 // extractChannelCreateData extracts channel create data into the pooled event
 func (w *EventWorker) extractChannelCreateData(ev *eventsocket.Event, pe *ProcessedEvent) {
 	pe.IPAddress = ev.Get("Variable_sip_network_ip")
-	if pe.IPAddress == "" {
-		pe.IPAddress = ev.Get("Variable_sip_from_host")
-	}
+	// Don't use Variable_sip_from_host as fallback - it's a domain/hostname, not an IP
 
 	pe.UserID = ev.Get("Variable_sip_from_user")
 	pe.Domain = ev.Get("Variable_sip_from_host")
@@ -547,6 +546,12 @@ func (w *EventWorker) handleSuccessfulRegistrationPooled(pe *ProcessedEvent) {
 
 	if pe.IPAddress == "" {
 		w.logger.Error("Worker #%d: Failed to extract IP address from registration event", w.id)
+		return
+	}
+
+	// Validate that we have an actual IP address, not a hostname/domain
+	if net.ParseIP(pe.IPAddress) == nil {
+		w.logger.Error("Worker #%d: Invalid IP address '%s' from registration event (likely a hostname/domain)", w.id, pe.IPAddress)
 		return
 	}
 
@@ -592,6 +597,12 @@ func (w *EventWorker) handleFailedRegistrationPooled(pe *ProcessedEvent) {
 		return
 	}
 
+	// Validate that we have an actual IP address, not a hostname/domain
+	if net.ParseIP(pe.IPAddress) == nil {
+		w.logger.Error("Worker #%d: Invalid IP address '%s' from failed registration event (likely a hostname/domain)", w.id, pe.IPAddress)
+		return
+	}
+
 	if pe.UserID == "" {
 		pe.UserID = "unknown"
 	}
@@ -614,6 +625,12 @@ func (w *EventWorker) handleWrongCallStatePooled(pe *ProcessedEvent) {
 		return
 	}
 
+	// Validate that we have an actual IP address, not a hostname/domain
+	if net.ParseIP(pe.IPAddress) == nil {
+		w.logger.Error("Worker #%d: Invalid IP address '%s' from wrong call state event (likely a hostname/domain)", w.id, pe.IPAddress)
+		return
+	}
+
 	if pe.UserID == "" {
 		pe.UserID = "unknown"
 	}
@@ -627,7 +644,13 @@ func (w *EventWorker) handleWrongCallStatePooled(pe *ProcessedEvent) {
 // handleChannelCreatePooled handles channel create with pooled event
 func (w *EventWorker) handleChannelCreatePooled(pe *ProcessedEvent) {
 	if pe.IPAddress == "" {
-		w.logger.Debug("Worker #%d: Could not determine source IP for channel create event", w.id)
+		w.logger.Debug("Worker #%d: No IP address in channel create event", w.id)
+		return
+	}
+
+	// Validate that we have an actual IP address, not a hostname/domain
+	if net.ParseIP(pe.IPAddress) == nil {
+		w.logger.Debug("Worker #%d: Invalid IP address '%s' from channel create event (likely a hostname/domain)", w.id, pe.IPAddress)
 		return
 	}
 

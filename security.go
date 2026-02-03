@@ -156,6 +156,38 @@ type WrongStateRequest struct {
 	UserID string
 }
 
+// BatchWhitelistRequest is used for batch whitelist operations
+type BatchWhitelistRequest struct {
+	IP        string `json:"ip" binding:"required"`
+	UserID    string `json:"user_id"`
+	Domain    string `json:"domain"`
+	Permanent bool   `json:"permanent"`
+}
+
+// BatchWhitelistResult is the result of a batch whitelist operation
+type BatchWhitelistResult struct {
+	IP        string
+	UserID    string
+	Domain    string
+	Permanent bool
+	Error     error
+}
+
+// BatchBlacklistRequest is used for batch blacklist operations
+type BatchBlacklistRequest struct {
+	IP        string `json:"ip" binding:"required"`
+	Reason    string `json:"reason"`
+	Permanent bool   `json:"permanent"`
+}
+
+// BatchBlacklistResult is the result of a batch blacklist operation
+type BatchBlacklistResult struct {
+	IP        string
+	Reason    string
+	Permanent bool
+	Error     error
+}
+
 var (
 	securityManager *SecurityManager
 	secManagerOnce  sync.Once
@@ -1638,6 +1670,24 @@ func (sm *SecurityManager) GetWhitelistedIPs() map[string]WhitelistEntry {
 	return result
 }
 
+// GetWhitelistEntry returns a single whitelist entry by IP
+func (sm *SecurityManager) GetWhitelistEntry(ip string) (WhitelistEntry, bool) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	entry, exists := sm.whitelist[ip]
+	if !exists {
+		return WhitelistEntry{}, false
+	}
+
+	// Check if expired
+	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
+		return WhitelistEntry{}, false
+	}
+
+	return entry, true
+}
+
 // GetBlacklistedIPs returns all blacklisted IPs
 func (sm *SecurityManager) GetBlacklistedIPs() map[string]BlacklistEntry {
 	result := make(map[string]BlacklistEntry)
@@ -1652,6 +1702,24 @@ func (sm *SecurityManager) GetBlacklistedIPs() map[string]BlacklistEntry {
 	sm.mutex.RUnlock()
 
 	return result
+}
+
+// GetBlacklistEntry returns a single blacklist entry by IP
+func (sm *SecurityManager) GetBlacklistEntry(ip string) (BlacklistEntry, bool) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	entry, exists := sm.blacklist[ip]
+	if !exists {
+		return BlacklistEntry{}, false
+	}
+
+	// Check if expired
+	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
+		return BlacklistEntry{}, false
+	}
+
+	return entry, true
 }
 
 // GetFailedAttempts returns all tracked failed attempts
@@ -1687,6 +1755,90 @@ func (sm *SecurityManager) UpdateRegistrationStats(ipAddress, userId, domain str
 
 	sm.statistics.TotalRegistrations++
 	sm.statistics.LastRegistrationTime = time.Now()
+}
+
+// AddToWhitelistBatch adds multiple IPs to the whitelist concurrently
+func (sm *SecurityManager) AddToWhitelistBatch(requests []BatchWhitelistRequest) []BatchWhitelistResult {
+	results := make([]BatchWhitelistResult, len(requests))
+
+	// Limit concurrent operations to prevent goroutine explosion
+	maxWorkers := 10
+	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	config := GetConfig()
+
+	for i, req := range requests {
+		wg.Add(1)
+		go func(idx int, r BatchWhitelistRequest) {
+			defer wg.Done()
+
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			// Apply default domain if needed
+			domain := r.Domain
+			if domain == "" {
+				domain = config.FreeSWITCH.DefaultDomain
+			}
+
+			err := sm.AddToWhitelist(r.IP, r.UserID, domain, r.Permanent)
+			results[idx] = BatchWhitelistResult{
+				IP:        r.IP,
+				UserID:    r.UserID,
+				Domain:    domain,
+				Permanent: r.Permanent,
+				Error:     err,
+			}
+		}(i, req)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// AddToBlacklistBatch adds multiple IPs to the blacklist concurrently
+func (sm *SecurityManager) AddToBlacklistBatch(requests []BatchBlacklistRequest) []BatchBlacklistResult {
+	results := make([]BatchBlacklistResult, len(requests))
+
+	// Limit concurrent operations to prevent goroutine explosion
+	maxWorkers := 10
+	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	for i, req := range requests {
+		wg.Add(1)
+		go func(idx int, r BatchBlacklistRequest) {
+			defer wg.Done()
+
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			err := sm.AddToBlacklist(r.IP, r.Reason, r.Permanent)
+			results[idx] = BatchBlacklistResult{
+				IP:        r.IP,
+				Reason:    r.Reason,
+				Permanent: r.Permanent,
+				Error:     err,
+			}
+		}(i, req)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// GetIPTablesInfo returns IPTables chain information
+func (sm *SecurityManager) GetIPTablesInfo() (map[string]interface{}, error) {
+	rules, err := getIPTablesRules(sm.securityConfig.IPTablesChain)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"chain": sm.securityConfig.IPTablesChain,
+		"rules": rules,
+	}, nil
 }
 
 // ensureIPTablesChain ensures that the iptables chain exists with improved error handling

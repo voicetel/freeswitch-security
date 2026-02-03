@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -155,6 +157,90 @@ func (rp *RequestProcessor) Shutdown() {
 	rp.wg.Wait()
 }
 
+// CacheMiddleware provides transparent caching for GET requests
+func CacheMiddleware(cacheKey string, ttl time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Only cache GET requests
+		if c.Request.Method != "GET" {
+			c.Next()
+			return
+		}
+
+		cache := GetCacheManager()
+		if !cache.enabled {
+			c.Next()
+			return
+		}
+
+		// Try to get from cache
+		fullKey := "route:" + cacheKey
+		if data, found := cache.GetSecurityItem(fullKey); found {
+			c.Data(200, "application/json", data)
+			c.Abort()
+			return
+		}
+
+		// Continue to handler and cache the response
+		c.Next()
+	}
+}
+
+// CacheResponse caches the JSON response after handler execution
+func CacheResponse(cacheKey string, data interface{}) {
+	cache := GetCacheManager()
+	if !cache.enabled {
+		return
+	}
+
+	fullKey := "route:" + cacheKey
+	if jsonData, err := json.Marshal(data); err == nil {
+		cache.CacheSecurityItemAsync(fullKey, jsonData)
+	} else {
+		log.Printf("Failed to marshal cache data: %v", err)
+	}
+}
+
+// validateIP validates an IP address string
+func validateIP(ip string) error {
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid IP address: %s", ip)
+	}
+	return nil
+}
+
+// registerRoutes registers all API routes (health, cache, security)
+func registerRoutes(router *gin.Engine) {
+	config := GetConfig()
+
+	// Health check endpoint
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status": "ok",
+		})
+	})
+
+	// Cache stats endpoint
+	router.GET("/cache/stats", func(c *gin.Context) {
+		cache := GetCacheManager()
+		c.JSON(200, cache.GetCacheStats())
+	})
+
+	// Cache control endpoints
+	router.POST("/cache/security/clear", func(c *gin.Context) {
+		cache := GetCacheManager()
+		if err := cache.ClearSecurityCache(); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"status": "security cache cleared"})
+	})
+
+	// Register security routes if security is enabled
+	if config.Security.Enabled {
+		RegisterSecurityRoutes(router)
+	}
+}
+
 // RegisterSecurityRoutes registers security-related API routes with channel-based processing
 func RegisterSecurityRoutes(router *gin.Engine) {
 	// Initialize security manager if not already initialized
@@ -204,27 +290,10 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 		})
 
 		// Get security statistics with caching
-		security.GET("/stats", func(c *gin.Context) {
-			// Check cache first
-			cache := GetCacheManager()
-			cacheKey := "stats:security"
-
-			if cache.enabled {
-				if data, found := cache.GetSecurityItem(cacheKey); found {
-					c.Data(200, "application/json", data)
-					return
-				}
-			}
-
+		security.GET("/stats", CacheMiddleware("stats:security", 5*time.Minute), func(c *gin.Context) {
 			stats := sm.GetSecurityStats()
+			CacheResponse("stats:security", stats)
 			c.JSON(200, stats)
-
-			// Cache the result asynchronously
-			if cache.enabled {
-				if data, err := json.Marshal(stats); err == nil {
-					cache.CacheSecurityItemAsync(cacheKey, data)
-				}
-			}
 		})
 
 		// Get dynamic channel statistics
@@ -273,6 +342,12 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 					return
 				}
 
+				// Validate IP address
+				if err := validateIP(req.IP); err != nil {
+					c.JSON(400, gin.H{"error": err.Error()})
+					return
+				}
+
 				// Set default domain if not provided
 				if req.Domain == "" {
 					config := GetConfig()
@@ -302,36 +377,35 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 					return
 				}
 
-				// Process batch asynchronously
-				results := make([]gin.H, len(batch))
-				var wg sync.WaitGroup
-
-				for i, req := range batch {
-					wg.Add(1)
-					go func(idx int, r struct {
-						IP        string `json:"ip" binding:"required"`
-						UserID    string `json:"user_id"`
-						Domain    string `json:"domain"`
-						Permanent bool   `json:"permanent"`
-					}) {
-						defer wg.Done()
-
-						if r.Domain == "" {
-							config := GetConfig()
-							r.Domain = config.FreeSWITCH.DefaultDomain
-						}
-
-						err := sm.AddToWhitelist(r.IP, r.UserID, r.Domain, r.Permanent)
-						if err != nil {
-							results[idx] = gin.H{"ip": r.IP, "error": err.Error()}
-						} else {
-							results[idx] = gin.H{"ip": r.IP, "status": "success"}
-						}
-					}(i, req)
+				if len(batch) > 1000 {
+					c.JSON(400, gin.H{"error": "batch size exceeds limit of 1000"})
+					return
 				}
 
-				wg.Wait()
-				c.JSON(200, gin.H{"results": results})
+				// Convert to batch request type
+				batchReq := make([]BatchWhitelistRequest, len(batch))
+				for i, req := range batch {
+					batchReq[i] = BatchWhitelistRequest{
+						IP:        req.IP,
+						UserID:    req.UserID,
+						Domain:    req.Domain,
+						Permanent: req.Permanent,
+					}
+				}
+
+				results := sm.AddToWhitelistBatch(batchReq)
+
+				// Format results for response
+				responseResults := make([]gin.H, len(results))
+				for i, res := range results {
+					if res.Error != nil {
+						responseResults[i] = gin.H{"ip": res.IP, "error": res.Error.Error()}
+					} else {
+						responseResults[i] = gin.H{"ip": res.IP, "status": "success"}
+					}
+				}
+
+				c.JSON(200, gin.H{"results": responseResults})
 			})
 
 			// Remove IP from whitelist
@@ -349,25 +423,21 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 			// Check if IP is whitelisted
 			whitelist.GET("/:ip", func(c *gin.Context) {
 				ip := c.Param("ip")
-				isWhitelisted := sm.IsIPWhitelisted(ip)
+				entry, exists := sm.GetWhitelistEntry(ip)
 
-				// Get the domain if IP is whitelisted
-				var domain string
-				var userId string
-				if isWhitelisted {
-					sm.mutex.RLock()
-					if entry, exists := sm.whitelist[ip]; exists {
-						domain = entry.Domain
-						userId = entry.UserID
-					}
-					sm.mutex.RUnlock()
+				if !exists {
+					c.JSON(200, gin.H{
+						"ip":          ip,
+						"whitelisted": false,
+					})
+					return
 				}
 
 				c.JSON(200, gin.H{
 					"ip":          ip,
-					"whitelisted": isWhitelisted,
-					"user_id":     userId,
-					"domain":      domain,
+					"whitelisted": true,
+					"user_id":     entry.UserID,
+					"domain":      entry.Domain,
 				})
 			})
 		}
@@ -389,6 +459,12 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 				}
 
 				if err := c.ShouldBindJSON(&req); err != nil {
+					c.JSON(400, gin.H{"error": err.Error()})
+					return
+				}
+
+				// Validate IP address
+				if err := validateIP(req.IP); err != nil {
 					c.JSON(400, gin.H{"error": err.Error()})
 					return
 				}
@@ -415,30 +491,34 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 					return
 				}
 
-				// Process batch asynchronously
-				results := make([]gin.H, len(batch))
-				var wg sync.WaitGroup
-
-				for i, req := range batch {
-					wg.Add(1)
-					go func(idx int, r struct {
-						IP        string `json:"ip" binding:"required"`
-						Reason    string `json:"reason"`
-						Permanent bool   `json:"permanent"`
-					}) {
-						defer wg.Done()
-
-						err := sm.AddToBlacklist(r.IP, r.Reason, r.Permanent)
-						if err != nil {
-							results[idx] = gin.H{"ip": r.IP, "error": err.Error()}
-						} else {
-							results[idx] = gin.H{"ip": r.IP, "status": "success"}
-						}
-					}(i, req)
+				if len(batch) > 1000 {
+					c.JSON(400, gin.H{"error": "batch size exceeds limit of 1000"})
+					return
 				}
 
-				wg.Wait()
-				c.JSON(200, gin.H{"results": results})
+				// Convert to batch request type
+				batchReq := make([]BatchBlacklistRequest, len(batch))
+				for i, req := range batch {
+					batchReq[i] = BatchBlacklistRequest{
+						IP:        req.IP,
+						Reason:    req.Reason,
+						Permanent: req.Permanent,
+					}
+				}
+
+				results := sm.AddToBlacklistBatch(batchReq)
+
+				// Format results for response
+				responseResults := make([]gin.H, len(results))
+				for i, res := range results {
+					if res.Error != nil {
+						responseResults[i] = gin.H{"ip": res.IP, "error": res.Error.Error()}
+					} else {
+						responseResults[i] = gin.H{"ip": res.IP, "status": "success"}
+					}
+				}
+
+				c.JSON(200, gin.H{"results": responseResults})
 			})
 
 			// Remove IP from blacklist
@@ -477,16 +557,13 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 
 		// View iptables rules
 		security.GET("/iptables", func(c *gin.Context) {
-			rules, err := getIPTablesRules(sm.securityConfig.IPTablesChain)
+			data, err := sm.GetIPTablesInfo()
 			if err != nil {
 				c.JSON(500, gin.H{"error": err.Error()})
 				return
 			}
 
-			c.JSON(200, gin.H{
-				"chain": sm.securityConfig.IPTablesChain,
-				"rules": rules,
-			})
+			c.JSON(200, data)
 		})
 
 		// ESL management with channel-based command processing

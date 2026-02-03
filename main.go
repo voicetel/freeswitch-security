@@ -125,36 +125,3 @@ func main() {
 
 	log.Println("Graceful shutdown complete")
 }
-
-// registerRoutes sets up all API routes
-func registerRoutes(router *gin.Engine) {
-	// Health check endpoint
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "ok",
-		})
-	})
-
-	// Add cache stats endpoint
-	router.GET("/cache/stats", func(c *gin.Context) {
-		cache := GetCacheManager()
-		c.JSON(200, cache.GetCacheStats())
-	})
-
-	// Add cache control endpoints
-	router.POST("/cache/security/clear", func(c *gin.Context) {
-		cache := GetCacheManager()
-		if err := cache.ClearSecurityCache(); err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(200, gin.H{"status": "security cache cleared"})
-	})
-
-	// Register security routes if security is enabled
-	config := GetConfig()
-	if config.Security.Enabled {
-		RegisterSecurityRoutes(router)
-		log.Println("Security API routes registered")
-	}
-}

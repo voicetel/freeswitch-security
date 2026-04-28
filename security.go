@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os/exec"
@@ -12,56 +11,64 @@ import (
 	"time"
 )
 
-// SecurityManager handles all security-related functionality
-type SecurityManager struct {
-	whitelist         map[string]WhitelistEntry
-	blacklist         map[string]BlacklistEntry
-	securityConfig    SecurityConfig
-	failedAttempts    map[string]FailedAttempt
-	mutex             sync.RWMutex
-	whitelistNetworks []*net.IPNet
-	untrustedPatterns []string
-	statistics        SecurityStats
-	statsMutex        sync.RWMutex
-	wrongCallStates   map[string]WrongCallStateEntry
+// Static channel buffer sizes. These were dynamic in earlier revisions; the
+// resizing logic was inherently racy (it swapped sm.xxxQueue while other
+// goroutines still held a reference to the old channel) so it has been
+// removed in favor of generously sized fixed buffers.
+const (
+	blacklistQueueSize  = 4096
+	whitelistQueueSize  = 4096
+	failedQueueSize     = 16384
+	wrongStateQueueSize = 16384
 
-	// Channel-based operations
+	defaultBatchSize     = 32
+	defaultBatchInterval = 100 * time.Millisecond
+
+	cleanupTickInterval = 10 * time.Minute
+
+	// defaultWhitelistTTL is the fallback TTL for whitelist entries when the
+	// configured value cannot be parsed.
+	defaultWhitelistTTL = 24 * time.Hour
+
+	// trackingBatchSize is the per-flush batch size for failed-attempt and
+	// wrong-state queue draining.
+	trackingBatchSize = 64
+)
+
+// SecurityManager handles all security-related functionality.
+type SecurityManager struct {
+	mu             sync.RWMutex
+	whitelist      map[string]WhitelistEntry
+	blacklist      map[string]BlacklistEntry
+	failedAttempts map[string]FailedAttempt
+	wrongStates    map[string]WrongCallStateEntry
+
+	// Read-mostly. trustedNetworks is set at init and never mutated.
+	trustedNetworks []*net.IPNet
+
+	// untrustedPatterns is a constant-time lookup table of exact-match
+	// patterns. Mutated under mu.
+	untrustedPatterns map[string]struct{}
+
+	cfg effectiveSecurityConfig
+
+	// Async work queues. Each has a single dedicated drainer goroutine.
 	blacklistQueue  chan BlacklistRequest
 	whitelistQueue  chan WhitelistRequest
 	failedQueue     chan FailedAttemptRequest
 	wrongStateQueue chan WrongStateRequest
 
-	// Batch processing
-	batchSize     int
-	batchInterval time.Duration
+	statsMu sync.RWMutex
+	stats   SecurityStats
 
-	// Dynamic channel sizing
-	channelResizers map[string]*DynamicChannelManager
-	channelMutex    sync.RWMutex
-
-	// Shutdown mechanism
+	// Lifecycle.
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	closed atomic.Bool
 }
 
-// DynamicChannelManager manages dynamic sizing for a specific channel
-type DynamicChannelManager struct {
-	name           string
-	baseSize       int
-	currentSize    int
-	maxSize        int
-	minSize        int
-	lastResize     time.Time
-	resizeInterval time.Duration
-	highLoadCount  int
-	lowLoadCount   int
-	totalProcessed int64
-	totalDropped   int64
-	mutex          sync.RWMutex
-}
-
-// SecurityConfig holds security-related configuration
+// SecurityConfig is the JSON-tagged configuration shape (kept for API stability).
 type SecurityConfig struct {
 	Enabled                bool     `json:"enabled"`
 	TrustedNetworks        []string `json:"trusted_networks"`
@@ -78,7 +85,24 @@ type SecurityConfig struct {
 	WrongCallStateWindow   string   `json:"wrong_call_state_window"`
 }
 
-// WhitelistEntry represents a whitelisted IP address
+// effectiveSecurityConfig is the validated, parsed config used at runtime.
+type effectiveSecurityConfig struct {
+	Enabled                bool
+	AutoBlockEnabled       bool
+	WhitelistEnabled       bool
+	AutoWhitelistOnSuccess bool
+
+	IPTablesChain string
+
+	MaxFailedAttempts  int
+	FailedWindow       time.Duration
+	BlockDuration      time.Duration
+	WhitelistTTL       time.Duration
+	MaxWrongCallStates int
+	WrongStateWindow   time.Duration
+}
+
+// WhitelistEntry represents a whitelisted IP address.
 type WhitelistEntry struct {
 	IP        string    `json:"ip"`
 	AddedAt   time.Time `json:"added_at"`
@@ -89,7 +113,7 @@ type WhitelistEntry struct {
 	Permanent bool      `json:"permanent"`
 }
 
-// BlacklistEntry represents a blacklisted IP address
+// BlacklistEntry represents a blacklisted IP address.
 type BlacklistEntry struct {
 	IP        string    `json:"ip"`
 	AddedAt   time.Time `json:"added_at"`
@@ -99,7 +123,7 @@ type BlacklistEntry struct {
 	Permanent bool      `json:"permanent"`
 }
 
-// FailedAttempt tracks failed registration attempts
+// FailedAttempt tracks failed registration attempts.
 type FailedAttempt struct {
 	Count        int       `json:"count"`
 	FirstAttempt time.Time `json:"first_attempt"`
@@ -108,7 +132,7 @@ type FailedAttempt struct {
 	Domains      []string  `json:"domains"`
 }
 
-// WrongCallStateEntry tracks wrong call state events
+// WrongCallStateEntry tracks wrong call state events.
 type WrongCallStateEntry struct {
 	Count        int       `json:"count"`
 	FirstAttempt time.Time `json:"first_attempt"`
@@ -116,7 +140,7 @@ type WrongCallStateEntry struct {
 	UserIDs      []string  `json:"user_ids"`
 }
 
-// SecurityStats tracks security-related statistics
+// SecurityStats tracks security-related statistics.
 type SecurityStats struct {
 	TotalRegistrations     int       `json:"total_registrations"`
 	FailedRegistrations    int       `json:"failed_registrations"`
@@ -129,7 +153,7 @@ type SecurityStats struct {
 	ActiveBlacklistEntries int       `json:"active_blacklist_entries"`
 }
 
-// Request types for channel operations
+// Request types for channel operations.
 type BlacklistRequest struct {
 	IP        string
 	Reason    string
@@ -156,15 +180,15 @@ type WrongStateRequest struct {
 	UserID string
 }
 
-// BatchWhitelistRequest is used for batch whitelist operations
+// BatchWhitelistRequest is used for batch whitelist operations.
 type BatchWhitelistRequest struct {
-	IP        string `json:"ip" binding:"required"`
+	IP        string `binding:"required" json:"ip"`
 	UserID    string `json:"user_id"`
 	Domain    string `json:"domain"`
 	Permanent bool   `json:"permanent"`
 }
 
-// BatchWhitelistResult is the result of a batch whitelist operation
+// BatchWhitelistResult is the result of a batch whitelist operation.
 type BatchWhitelistResult struct {
 	IP        string
 	UserID    string
@@ -173,14 +197,14 @@ type BatchWhitelistResult struct {
 	Error     error
 }
 
-// BatchBlacklistRequest is used for batch blacklist operations
+// BatchBlacklistRequest is used for batch blacklist operations.
 type BatchBlacklistRequest struct {
-	IP        string `json:"ip" binding:"required"`
+	IP        string `binding:"required" json:"ip"`
 	Reason    string `json:"reason"`
 	Permanent bool   `json:"permanent"`
 }
 
-// BatchBlacklistResult is the result of a batch blacklist operation
+// BatchBlacklistResult is the result of a batch blacklist operation.
 type BatchBlacklistResult struct {
 	IP        string
 	Reason    string
@@ -193,493 +217,209 @@ var (
 	secManagerOnce  sync.Once
 )
 
-// NewDynamicChannelManager creates a new dynamic channel manager
-func NewDynamicChannelManager(name string, baseSize, minSize, maxSize int) *DynamicChannelManager {
-	return &DynamicChannelManager{
-		name:           name,
-		baseSize:       baseSize,
-		currentSize:    baseSize,
-		minSize:        minSize,
-		maxSize:        maxSize,
-		lastResize:     time.Now(),
-		resizeInterval: 30 * time.Second,
-	}
-}
-
-// ShouldResize determines if a channel should be resized based on current load
-func (dcm *DynamicChannelManager) ShouldResize(currentLength, currentCapacity int) (bool, int) {
-	dcm.mutex.Lock()
-	defer dcm.mutex.Unlock()
-
-	// Don't resize too frequently
-	if time.Since(dcm.lastResize) < dcm.resizeInterval {
-		return false, dcm.currentSize
+// parseDurationOr returns the parsed duration or fallback if parsing fails.
+func parseDurationOr(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
 	}
 
-	utilization := float64(currentLength) / float64(currentCapacity)
-
-	// High load: > 80% utilization
-	if utilization > 0.8 {
-		dcm.highLoadCount++
-		dcm.lowLoadCount = 0
-
-		if dcm.highLoadCount >= 3 {
-			newSize := dcm.currentSize * 2
-			if newSize > dcm.maxSize {
-				newSize = dcm.maxSize
-			}
-			if newSize != dcm.currentSize {
-				dcm.currentSize = newSize
-				dcm.lastResize = time.Now()
-				dcm.highLoadCount = 0
-				return true, newSize
-			}
-		}
-	} else if utilization < 0.2 { // Low load: < 20% utilization
-		dcm.lowLoadCount++
-		dcm.highLoadCount = 0
-
-		if dcm.lowLoadCount >= 5 {
-			newSize := dcm.currentSize / 2
-			if newSize < dcm.minSize {
-				newSize = dcm.minSize
-			}
-			if newSize != dcm.currentSize {
-				dcm.currentSize = newSize
-				dcm.lastResize = time.Now()
-				dcm.lowLoadCount = 0
-				return true, newSize
-			}
-		}
-	} else {
-		// Normal load, reset counters
-		dcm.highLoadCount = 0
-		dcm.lowLoadCount = 0
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return fallback
 	}
 
-	return false, dcm.currentSize
+	return d
 }
 
-// UpdateStats updates the channel statistics
-func (dcm *DynamicChannelManager) UpdateStats(processed, dropped int64) {
-	atomic.AddInt64(&dcm.totalProcessed, processed)
-	atomic.AddInt64(&dcm.totalDropped, dropped)
-}
-
-// GetStats returns channel statistics
-func (dcm *DynamicChannelManager) GetStats() map[string]interface{} {
-	dcm.mutex.RLock()
-	defer dcm.mutex.RUnlock()
-
-	return map[string]interface{}{
-		"name":            dcm.name,
-		"current_size":    dcm.currentSize,
-		"base_size":       dcm.baseSize,
-		"min_size":        dcm.minSize,
-		"max_size":        dcm.maxSize,
-		"high_load_count": dcm.highLoadCount,
-		"low_load_count":  dcm.lowLoadCount,
-		"last_resize":     dcm.lastResize.Format(time.RFC3339),
-		"total_processed": atomic.LoadInt64(&dcm.totalProcessed),
-		"total_dropped":   atomic.LoadInt64(&dcm.totalDropped),
-	}
-}
-
-// InitSecurityManager initializes the security manager
-func InitSecurityManager() error {
-	var err error
+// InitSecurityManager initializes the security manager. iptables setup
+// failures are logged but not returned because the manager remains usable in
+// a degraded mode (without auto-blocking) when iptables is unavailable.
+func InitSecurityManager() {
 	secManagerOnce.Do(func() {
 		logger := GetLogger()
-		config := GetConfig()
+		cfg := GetConfig()
 
-		// Initialize the security configuration
-		secConfig := SecurityConfig{
-			Enabled:                config.Security.Enabled,
-			MaxFailedAttempts:      config.Security.MaxFailedAttempts,
-			FailedAttemptsWindow:   config.Security.FailedAttemptsWindow,
-			AutoBlockEnabled:       config.Security.AutoBlockEnabled,
-			BlockDuration:          config.Security.BlockDuration,
-			WhitelistEnabled:       config.Security.WhitelistEnabled,
-			WhitelistTTL:           config.Security.WhitelistTTL,
-			IPTablesChain:          config.Security.IPTablesChain,
-			TrustedNetworks:        config.Security.TrustedNetworks,
-			UntrustedNetworks:      config.Security.UntrustedNetworks,
-			AutoWhitelistOnSuccess: config.Security.AutoWhitelistOnSuccess,
-			MaxWrongCallStates:     config.Security.MaxWrongCallStates,
-			WrongCallStateWindow:   config.Security.WrongCallStateWindow,
+		eff := effectiveSecurityConfig{
+			Enabled:                cfg.Security.Enabled,
+			AutoBlockEnabled:       cfg.Security.AutoBlockEnabled,
+			WhitelistEnabled:       cfg.Security.WhitelistEnabled,
+			AutoWhitelistOnSuccess: cfg.Security.AutoWhitelistOnSuccess,
+			IPTablesChain:          cfg.Security.IPTablesChain,
+			MaxFailedAttempts:      cfg.Security.MaxFailedAttempts,
+			MaxWrongCallStates:     cfg.Security.MaxWrongCallStates,
+			FailedWindow:           parseDurationOr(cfg.Security.FailedAttemptsWindow, 10*time.Minute),
+			BlockDuration:          parseDurationOr(cfg.Security.BlockDuration, time.Hour),
+			WhitelistTTL:           parseDurationOr(cfg.Security.WhitelistTTL, defaultWhitelistTTL),
+			WrongStateWindow:       parseDurationOr(cfg.Security.WrongCallStateWindow, 10*time.Minute),
 		}
 
-		logger.SetLogLevelFromString(config.Security.ESLLogLevel)
+		logger.SetLogLevelFromString(cfg.Security.ESLLogLevel)
 
-		// Parse trusted networks
-		var trustedNetworks []*net.IPNet
-		for _, networkStr := range secConfig.TrustedNetworks {
-			_, network, err := net.ParseCIDR(networkStr)
+		trusted := make([]*net.IPNet, 0, len(cfg.Security.TrustedNetworks))
+
+		for _, s := range cfg.Security.TrustedNetworks {
+			_, network, err := net.ParseCIDR(s)
 			if err != nil {
-				logger.Error("Error parsing trusted network %s: %v", networkStr, err)
+				logger.Error("Error parsing trusted network %q: %v", s, err)
+
 				continue
 			}
-			trustedNetworks = append(trustedNetworks, network)
+
+			trusted = append(trusted, network)
 		}
 
-		// Create context for shutdown
+		untrusted := make(map[string]struct{}, len(cfg.Security.UntrustedNetworks))
+		for _, p := range cfg.Security.UntrustedNetworks {
+			untrusted[p] = struct{}{}
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
-
-		// Initialize channel resizers
-		channelResizers := make(map[string]*DynamicChannelManager)
-		channelResizers["blacklist"] = NewDynamicChannelManager("blacklist", 1000, 500, 5000)
-		channelResizers["whitelist"] = NewDynamicChannelManager("whitelist", 1000, 500, 5000)
-		channelResizers["failed"] = NewDynamicChannelManager("failed", 5000, 1000, 20000)
-		channelResizers["wrongstate"] = NewDynamicChannelManager("wrongstate", 5000, 1000, 20000)
-
-		// Initialize the security manager with dynamic channel sizes
 		securityManager = &SecurityManager{
 			whitelist:         make(map[string]WhitelistEntry),
 			blacklist:         make(map[string]BlacklistEntry),
-			securityConfig:    secConfig,
 			failedAttempts:    make(map[string]FailedAttempt),
-			wrongCallStates:   make(map[string]WrongCallStateEntry),
-			whitelistNetworks: trustedNetworks,
-			untrustedPatterns: secConfig.UntrustedNetworks,
-			statistics: SecurityStats{
-				LastRegistrationTime:   time.Time{},
-				LastFailedTime:         time.Time{},
-				LastWrongCallStateTime: time.Time{},
-			},
-			// Channel initialization with dynamic sizes
-			blacklistQueue:  make(chan BlacklistRequest, channelResizers["blacklist"].currentSize),
-			whitelistQueue:  make(chan WhitelistRequest, channelResizers["whitelist"].currentSize),
-			failedQueue:     make(chan FailedAttemptRequest, channelResizers["failed"].currentSize),
-			wrongStateQueue: make(chan WrongStateRequest, channelResizers["wrongstate"].currentSize),
-			batchSize:       10,
-			batchInterval:   100 * time.Millisecond,
-			channelResizers: channelResizers,
-			ctx:             ctx,
-			cancel:          cancel,
+			wrongStates:       make(map[string]WrongCallStateEntry),
+			trustedNetworks:   trusted,
+			untrustedPatterns: untrusted,
+			cfg:               eff,
+			blacklistQueue:    make(chan BlacklistRequest, blacklistQueueSize),
+			whitelistQueue:    make(chan WhitelistRequest, whitelistQueueSize),
+			failedQueue:       make(chan FailedAttemptRequest, failedQueueSize),
+			wrongStateQueue:   make(chan WrongStateRequest, wrongStateQueueSize),
+			ctx:               ctx,
+			cancel:            cancel,
 		}
 
-		logger.Info("Security manager initialized with dynamic channel sizing")
-		logger.Info("Initial channel sizes - Blacklist: %d, Whitelist: %d, Failed: %d, WrongState: %d",
-			channelResizers["blacklist"].currentSize,
-			channelResizers["whitelist"].currentSize,
-			channelResizers["failed"].currentSize,
-			channelResizers["wrongstate"].currentSize)
-		logger.Info("Whitelist settings - Enabled: %t, TTL: %s, Auto-whitelist: %t",
-			secConfig.WhitelistEnabled, secConfig.WhitelistTTL, secConfig.AutoWhitelistOnSuccess)
-		logger.Info("Blacklist settings - Auto-block: %t, Max attempts: %d, Window: %s, Duration: %s",
-			secConfig.AutoBlockEnabled, secConfig.MaxFailedAttempts, secConfig.FailedAttemptsWindow, secConfig.BlockDuration)
+		logger.Info("Security manager initialized")
+		logger.Info("Whitelist - enabled: %t, ttl: %s, auto-on-success: %t",
+			eff.WhitelistEnabled, eff.WhitelistTTL, eff.AutoWhitelistOnSuccess)
+		logger.Info("Blacklist - auto-block: %t, max-attempts: %d, window: %s, duration: %s",
+			eff.AutoBlockEnabled, eff.MaxFailedAttempts, eff.FailedWindow, eff.BlockDuration)
 
-		// Log untrusted networks
-		if len(secConfig.UntrustedNetworks) > 0 {
-			logger.Info("Untrusted networks loaded - Count: %d", len(secConfig.UntrustedNetworks))
-			for i, pattern := range secConfig.UntrustedNetworks {
-				logger.Info("  Untrusted pattern #%d: %s", i+1, pattern)
-			}
-		} else {
-			logger.Info("No untrusted networks configured")
+		if len(untrusted) > 0 {
+			logger.Info("Untrusted patterns loaded: %d", len(untrusted))
 		}
 
-		// Ensure the iptables chain exists
-		if secConfig.AutoBlockEnabled {
-			err = ensureIPTablesChain(secConfig.IPTablesChain)
-			if err != nil {
-				logger.Error("Warning: Failed to set up iptables chain: %v", err)
+		if eff.AutoBlockEnabled {
+			if err := ensureIPTablesChain(eff.IPTablesChain); err != nil {
+				logger.Error("Warning: failed to set up iptables chain: %v", err)
 			} else {
-				logger.Info("Successfully configured iptables chain: %s", secConfig.IPTablesChain)
+				logger.Info("Configured iptables chain: %s", eff.IPTablesChain)
 			}
 		}
 
-		// Start worker goroutines
-		securityManager.wg.Add(4)
+		// Start workers.
+		securityManager.wg.Add(5)
 		go securityManager.processBlacklistQueue()
 		go securityManager.processWhitelistQueue()
 		go securityManager.processFailedAttemptQueue()
 		go securityManager.processWrongStateQueue()
-
-		// Start channel monitor
-		securityManager.wg.Add(1)
-		go securityManager.monitorChannelSizes()
-
-		// Start cleanup routine
-		logger.Info("Starting periodic cleanup routine")
-		securityManager.wg.Add(1)
 		go securityManager.startCleanupRoutine()
 	})
-
-	return err
 }
 
-// monitorChannelSizes monitors and adjusts channel sizes based on load
-func (sm *SecurityManager) monitorChannelSizes() {
-	defer sm.wg.Done()
-
-	logger := GetLogger()
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			logger.Info("Channel size monitor shutting down")
-			return
-
-		case <-ticker.C:
-			// Check each channel and resize if needed
-			sm.checkAndResizeChannel("blacklist", sm.blacklistQueue)
-			sm.checkAndResizeChannel("whitelist", sm.whitelistQueue)
-			sm.checkAndResizeChannel("failed", sm.failedQueue)
-			sm.checkAndResizeChannel("wrongstate", sm.wrongStateQueue)
-		}
+// GetSecurityManager returns the security manager instance, initializing it
+// on first call.
+func GetSecurityManager() *SecurityManager {
+	if securityManager == nil {
+		InitSecurityManager()
 	}
+
+	return securityManager
 }
 
-// checkAndResizeChannel checks a specific channel and resizes if needed
-func (sm *SecurityManager) checkAndResizeChannel(name string, currentChannel interface{}) {
-	logger := GetLogger()
-
-	sm.channelMutex.RLock()
-	resizer, exists := sm.channelResizers[name]
-	sm.channelMutex.RUnlock()
-
-	if !exists {
+// Shutdown gracefully shuts down the security manager.
+func (sm *SecurityManager) Shutdown() {
+	if !sm.closed.CompareAndSwap(false, true) {
 		return
 	}
 
-	var length, capacity int
-	var needsResize bool
-	var newSize int
-
-	// Get channel metrics based on type
-	switch ch := currentChannel.(type) {
-	case chan BlacklistRequest:
-		length = len(ch)
-		capacity = cap(ch)
-		needsResize, newSize = resizer.ShouldResize(length, capacity)
-		if needsResize {
-			sm.resizeBlacklistChannel(newSize)
-		}
-	case chan WhitelistRequest:
-		length = len(ch)
-		capacity = cap(ch)
-		needsResize, newSize = resizer.ShouldResize(length, capacity)
-		if needsResize {
-			sm.resizeWhitelistChannel(newSize)
-		}
-	case chan FailedAttemptRequest:
-		length = len(ch)
-		capacity = cap(ch)
-		needsResize, newSize = resizer.ShouldResize(length, capacity)
-		if needsResize {
-			sm.resizeFailedChannel(newSize)
-		}
-	case chan WrongStateRequest:
-		length = len(ch)
-		capacity = cap(ch)
-		needsResize, newSize = resizer.ShouldResize(length, capacity)
-		if needsResize {
-			sm.resizeWrongStateChannel(newSize)
-		}
-	}
-
-	if needsResize {
-		logger.Info("Resized %s channel from %d to %d (was %d/%d full)",
-			name, capacity, newSize, length, capacity)
-	}
-}
-
-// Channel resize methods
-func (sm *SecurityManager) resizeBlacklistChannel(newSize int) {
-	newChan := make(chan BlacklistRequest, newSize)
-	oldChan := sm.blacklistQueue
-	sm.blacklistQueue = newChan
-
-	// Transfer existing items
-	go func() {
-		for req := range oldChan {
-			select {
-			case newChan <- req:
-			default:
-				// New channel full, send error response
-				if req.Response != nil {
-					req.Response <- fmt.Errorf("channel resize: queue full")
-				}
-				sm.channelResizers["blacklist"].UpdateStats(0, 1)
-			}
-		}
-	}()
-}
-
-func (sm *SecurityManager) resizeWhitelistChannel(newSize int) {
-	newChan := make(chan WhitelistRequest, newSize)
-	oldChan := sm.whitelistQueue
-	sm.whitelistQueue = newChan
-
-	go func() {
-		for req := range oldChan {
-			select {
-			case newChan <- req:
-			default:
-				if req.Response != nil {
-					req.Response <- fmt.Errorf("channel resize: queue full")
-				}
-				sm.channelResizers["whitelist"].UpdateStats(0, 1)
-			}
-		}
-	}()
-}
-
-func (sm *SecurityManager) resizeFailedChannel(newSize int) {
-	newChan := make(chan FailedAttemptRequest, newSize)
-	oldChan := sm.failedQueue
-	sm.failedQueue = newChan
-
-	go func() {
-		for req := range oldChan {
-			select {
-			case newChan <- req:
-			default:
-				sm.channelResizers["failed"].UpdateStats(0, 1)
-			}
-		}
-	}()
-}
-
-func (sm *SecurityManager) resizeWrongStateChannel(newSize int) {
-	newChan := make(chan WrongStateRequest, newSize)
-	oldChan := sm.wrongStateQueue
-	sm.wrongStateQueue = newChan
-
-	go func() {
-		for req := range oldChan {
-			select {
-			case newChan <- req:
-			default:
-				sm.channelResizers["wrongstate"].UpdateStats(0, 1)
-			}
-		}
-	}()
-}
-
-// Shutdown gracefully shuts down the security manager
-func (sm *SecurityManager) Shutdown() {
 	logger := GetLogger()
 	logger.Info("Shutting down security manager...")
 
-	// Cancel the context to signal shutdown
 	sm.cancel()
-
-	// Close all channels
 	close(sm.blacklistQueue)
 	close(sm.whitelistQueue)
 	close(sm.failedQueue)
 	close(sm.wrongStateQueue)
-
-	// Wait for all goroutines to finish
 	sm.wg.Wait()
 
 	logger.Info("Security manager shutdown complete")
 }
 
-// GetSecurityManager returns the security manager instance
-func GetSecurityManager() *SecurityManager {
-	if securityManager == nil {
-		if err := InitSecurityManager(); err != nil {
-			GetLogger().Error("Error initializing security manager: %v", err)
-		}
-	}
-	return securityManager
-}
-
-// processBlacklistQueue processes blacklist requests in batches
+// processBlacklistQueue drains the blacklist queue.
 func (sm *SecurityManager) processBlacklistQueue() {
 	defer sm.wg.Done()
 
-	logger := GetLogger()
-	ticker := time.NewTicker(sm.batchInterval)
+	ticker := time.NewTicker(defaultBatchInterval)
 	defer ticker.Stop()
 
-	batch := make([]BlacklistRequest, 0, sm.batchSize)
+	batch := make([]BlacklistRequest, 0, defaultBatchSize)
+	flush := func() {
+		if len(batch) > 0 {
+			sm.processBatchBlacklist(batch)
+			batch = batch[:0]
+		}
+	}
 
 	for {
 		select {
 		case <-sm.ctx.Done():
-			logger.Info("Blacklist queue processor shutting down")
-			return
+			flush()
 
+			return
 		case req, ok := <-sm.blacklistQueue:
 			if !ok {
-				// Channel closed
+				flush()
+
 				return
 			}
+
 			batch = append(batch, req)
-
-			// Process batch if it's full
-			if len(batch) >= sm.batchSize {
-				sm.processBatchBlacklist(batch)
-				batch = batch[:0]
+			if len(batch) >= defaultBatchSize {
+				flush()
 			}
-
 		case <-ticker.C:
-			// Process any pending items
-			if len(batch) > 0 {
-				sm.processBatchBlacklist(batch)
-				batch = batch[:0]
-			}
+			flush()
 		}
 	}
 }
 
-// processBatchBlacklist processes a batch of blacklist requests
+// processBatchBlacklist applies a batch of blacklist requests.
 func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 	logger := GetLogger()
+	now := time.Now()
+	blockDuration := sm.cfg.BlockDuration
 
-	// Update channel statistics
-	sm.channelResizers["blacklist"].UpdateStats(int64(len(batch)), 0)
+	// IPs we successfully accepted into the blacklist; iptables work happens
+	// outside the lock to avoid blocking other security operations on fork+exec.
+	toBlock := make([]string, 0, len(batch))
 
-	// Batch iptables commands
-	var iptablesCommands []string
-
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
+	sm.mu.Lock()
 	for _, req := range batch {
-		// Validate IP
-		if net.ParseIP(req.IP) == nil {
-			if req.Response != nil {
-				req.Response <- fmt.Errorf("invalid IP address: %s", req.IP)
-			}
-			continue
-		}
-
-		// Check if whitelisted
-		if _, isWhitelisted := sm.whitelist[req.IP]; isWhitelisted {
-			if req.Response != nil {
-				req.Response <- fmt.Errorf("cannot blacklist whitelisted IP: %s", req.IP)
-			}
-			continue
-		}
-
-		// Check if IP is in a trusted network
 		ip := net.ParseIP(req.IP)
-		inTrustedNetwork := false
-		for _, network := range sm.whitelistNetworks {
-			if network.Contains(ip) {
-				inTrustedNetwork = true
-				break
-			}
-		}
-		if inTrustedNetwork {
+		if ip == nil {
 			if req.Response != nil {
-				req.Response <- fmt.Errorf("cannot blacklist IP in trusted network: %s", req.IP)
+				req.Response <- fmt.Errorf("%w: %s", ErrInvalidIP, req.IP)
 			}
+
 			continue
 		}
 
-		// Add to blacklist
-		now := time.Now()
-		blockDuration, _ := time.ParseDuration(sm.securityConfig.BlockDuration)
-		if blockDuration == 0 {
-			blockDuration = time.Hour
+		if _, ok := sm.whitelist[req.IP]; ok {
+			if req.Response != nil {
+				req.Response <- fmt.Errorf("%w: %s", ErrIPWhitelisted, req.IP)
+			}
+
+			continue
+		}
+
+		if sm.ipInTrustedNetwork(ip) {
+			if req.Response != nil {
+				req.Response <- fmt.Errorf("%w: %s", ErrIPInTrustedNetwork, req.IP)
+			}
+
+			continue
 		}
 
 		entry := BlacklistEntry{
@@ -689,715 +429,516 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 			Reason:    req.Reason,
 			Permanent: req.Permanent,
 		}
-
 		sm.blacklist[req.IP] = entry
 		delete(sm.failedAttempts, req.IP)
 
-		// Queue iptables command
-		if sm.securityConfig.AutoBlockEnabled {
-			iptablesCommands = append(iptablesCommands, req.IP)
+		if sm.cfg.AutoBlockEnabled {
+			toBlock = append(toBlock, req.IP)
 		}
 
 		logger.Info("Added IP %s to blacklist: %s", req.IP, req.Reason)
-
-		// Cache the entry
-		cache := GetCacheManager()
-		if cache.enabled {
-			key := fmt.Sprintf("blacklist:%s", req.IP)
-			data, err := json.Marshal(entry)
-			if err == nil {
-				cache.CacheSecurityItemAsync(key, data)
-			}
-		}
 
 		if req.Response != nil {
 			req.Response <- nil
 		}
 	}
 
-	// Update statistics
-	sm.statsMutex.Lock()
-	sm.statistics.ActiveBlacklistEntries = len(sm.blacklist)
-	sm.statistics.BlockedAttempts += len(batch)
-	sm.statsMutex.Unlock()
+	blacklistCount := len(sm.blacklist)
+	sm.mu.Unlock()
 
-	// Execute batch iptables commands
-	if len(iptablesCommands) > 0 && sm.securityConfig.AutoBlockEnabled {
-		sm.batchBlockIPs(iptablesCommands)
+	sm.statsMu.Lock()
+	sm.stats.ActiveBlacklistEntries = blacklistCount
+	sm.stats.BlockedAttempts += len(batch)
+	sm.statsMu.Unlock()
+
+	if len(toBlock) > 0 {
+		sm.batchBlockIPs(toBlock)
 	}
 }
 
-// batchBlockIPs blocks multiple IPs using iptables in a single operation
-func (sm *SecurityManager) batchBlockIPs(ips []string) {
-
-	if len(ips) == 0 {
-		return
-	}
-
-	// Process in smaller batches to reduce lock contention
-	batchSize := 5
-	for i := 0; i < len(ips); i += batchSize {
-		end := i + batchSize
-		if end > len(ips) {
-			end = len(ips)
-		}
-
-		batch := ips[i:end]
-		sm.processBatchBlock(batch)
-
-		// Small delay between batches to reduce lock contention
-		if end < len(ips) {
-			time.Sleep(100 * time.Millisecond)
+// ipInTrustedNetwork must be called with sm.mu held (or while trustedNetworks
+// is otherwise known to be stable, which is always after init).
+func (sm *SecurityManager) ipInTrustedNetwork(ip net.IP) bool {
+	for _, n := range sm.trustedNetworks {
+		if n.Contains(ip) {
+			return true
 		}
 	}
+
+	return false
 }
 
-// processBatchBlock processes a small batch of IP blocks
-func (sm *SecurityManager) processBatchBlock(ips []string) {
-	logger := GetLogger()
-
-	var commands []string
-	var validIPs []string
-
-	// Build commands with existence checks
-	for _, ip := range ips {
-		// First check if rule already exists, then add if not
-		checkAndAdd := fmt.Sprintf("iptables -C %s -s %s -j DROP 2>/dev/null || iptables -A %s -s %s -j DROP",
-			sm.securityConfig.IPTablesChain, ip, sm.securityConfig.IPTablesChain, ip)
-		commands = append(commands, checkAndAdd)
-		validIPs = append(validIPs, ip)
-	}
-
-	if len(commands) == 0 {
-		return
-	}
-
-	// Execute batch with retry logic
-	script := strings.Join(commands, " && ")
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("sh", "-c", script)
-		output, err := cmd.CombinedOutput()
-
-		if err == nil {
-			logger.Info("Successfully processed batch block for %d IPs", len(validIPs))
-			return
-		}
-
-		// Check if it's a lock error
-		if strings.Contains(string(output), "xtables lock") {
-			if attempt < maxRetries {
-				backoff := time.Duration(attempt) * 500 * time.Millisecond
-				logger.Debug("Batch iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
-				time.Sleep(backoff)
-				continue
-			}
-		}
-
-		// If batch failed, fall back to individual processing
-		logger.Info("Batch iptables failed, falling back to individual processing: %v", err)
-		sm.fallbackIndividualBlock(validIPs)
-		return
-	}
-
-	logger.Error("Batch iptables failed after %d attempts, falling back to individual processing", maxRetries)
-	sm.fallbackIndividualBlock(validIPs)
-}
-
-// fallbackIndividualBlock processes IPs individually when batch fails
-func (sm *SecurityManager) fallbackIndividualBlock(ips []string) {
-	for _, ip := range ips {
-		if err := blockIPWithIptables(ip, sm.securityConfig.IPTablesChain); err != nil {
-			GetLogger().Error("Failed to block IP %s individually: %v", ip, err)
-		}
-	}
-}
-
-// processWhitelistQueue processes whitelist requests
+// processWhitelistQueue drains the whitelist queue.
 func (sm *SecurityManager) processWhitelistQueue() {
 	defer sm.wg.Done()
 
-	logger := GetLogger()
-	ticker := time.NewTicker(sm.batchInterval)
+	ticker := time.NewTicker(defaultBatchInterval)
 	defer ticker.Stop()
 
-	batch := make([]WhitelistRequest, 0, sm.batchSize)
+	batch := make([]WhitelistRequest, 0, defaultBatchSize)
+	flush := func() {
+		if len(batch) > 0 {
+			sm.processBatchWhitelist(batch)
+			batch = batch[:0]
+		}
+	}
 
 	for {
 		select {
 		case <-sm.ctx.Done():
-			logger.Info("Whitelist queue processor shutting down")
-			return
+			flush()
 
+			return
 		case req, ok := <-sm.whitelistQueue:
 			if !ok {
+				flush()
+
 				return
 			}
+
 			batch = append(batch, req)
-
-			if len(batch) >= sm.batchSize {
-				sm.processBatchWhitelist(batch)
-				batch = batch[:0]
+			if len(batch) >= defaultBatchSize {
+				flush()
 			}
-
 		case <-ticker.C:
-			if len(batch) > 0 {
-				sm.processBatchWhitelist(batch)
-				batch = batch[:0]
-			}
+			flush()
 		}
 	}
 }
 
-// processBatchWhitelist processes a batch of whitelist requests
+// processBatchWhitelist applies a batch of whitelist requests.
 func (sm *SecurityManager) processBatchWhitelist(batch []WhitelistRequest) {
 	logger := GetLogger()
-
-	// Update channel statistics
-	sm.channelResizers["whitelist"].UpdateStats(int64(len(batch)), 0)
-
-	whitelistTTL, _ := time.ParseDuration(sm.securityConfig.WhitelistTTL)
-	if whitelistTTL == 0 {
-		whitelistTTL = 24 * time.Hour
-	}
 	now := time.Now()
+	ttl := sm.cfg.WhitelistTTL
 
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	// IPs unblocked from iptables outside the lock.
+	toUnblock := make([]string, 0)
 
+	sm.mu.Lock()
 	for _, req := range batch {
-		// Validate IP
 		if net.ParseIP(req.IP) == nil {
 			if req.Response != nil {
-				req.Response <- fmt.Errorf("invalid IP address: %s", req.IP)
+				req.Response <- fmt.Errorf("%w: %s", ErrInvalidIP, req.IP)
 			}
+
 			continue
 		}
 
 		entry := WhitelistEntry{
 			IP:        req.IP,
 			AddedAt:   now,
-			ExpiresAt: now.Add(whitelistTTL),
+			ExpiresAt: now.Add(ttl),
 			LastSeen:  now,
 			UserID:    req.UserID,
 			Domain:    req.Domain,
 			Permanent: req.Permanent,
 		}
-
 		sm.whitelist[req.IP] = entry
 
-		// Remove from blacklist if present
-		if _, exists := sm.blacklist[req.IP]; exists {
+		if _, ok := sm.blacklist[req.IP]; ok {
 			delete(sm.blacklist, req.IP)
-			// Unblock from iptables
-			if sm.securityConfig.AutoBlockEnabled {
-				go func(ip, chain string) {
-					if err := unblockIPWithIptables(ip, chain); err != nil {
-						logger.Error("Failed to unblock IP %s: %v", ip, err)
-					}
-				}(req.IP, sm.securityConfig.IPTablesChain)
+
+			if sm.cfg.AutoBlockEnabled {
+				toUnblock = append(toUnblock, req.IP)
 			}
 		}
 
 		logger.Info("Added IP %s to whitelist for user %s@%s", req.IP, req.UserID, req.Domain)
-
-		// Cache the entry
-		cache := GetCacheManager()
-		if cache.enabled {
-			key := fmt.Sprintf("whitelist:%s", req.IP)
-			data, err := json.Marshal(entry)
-			if err == nil {
-				cache.CacheSecurityItemAsync(key, data)
-			}
-		}
 
 		if req.Response != nil {
 			req.Response <- nil
 		}
 	}
 
-	// Update statistics
-	sm.statsMutex.Lock()
-	sm.statistics.ActiveWhitelistEntries = len(sm.whitelist)
-	sm.statsMutex.Unlock()
-}
+	whitelistCount := len(sm.whitelist)
+	sm.mu.Unlock()
 
-// processFailedAttemptQueue processes failed attempt tracking
-func (sm *SecurityManager) processFailedAttemptQueue() {
-	defer sm.wg.Done()
+	sm.statsMu.Lock()
+	sm.stats.ActiveWhitelistEntries = whitelistCount
+	sm.statsMu.Unlock()
 
-	logger := GetLogger()
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	batch := make([]FailedAttemptRequest, 0, 50)
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			logger.Info("Failed attempt queue processor shutting down")
-			return
-
-		case req, ok := <-sm.failedQueue:
-			if !ok {
-				return
-			}
-			batch = append(batch, req)
-
-			if len(batch) >= 50 {
-				sm.processBatchFailedAttempts(batch)
-				batch = batch[:0]
-			}
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				sm.processBatchFailedAttempts(batch)
-				batch = batch[:0]
-			}
+	chain := sm.cfg.IPTablesChain
+	for _, ip := range toUnblock {
+		if err := unblockIPWithIptables(ip, chain); err != nil {
+			logger.Error("Failed to unblock IP %s: %v", ip, err)
 		}
 	}
 }
 
-// processBatchFailedAttempts processes a batch of failed attempts
+// processFailedAttemptQueue drains the failed-attempt queue.
+func (sm *SecurityManager) processFailedAttemptQueue() {
+	defer sm.wg.Done()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	batch := make([]FailedAttemptRequest, 0, trackingBatchSize)
+	flush := func() {
+		if len(batch) > 0 {
+			sm.processBatchFailedAttempts(batch)
+			batch = batch[:0]
+		}
+	}
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			flush()
+
+			return
+		case req, ok := <-sm.failedQueue:
+			if !ok {
+				flush()
+
+				return
+			}
+
+			batch = append(batch, req)
+			if len(batch) >= trackingBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// processBatchFailedAttempts handles a batch of failed registration attempts.
 func (sm *SecurityManager) processBatchFailedAttempts(batch []FailedAttemptRequest) {
-	logger := GetLogger()
+	now := time.Now()
+	maxAttempts := sm.cfg.MaxFailedAttempts
+	autoBlock := sm.cfg.AutoBlockEnabled
 
-	// Update channel statistics
-	sm.channelResizers["failed"].UpdateStats(int64(len(batch)), 0)
-
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// Track IPs that need to be blacklisted
 	var toBlacklist []BlacklistRequest
 
+	sm.mu.Lock()
 	for _, req := range batch {
-		// Check if whitelisted
-		if _, isWhitelisted := sm.whitelist[req.IP]; isWhitelisted {
+		if _, whitelisted := sm.whitelist[req.IP]; whitelisted {
 			continue
 		}
 
-		// Check if IP is in a trusted network
 		ip := net.ParseIP(req.IP)
-		inTrustedNetwork := false
-		for _, network := range sm.whitelistNetworks {
-			if network.Contains(ip) {
-				inTrustedNetwork = true
-				break
-			}
-		}
-		if inTrustedNetwork {
+		if ip == nil || sm.ipInTrustedNetwork(ip) {
 			continue
 		}
 
-		// Update failed attempts
-		attempt, exists := sm.failedAttempts[req.IP]
-		if !exists {
+		attempt, ok := sm.failedAttempts[req.IP]
+		if !ok {
 			attempt = FailedAttempt{
 				Count:        1,
-				FirstAttempt: time.Now(),
-				LastAttempt:  time.Now(),
-				UserIDs:      []string{req.UserID},
-				Domains:      []string{req.Domain},
+				FirstAttempt: now,
+				LastAttempt:  now,
+				UserIDs:      appendUnique(nil, req.UserID),
+				Domains:      appendUnique(nil, req.Domain),
 			}
 		} else {
 			attempt.Count++
-			attempt.LastAttempt = time.Now()
-
-			// Add unique user IDs and domains
-			if req.UserID != "" && req.UserID != "unknown" {
-				found := false
-				for _, id := range attempt.UserIDs {
-					if id == req.UserID {
-						found = true
-						break
-					}
-				}
-				if !found {
-					attempt.UserIDs = append(attempt.UserIDs, req.UserID)
-				}
-			}
-
-			if req.Domain != "" {
-				found := false
-				for _, dom := range attempt.Domains {
-					if dom == req.Domain {
-						found = true
-						break
-					}
-				}
-				if !found {
-					attempt.Domains = append(attempt.Domains, req.Domain)
-				}
-			}
+			attempt.LastAttempt = now
+			attempt.UserIDs = appendUnique(attempt.UserIDs, req.UserID)
+			attempt.Domains = appendUnique(attempt.Domains, req.Domain)
 		}
 
 		sm.failedAttempts[req.IP] = attempt
 
-		// Check if should be blacklisted
-		if sm.securityConfig.AutoBlockEnabled && attempt.Count >= sm.securityConfig.MaxFailedAttempts {
-			reason := fmt.Sprintf("Exceeded max failed registrations (%d)", sm.securityConfig.MaxFailedAttempts)
+		if autoBlock && attempt.Count >= maxAttempts {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:        req.IP,
-				Reason:    reason,
-				Permanent: false,
+				IP:     req.IP,
+				Reason: fmt.Sprintf("Exceeded max failed registrations (%d)", maxAttempts),
 			})
 		}
 
-		// Check untrusted domain
-		if sm.IsUntrustedDomain(req.Domain) {
-			reason := fmt.Sprintf("Failed registration attempt from untrusted domain '%s'", req.Domain)
+		if _, untrusted := sm.untrustedPatterns[req.Domain]; untrusted && req.Domain != "" {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:        req.IP,
-				Reason:    reason,
-				Permanent: false,
+				IP:     req.IP,
+				Reason: fmt.Sprintf("Failed registration from untrusted domain %q", req.Domain),
 			})
 		}
 	}
+	sm.mu.Unlock()
 
-	// Update statistics
-	sm.statsMutex.Lock()
-	sm.statistics.FailedRegistrations += len(batch)
-	sm.statistics.LastFailedTime = time.Now()
-	sm.statsMutex.Unlock()
+	sm.statsMu.Lock()
+	sm.stats.FailedRegistrations += len(batch)
+	sm.stats.LastFailedTime = now
+	sm.statsMu.Unlock()
 
-	// Queue blacklist requests
-	for _, req := range toBlacklist {
-		select {
-		case sm.blacklistQueue <- req:
-			logger.Info("Queued IP %s for blacklisting: %s", req.IP, req.Reason)
-		default:
-			// Queue is full, log error
-			logger.Error("Blacklist queue full, could not queue IP %s", req.IP)
-			sm.channelResizers["blacklist"].UpdateStats(0, 1)
-		}
-	}
+	sm.enqueueBlacklist(toBlacklist)
 }
 
-// processWrongStateQueue processes wrong call state events
+// processWrongStateQueue drains the wrong-state queue.
 func (sm *SecurityManager) processWrongStateQueue() {
 	defer sm.wg.Done()
 
-	logger := GetLogger()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
-	batch := make([]WrongStateRequest, 0, 50)
+	batch := make([]WrongStateRequest, 0, trackingBatchSize)
+	flush := func() {
+		if len(batch) > 0 {
+			sm.processBatchWrongStates(batch)
+			batch = batch[:0]
+		}
+	}
 
 	for {
 		select {
 		case <-sm.ctx.Done():
-			logger.Info("Wrong state queue processor shutting down")
-			return
+			flush()
 
+			return
 		case req, ok := <-sm.wrongStateQueue:
 			if !ok {
+				flush()
+
 				return
 			}
+
 			batch = append(batch, req)
-
-			if len(batch) >= 50 {
-				sm.processBatchWrongStates(batch)
-				batch = batch[:0]
+			if len(batch) >= trackingBatchSize {
+				flush()
 			}
-
 		case <-ticker.C:
-			if len(batch) > 0 {
-				sm.processBatchWrongStates(batch)
-				batch = batch[:0]
-			}
+			flush()
 		}
 	}
 }
 
-// processBatchWrongStates processes a batch of wrong call states
+// processBatchWrongStates handles a batch of wrong-call-state events.
 func (sm *SecurityManager) processBatchWrongStates(batch []WrongStateRequest) {
-	logger := GetLogger()
-
-	// Update channel statistics
-	sm.channelResizers["wrongstate"].UpdateStats(int64(len(batch)), 0)
-
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	now := time.Now()
+	maxStates := sm.cfg.MaxWrongCallStates
+	autoBlock := sm.cfg.AutoBlockEnabled
 
 	var toBlacklist []BlacklistRequest
 
+	sm.mu.Lock()
 	for _, req := range batch {
-		// Check if whitelisted
-		if _, isWhitelisted := sm.whitelist[req.IP]; isWhitelisted {
+		if _, whitelisted := sm.whitelist[req.IP]; whitelisted {
 			continue
 		}
 
-		// Check if IP is in a trusted network
 		ip := net.ParseIP(req.IP)
-		inTrustedNetwork := false
-		for _, network := range sm.whitelistNetworks {
-			if network.Contains(ip) {
-				inTrustedNetwork = true
-				break
-			}
-		}
-		if inTrustedNetwork {
+		if ip == nil || sm.ipInTrustedNetwork(ip) {
 			continue
 		}
 
-		// Update wrong call state count
-		attempt, exists := sm.wrongCallStates[req.IP]
-		if !exists {
+		attempt, ok := sm.wrongStates[req.IP]
+		if !ok {
 			attempt = WrongCallStateEntry{
 				Count:        1,
-				FirstAttempt: time.Now(),
-				LastAttempt:  time.Now(),
-				UserIDs:      []string{req.UserID},
+				FirstAttempt: now,
+				LastAttempt:  now,
+				UserIDs:      appendUnique(nil, req.UserID),
 			}
 		} else {
 			attempt.Count++
-			attempt.LastAttempt = time.Now()
-
-			// Add unique user ID
-			if req.UserID != "" && req.UserID != "unknown" {
-				found := false
-				for _, id := range attempt.UserIDs {
-					if id == req.UserID {
-						found = true
-						break
-					}
-				}
-				if !found {
-					attempt.UserIDs = append(attempt.UserIDs, req.UserID)
-				}
-			}
+			attempt.LastAttempt = now
+			attempt.UserIDs = appendUnique(attempt.UserIDs, req.UserID)
 		}
 
-		sm.wrongCallStates[req.IP] = attempt
+		sm.wrongStates[req.IP] = attempt
 
-		// Check if should be blacklisted
-		if sm.securityConfig.AutoBlockEnabled && attempt.Count >= sm.securityConfig.MaxWrongCallStates {
-			reason := fmt.Sprintf("Exceeded max wrong call states (%d)", sm.securityConfig.MaxWrongCallStates)
+		if autoBlock && attempt.Count >= maxStates {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:        req.IP,
-				Reason:    reason,
-				Permanent: false,
+				IP:     req.IP,
+				Reason: fmt.Sprintf("Exceeded max wrong call states (%d)", maxStates),
 			})
 		}
 	}
+	sm.mu.Unlock()
 
-	// Update statistics
-	sm.statsMutex.Lock()
-	sm.statistics.WrongCallStates += len(batch)
-	sm.statistics.LastWrongCallStateTime = time.Now()
-	sm.statsMutex.Unlock()
+	sm.statsMu.Lock()
+	sm.stats.WrongCallStates += len(batch)
+	sm.stats.LastWrongCallStateTime = now
+	sm.statsMu.Unlock()
 
-	// Queue blacklist requests
-	for _, req := range toBlacklist {
+	sm.enqueueBlacklist(toBlacklist)
+}
+
+// enqueueBlacklist sends requests to the blacklist queue. If the queue is
+// saturated, the request is logged and dropped — better than blocking the
+// caller and risking deadlock with the same goroutine that drains the queue.
+func (sm *SecurityManager) enqueueBlacklist(reqs []BlacklistRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+
+	logger := GetLogger()
+
+	for _, req := range reqs {
 		select {
 		case sm.blacklistQueue <- req:
 			logger.Info("Queued IP %s for blacklisting: %s", req.IP, req.Reason)
 		default:
-			logger.Error("Blacklist queue full, could not queue IP %s", req.IP)
-			sm.channelResizers["blacklist"].UpdateStats(0, 1)
+			logger.Error("Blacklist queue full, dropped request for IP %s", req.IP)
 		}
 	}
 }
 
-// AddToBlacklistAsync adds an IP to the blacklist asynchronously
-func (sm *SecurityManager) AddToBlacklistAsync(ipAddress, reason string, permanent bool) {
-	select {
-	case sm.blacklistQueue <- BlacklistRequest{
-		IP:        ipAddress,
-		Reason:    reason,
-		Permanent: permanent,
-		Response:  nil, // Fire and forget
-	}:
-		// Queued successfully
-	case <-time.After(100 * time.Millisecond):
-		// Queue is full, fall back to synchronous
-		if err := sm.AddToBlacklist(ipAddress, reason, permanent); err != nil {
-			GetLogger().Error("Failed to add IP %s to blacklist: %v", ipAddress, err)
+// appendUnique appends value to the slice if non-empty, non-"unknown", and
+// not already present.
+func appendUnique(slice []string, value string) []string {
+	if value == "" || value == unknownUser {
+		return slice
+	}
+
+	for _, existing := range slice {
+		if existing == value {
+			return slice
 		}
 	}
+
+	return append(slice, value)
 }
 
-// ProcessFailedRegistration processes a failed registration event asynchronously
-func (sm *SecurityManager) ProcessFailedRegistration(ipAddress, userId, domain string) {
+// AddToBlacklistAsync queues an IP for blacklisting without waiting.
+func (sm *SecurityManager) AddToBlacklistAsync(ip, reason string, permanent bool) {
 	select {
-	case sm.failedQueue <- FailedAttemptRequest{
-		IP:     ipAddress,
-		UserID: userId,
-		Domain: domain,
-	}:
-		// Queued successfully
-	case <-time.After(10 * time.Millisecond):
-		// Queue is full, drop the event
-		logger := GetLogger()
-		logger.Error("Failed attempt queue full, dropping event for IP %s", ipAddress)
-		sm.channelResizers["failed"].UpdateStats(0, 1)
+	case sm.blacklistQueue <- BlacklistRequest{IP: ip, Reason: reason, Permanent: permanent}:
+	default:
+		GetLogger().Error("Blacklist queue full, dropped async request for IP %s", ip)
 	}
 }
 
-// ProcessWrongCallState processes a wrong call state event asynchronously
-func (sm *SecurityManager) ProcessWrongCallState(ipAddress, userId string) {
+// AddToBlacklist queues a blacklist request and waits for the result.
+func (sm *SecurityManager) AddToBlacklist(ip, reason string, permanent bool) error {
+	resp := make(chan error, 1)
 	select {
-	case sm.wrongStateQueue <- WrongStateRequest{
-		IP:     ipAddress,
-		UserID: userId,
-	}:
-		// Queued successfully
-	case <-time.After(10 * time.Millisecond):
-		// Queue is full, drop the event
-		logger := GetLogger()
-		logger.Error("Wrong state queue full, dropping event for IP %s", ipAddress)
-		sm.channelResizers["wrongstate"].UpdateStats(0, 1)
+	case sm.blacklistQueue <- BlacklistRequest{IP: ip, Reason: reason, Permanent: permanent, Response: resp}:
+	case <-time.After(time.Second):
+		return fmt.Errorf("%w: blacklist enqueue", ErrTimeoutQueueing)
+	}
+	select {
+	case err := <-resp:
+		return err
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("%w: blacklist", ErrTimeoutWaiting)
 	}
 }
 
-// Keep the original synchronous methods for compatibility
-func (sm *SecurityManager) AddToBlacklist(ipAddress, reason string, permanent bool) error {
-	respChan := make(chan error, 1)
-
+// AddToWhitelist queues a whitelist request and waits for the result.
+func (sm *SecurityManager) AddToWhitelist(ip, userID, domain string, permanent bool) error {
+	resp := make(chan error, 1)
 	select {
-	case sm.blacklistQueue <- BlacklistRequest{
-		IP:        ipAddress,
-		Reason:    reason,
-		Permanent: permanent,
-		Response:  respChan,
-	}:
-		return <-respChan
-	case <-time.After(1 * time.Second):
-		return fmt.Errorf("timeout queueing blacklist request")
+	case sm.whitelistQueue <- WhitelistRequest{IP: ip, UserID: userID, Domain: domain, Permanent: permanent, Response: resp}:
+	case <-time.After(time.Second):
+		return fmt.Errorf("%w: whitelist enqueue", ErrTimeoutQueueing)
+	}
+	select {
+	case err := <-resp:
+		return err
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("%w: whitelist", ErrTimeoutWaiting)
 	}
 }
 
-func (sm *SecurityManager) AddToWhitelist(ipAddress, userId, domain string, permanent bool) error {
-	respChan := make(chan error, 1)
-
+// ProcessFailedRegistration enqueues a failed registration for tracking.
+func (sm *SecurityManager) ProcessFailedRegistration(ip, userID, domain string) {
 	select {
-	case sm.whitelistQueue <- WhitelistRequest{
-		IP:        ipAddress,
-		UserID:    userId,
-		Domain:    domain,
-		Permanent: permanent,
-		Response:  respChan,
-	}:
-		return <-respChan
-	case <-time.After(1 * time.Second):
-		return fmt.Errorf("timeout queueing whitelist request")
+	case sm.failedQueue <- FailedAttemptRequest{IP: ip, UserID: userID, Domain: domain}:
+	default:
+		GetLogger().Error("Failed-attempt queue full, dropping event for IP %s", ip)
 	}
 }
 
-// RemoveFromWhitelist removes an IP address from the whitelist
-func (sm *SecurityManager) RemoveFromWhitelist(ipAddress string) error {
+// ProcessWrongCallState enqueues a wrong call state for tracking.
+func (sm *SecurityManager) ProcessWrongCallState(ip, userID string) {
+	select {
+	case sm.wrongStateQueue <- WrongStateRequest{IP: ip, UserID: userID}:
+	default:
+		GetLogger().Error("Wrong-state queue full, dropping event for IP %s", ip)
+	}
+}
+
+// RemoveFromWhitelist removes an IP address from the whitelist.
+func (sm *SecurityManager) RemoveFromWhitelist(ip string) {
 	logger := GetLogger()
 
-	sm.mutex.Lock()
-	entry, exists := sm.whitelist[ipAddress]
-	delete(sm.whitelist, ipAddress)
+	sm.mu.Lock()
+	entry, existed := sm.whitelist[ip]
+	delete(sm.whitelist, ip)
 	count := len(sm.whitelist)
-	sm.mutex.Unlock()
+	sm.mu.Unlock()
 
-	// Update stats
-	sm.statsMutex.Lock()
-	sm.statistics.ActiveWhitelistEntries = count
-	sm.statsMutex.Unlock()
+	sm.statsMu.Lock()
+	sm.stats.ActiveWhitelistEntries = count
+	sm.statsMu.Unlock()
 
-	if exists {
-		logger.Info("Removed IP %s from whitelist (was for user %s@%s)", ipAddress, entry.UserID, entry.Domain)
+	if existed {
+		logger.Info("Removed IP %s from whitelist (was for user %s@%s)", ip, entry.UserID, entry.Domain)
 	} else {
-		logger.Info("Removed IP %s from whitelist", ipAddress)
+		logger.Info("Removed IP %s from whitelist", ip)
 	}
-
-	// Remove from cache if caching is enabled
-	cache := GetCacheManager()
-	if cache.enabled {
-		key := fmt.Sprintf("whitelist:%s", ipAddress)
-		cache.DeleteSecurityItemAsync(key)
-	}
-
-	return nil
 }
 
-// RemoveFromBlacklist removes an IP address from the blacklist and unblocks it using iptables
-func (sm *SecurityManager) RemoveFromBlacklist(ipAddress string) error {
+// RemoveFromBlacklist removes an IP address from the blacklist and unblocks it.
+func (sm *SecurityManager) RemoveFromBlacklist(ip string) {
 	logger := GetLogger()
 
-	sm.mutex.Lock()
-	_, wasBlacklisted := sm.blacklist[ipAddress]
-	delete(sm.blacklist, ipAddress)
+	sm.mu.Lock()
+	_, existed := sm.blacklist[ip]
+	delete(sm.blacklist, ip)
 	count := len(sm.blacklist)
-	sm.mutex.Unlock()
+	autoBlock := sm.cfg.AutoBlockEnabled
+	chain := sm.cfg.IPTablesChain
+	sm.mu.Unlock()
 
-	// Update stats
-	sm.statsMutex.Lock()
-	sm.statistics.ActiveBlacklistEntries = count
-	sm.statsMutex.Unlock()
+	sm.statsMu.Lock()
+	sm.stats.ActiveBlacklistEntries = count
+	sm.statsMu.Unlock()
 
-	// Unblock IP with iptables if it was blacklisted
-	if wasBlacklisted && sm.securityConfig.AutoBlockEnabled {
-		err := unblockIPWithIptables(ipAddress, sm.securityConfig.IPTablesChain)
-		if err != nil {
-			logger.Error("Failed to unblock IP %s with iptables: %v", ipAddress, err)
+	if existed && autoBlock {
+		if err := unblockIPWithIptables(ip, chain); err != nil {
+			logger.Error("Failed to unblock IP %s with iptables: %v", ip, err)
 		} else {
-			logger.Info("Unblocked IP %s with iptables in chain %s", ipAddress, sm.securityConfig.IPTablesChain)
+			logger.Info("Unblocked IP %s with iptables in chain %s", ip, chain)
 		}
 	}
 
-	logger.Info("Removed IP %s from blacklist", ipAddress)
-
-	// Remove from cache if caching is enabled
-	cache := GetCacheManager()
-	if cache.enabled {
-		key := fmt.Sprintf("blacklist:%s", ipAddress)
-		cache.DeleteSecurityItemAsync(key)
-	}
-
-	return nil
+	logger.Info("Removed IP %s from blacklist", ip)
 }
 
-// IsIPWhitelisted checks if an IP address is whitelisted
-func (sm *SecurityManager) IsIPWhitelisted(ipAddress string) bool {
-	// Parse the IP
-	ip := net.ParseIP(ipAddress)
+// IsIPWhitelisted reports whether the given IP is whitelisted (including via
+// trusted networks). It is a hot path: callers may invoke it once per packet.
+//
+// The fast path checks the explicit whitelist map first to avoid the cost of
+// net.ParseIP, which dominates the function under profiling. ParseIP is only
+// called when the explicit whitelist misses AND there is at least one trusted
+// network configured.
+func (sm *SecurityManager) IsIPWhitelisted(ipStr string) bool {
+	sm.mu.RLock()
+	entry, mapHit := sm.whitelist[ipStr]
+	trustedEmpty := len(sm.trustedNetworks) == 0
+	sm.mu.RUnlock()
+
+	if mapHit {
+		if entry.Permanent || !entry.ExpiresAt.Before(time.Now()) {
+			return true
+		}
+	}
+
+	if trustedEmpty {
+		return false
+	}
+
+	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
 
-	// Check trusted networks first
-	for _, network := range sm.whitelistNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
+	return sm.ipInTrustedNetwork(ip)
+}
 
-	// Check if caching is enabled and look for entry in cache first
-	cache := GetCacheManager()
-	if cache.enabled {
-		key := fmt.Sprintf("whitelist:%s", ipAddress)
-		data, found := cache.GetSecurityItem(key)
-		if found {
-			var entry WhitelistEntry
-			if err := json.Unmarshal(data, &entry); err == nil {
-				// Check if entry is expired
-				if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
-					// Remove expired entry from cache
-					cache.DeleteSecurityItemAsync(key)
-					return false
-				}
-				return true
-			}
-		}
-	}
+// IsIPBlacklisted reports whether the given IP is currently blacklisted.
+func (sm *SecurityManager) IsIPBlacklisted(ipStr string) bool {
+	sm.mu.RLock()
+	entry, ok := sm.blacklist[ipStr]
+	sm.mu.RUnlock()
 
-	// Check explicit whitelist
-	sm.mutex.RLock()
-	entry, exists := sm.whitelist[ipAddress]
-	sm.mutex.RUnlock()
-
-	if !exists {
+	if !ok {
 		return false
 	}
 
-	// Check if entry is expired
 	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
 		return false
 	}
@@ -1405,282 +946,234 @@ func (sm *SecurityManager) IsIPWhitelisted(ipAddress string) bool {
 	return true
 }
 
-// IsIPBlacklisted checks if an IP address is blacklisted
-func (sm *SecurityManager) IsIPBlacklisted(ipAddress string) bool {
-	// Check if caching is enabled and look for entry in cache first
-	cache := GetCacheManager()
-	if cache.enabled {
-		key := fmt.Sprintf("blacklist:%s", ipAddress)
-		data, found := cache.GetSecurityItem(key)
-		if found {
-			var entry BlacklistEntry
-			if err := json.Unmarshal(data, &entry); err == nil {
-				// Check if entry is expired
-				if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
-					// Remove expired entry from cache
-					cache.DeleteSecurityItemAsync(key)
-					return false
-				}
-				return true
-			}
-		}
+// ipListStatus reports both whitelist and blacklist status. It is structured
+// to do the minimum work for each case:
+//
+//   - explicit whitelist hit: 1 map lookup, no ParseIP, no blacklist lookup
+//   - trusted-network hit: 1 map lookup + 1 ParseIP, no blacklist lookup
+//   - blacklist hit / miss: 2 map lookups + 1 ParseIP if trusted nets configured
+//
+// The fast paths are equivalent to the public IsIPWhitelisted; the slow path
+// avoids the second RLock that calling IsIPWhitelisted then IsIPBlacklisted
+// would incur.
+func (sm *SecurityManager) ipListStatus(ipStr string) (bool, bool) {
+	sm.mu.RLock()
+
+	wlEntry, wlHit := sm.whitelist[ipStr]
+	if wlHit && (wlEntry.Permanent || !wlEntry.ExpiresAt.Before(time.Now())) {
+		sm.mu.RUnlock()
+
+		return true, false
 	}
 
-	sm.mutex.RLock()
-	entry, exists := sm.blacklist[ipAddress]
-	sm.mutex.RUnlock()
+	blEntry, blHit := sm.blacklist[ipStr]
+	trustedEmpty := len(sm.trustedNetworks) == 0
+	sm.mu.RUnlock()
 
-	if !exists {
-		return false
+	if blHit && (blEntry.Permanent || !blEntry.ExpiresAt.Before(time.Now())) {
+		return false, true
 	}
 
-	// Check if entry is expired
-	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
-		return false
+	if trustedEmpty {
+		return false, false
 	}
 
-	return true
+	ip := net.ParseIP(ipStr)
+	if ip != nil && sm.ipInTrustedNetwork(ip) {
+		return true, false
+	}
+
+	return false, false
 }
 
-// Check if a domain matches any untrusted pattern
+// IsUntrustedDomain reports whether the given domain matches any untrusted pattern.
 func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
-	logger := GetLogger()
-
-	if domain == "" || len(sm.untrustedPatterns) == 0 {
+	if domain == "" {
 		return false
 	}
 
-	for _, pattern := range sm.untrustedPatterns {
-		// If the pattern is an exact match
-		if pattern == domain {
-			logger.Debug("pattern '%s' matched in untrusted networks", domain)
-			return true
-		}
-	}
-	return false
+	sm.mu.RLock()
+	_, ok := sm.untrustedPatterns[domain]
+	sm.mu.RUnlock()
+
+	return ok
 }
 
-// AddUntrustedNetwork adds to untrusted networks list
+// AddUntrustedNetwork adds to the untrusted-networks list.
 func (sm *SecurityManager) AddUntrustedNetwork(pattern string) error {
 	logger := GetLogger()
 
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	// Check if pattern already exists
-	for _, existing := range sm.untrustedPatterns {
-		if existing == pattern {
-			return fmt.Errorf("pattern '%s' already exists in untrusted networks", pattern)
-		}
+	if _, exists := sm.untrustedPatterns[pattern]; exists {
+		return fmt.Errorf("%w: %q", ErrUntrustedPatternExists, pattern)
 	}
 
-	// Add to the list
-	sm.untrustedPatterns = append(sm.untrustedPatterns, pattern)
-	logger.Info("Added pattern '%s' to untrusted networks", pattern)
+	sm.untrustedPatterns[pattern] = struct{}{}
+
+	logger.Info("Added pattern %q to untrusted networks", pattern)
+
 	return nil
 }
 
-// RemoveUntrustedNetwork removes from untrusted networks list
+// RemoveUntrustedNetwork removes from the untrusted-networks list.
 func (sm *SecurityManager) RemoveUntrustedNetwork(pattern string) error {
 	logger := GetLogger()
 
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	for i, existing := range sm.untrustedPatterns {
-		if existing == pattern {
-			// Remove by replacing with last element and truncating
-			sm.untrustedPatterns[i] = sm.untrustedPatterns[len(sm.untrustedPatterns)-1]
-			sm.untrustedPatterns = sm.untrustedPatterns[:len(sm.untrustedPatterns)-1]
-			logger.Info("Removed pattern '%s' from untrusted networks", pattern)
-			return nil
-		}
+	if _, exists := sm.untrustedPatterns[pattern]; !exists {
+		return fmt.Errorf("%w: %q", ErrUntrustedPatternMissing, pattern)
 	}
 
-	return fmt.Errorf("pattern '%s' not found in untrusted networks", pattern)
+	delete(sm.untrustedPatterns, pattern)
+	logger.Info("Removed pattern %q from untrusted networks", pattern)
+
+	return nil
 }
 
-// GetUntrustedNetworks returns all untrusted network patterns
+// GetUntrustedNetworks returns a snapshot of all untrusted-network patterns.
 func (sm *SecurityManager) GetUntrustedNetworks() []string {
-	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
+	sm.mu.RLock()
 
-	// Create a copy to avoid race conditions
-	result := make([]string, len(sm.untrustedPatterns))
-	copy(result, sm.untrustedPatterns)
+	out := make([]string, 0, len(sm.untrustedPatterns))
+	for p := range sm.untrustedPatterns {
+		out = append(out, p)
+	}
+	sm.mu.RUnlock()
 
-	return result
+	return out
 }
 
-// startCleanupRoutine periodically cleans up expired whitelist and blacklist entries
+// startCleanupRoutine periodically removes expired/stale entries.
 func (sm *SecurityManager) startCleanupRoutine() {
 	defer sm.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(cleanupTickInterval)
 	defer ticker.Stop()
+
+	logger := GetLogger()
+	logger.Info("Starting periodic cleanup routine")
 
 	for {
 		select {
 		case <-sm.ctx.Done():
-			GetLogger().Info("Cleanup routine shutting down")
+			logger.Info("Cleanup routine shutting down")
+
 			return
 		case <-ticker.C:
-			GetLogger().Info("Running scheduled cleanup of expired entries")
 			sm.cleanupExpiredEntries()
 		}
 	}
 }
 
-// cleanupExpiredEntries removes expired entries from whitelist and blacklist
+// cleanupExpiredEntries removes expired whitelist/blacklist entries and
+// stale failed-attempt / wrong-state records in a single locked pass.
 func (sm *SecurityManager) cleanupExpiredEntries() {
 	logger := GetLogger()
 	now := time.Now()
+	failedWindow := sm.cfg.FailedWindow
+	wrongWindow := sm.cfg.WrongStateWindow
+	autoBlock := sm.cfg.AutoBlockEnabled
+	chain := sm.cfg.IPTablesChain
 
-	failedWindow, err := time.ParseDuration(sm.securityConfig.FailedAttemptsWindow)
-	if err != nil {
-		logger.Error("Error parsing failed attempts window: %v, using default 10m", err)
-		failedWindow = 10 * time.Minute
-	}
+	var (
+		whitelistRemoved []string
+		blacklistRemoved []string
+		failedRemoved    int
+		wrongRemoved     int
+	)
 
-	// Parse wrong call state window
-	wrongCallStateWindow, err := time.ParseDuration(sm.securityConfig.WrongCallStateWindow)
-	if err != nil {
-		logger.Error("Error parsing wrong call state window: %v, using default 10m", err)
-		wrongCallStateWindow = 10 * time.Minute
-	}
-
-	// Clean up whitelist
-	var whitelistToRemove []string
-	sm.mutex.RLock()
-	for ip, entry := range sm.whitelist {
-		if !entry.Permanent && entry.ExpiresAt.Before(now) {
-			whitelistToRemove = append(whitelistToRemove, ip)
-		}
-	}
-	sm.mutex.RUnlock()
-
-	for _, ip := range whitelistToRemove {
-		logger.Debug("Cleanup: Removing expired whitelist entry for IP %s", ip)
-		if err := sm.RemoveFromWhitelist(ip); err != nil {
-			logger.Error("Failed to remove expired whitelist entry for IP %s: %v", ip, err)
+	sm.mu.Lock()
+	for ip, e := range sm.whitelist {
+		if !e.Permanent && e.ExpiresAt.Before(now) {
+			delete(sm.whitelist, ip)
+			whitelistRemoved = append(whitelistRemoved, ip)
 		}
 	}
 
-	// Clean up blacklist
-	var blacklistToRemove []string
-	sm.mutex.RLock()
-	for ip, entry := range sm.blacklist {
-		if !entry.Permanent && entry.ExpiresAt.Before(now) {
-			blacklistToRemove = append(blacklistToRemove, ip)
-		}
-	}
-	sm.mutex.RUnlock()
-
-	for _, ip := range blacklistToRemove {
-		logger.Debug("Cleanup: Removing expired blacklist entry for IP %s", ip)
-		if err := sm.RemoveFromBlacklist(ip); err != nil {
-			logger.Error("Failed to remove expired blacklist entry for IP %s: %v", ip, err)
+	for ip, e := range sm.blacklist {
+		if !e.Permanent && e.ExpiresAt.Before(now) {
+			delete(sm.blacklist, ip)
+			blacklistRemoved = append(blacklistRemoved, ip)
 		}
 	}
 
-	// Clean up failed attempts
-	var failedToRemove []string
-	sm.mutex.RLock()
-	for ip, attempt := range sm.failedAttempts {
-		if attempt.LastAttempt.Add(failedWindow).Before(now) {
-			failedToRemove = append(failedToRemove, ip)
-		}
-	}
-	sm.mutex.RUnlock()
-
-	if len(failedToRemove) > 0 {
-		sm.mutex.Lock()
-		for _, ip := range failedToRemove {
-			logger.Debug("Cleanup: Removing stale failed attempts record for IP %s", ip)
+	for ip, a := range sm.failedAttempts {
+		if a.LastAttempt.Add(failedWindow).Before(now) {
 			delete(sm.failedAttempts, ip)
-		}
-		sm.mutex.Unlock()
-	}
 
-	// Clean up wrong call states
-	var wrongCallStatesToRemove []string
-	sm.mutex.RLock()
-	for ip, attempt := range sm.wrongCallStates {
-		if attempt.LastAttempt.Add(wrongCallStateWindow).Before(now) {
-			wrongCallStatesToRemove = append(wrongCallStatesToRemove, ip)
+			failedRemoved++
 		}
 	}
-	sm.mutex.RUnlock()
 
-	if len(wrongCallStatesToRemove) > 0 {
-		sm.mutex.Lock()
-		for _, ip := range wrongCallStatesToRemove {
-			logger.Debug("Cleanup: Removing stale wrong call state record for IP %s", ip)
-			delete(sm.wrongCallStates, ip)
+	for ip, a := range sm.wrongStates {
+		if a.LastAttempt.Add(wrongWindow).Before(now) {
+			delete(sm.wrongStates, ip)
+
+			wrongRemoved++
 		}
-		sm.mutex.Unlock()
 	}
 
-	logger.Info("Cleanup: removed %d expired whitelist entries, %d expired blacklist entries, %d expired failed attempts, %d expired wrong call states",
-		len(whitelistToRemove), len(blacklistToRemove), len(failedToRemove), len(wrongCallStatesToRemove))
+	whitelistCount := len(sm.whitelist)
+	blacklistCount := len(sm.blacklist)
+	sm.mu.Unlock()
+
+	sm.statsMu.Lock()
+	sm.stats.ActiveWhitelistEntries = whitelistCount
+	sm.stats.ActiveBlacklistEntries = blacklistCount
+	sm.statsMu.Unlock()
+
+	// Unblock removed blacklist entries from iptables (outside lock).
+	if autoBlock {
+		for _, ip := range blacklistRemoved {
+			if err := unblockIPWithIptables(ip, chain); err != nil {
+				logger.Error("Failed to unblock expired IP %s: %v", ip, err)
+			}
+		}
+	}
+
+	logger.Info("Cleanup: removed %d whitelist, %d blacklist, %d failed, %d wrong-state",
+		len(whitelistRemoved), len(blacklistRemoved), failedRemoved, wrongRemoved)
 }
 
-// GetSecurityStats returns current security statistics
+// GetSecurityStats returns a snapshot of current security statistics.
 func (sm *SecurityManager) GetSecurityStats() SecurityStats {
-	sm.statsMutex.RLock()
-	stats := sm.statistics
-	sm.statsMutex.RUnlock()
-	return stats
+	sm.statsMu.RLock()
+	defer sm.statsMu.RUnlock()
+
+	return sm.stats
 }
 
-// GetChannelStats returns dynamic channel statistics
-func (sm *SecurityManager) GetChannelStats() map[string]interface{} {
-	sm.channelMutex.RLock()
-	defer sm.channelMutex.RUnlock()
-
-	stats := make(map[string]interface{})
-	for name, resizer := range sm.channelResizers {
-		stats[name] = resizer.GetStats()
-	}
-
-	// Add current queue lengths
-	stats["current_queue_lengths"] = map[string]int{
-		"blacklist":  len(sm.blacklistQueue),
-		"whitelist":  len(sm.whitelistQueue),
-		"failed":     len(sm.failedQueue),
-		"wrongstate": len(sm.wrongStateQueue),
-	}
-
-	return stats
-}
-
-// GetWhitelistedIPs returns all whitelisted IPs
+// GetWhitelistedIPs returns a snapshot of the whitelist.
 func (sm *SecurityManager) GetWhitelistedIPs() map[string]WhitelistEntry {
-	result := make(map[string]WhitelistEntry)
+	now := time.Now()
 
-	sm.mutex.RLock()
-	for ip, entry := range sm.whitelist {
-		// Only include non-expired entries
-		if entry.Permanent || entry.ExpiresAt.After(time.Now()) {
-			result[ip] = entry
+	sm.mu.RLock()
+	out := make(map[string]WhitelistEntry, len(sm.whitelist))
+
+	for ip, e := range sm.whitelist {
+		if e.Permanent || e.ExpiresAt.After(now) {
+			out[ip] = e
 		}
 	}
-	sm.mutex.RUnlock()
+	sm.mu.RUnlock()
 
-	return result
+	return out
 }
 
-// GetWhitelistEntry returns a single whitelist entry by IP
+// GetWhitelistEntry returns a single whitelist entry by IP.
 func (sm *SecurityManager) GetWhitelistEntry(ip string) (WhitelistEntry, bool) {
-	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
+	sm.mu.RLock()
+	entry, ok := sm.whitelist[ip]
+	sm.mu.RUnlock()
 
-	entry, exists := sm.whitelist[ip]
-	if !exists {
+	if !ok {
 		return WhitelistEntry{}, false
 	}
 
-	// Check if expired
 	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
 		return WhitelistEntry{}, false
 	}
@@ -1688,33 +1181,33 @@ func (sm *SecurityManager) GetWhitelistEntry(ip string) (WhitelistEntry, bool) {
 	return entry, true
 }
 
-// GetBlacklistedIPs returns all blacklisted IPs
+// GetBlacklistedIPs returns a snapshot of the blacklist.
 func (sm *SecurityManager) GetBlacklistedIPs() map[string]BlacklistEntry {
-	result := make(map[string]BlacklistEntry)
+	now := time.Now()
 
-	sm.mutex.RLock()
-	for ip, entry := range sm.blacklist {
-		// Only include non-expired entries
-		if entry.Permanent || entry.ExpiresAt.After(time.Now()) {
-			result[ip] = entry
+	sm.mu.RLock()
+	out := make(map[string]BlacklistEntry, len(sm.blacklist))
+
+	for ip, e := range sm.blacklist {
+		if e.Permanent || e.ExpiresAt.After(now) {
+			out[ip] = e
 		}
 	}
-	sm.mutex.RUnlock()
+	sm.mu.RUnlock()
 
-	return result
+	return out
 }
 
-// GetBlacklistEntry returns a single blacklist entry by IP
+// GetBlacklistEntry returns a single blacklist entry by IP.
 func (sm *SecurityManager) GetBlacklistEntry(ip string) (BlacklistEntry, bool) {
-	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
+	sm.mu.RLock()
+	entry, ok := sm.blacklist[ip]
+	sm.mu.RUnlock()
 
-	entry, exists := sm.blacklist[ip]
-	if !exists {
+	if !ok {
 		return BlacklistEntry{}, false
 	}
 
-	// Check if expired
 	if !entry.Permanent && entry.ExpiresAt.Before(time.Now()) {
 		return BlacklistEntry{}, false
 	}
@@ -1722,320 +1215,266 @@ func (sm *SecurityManager) GetBlacklistEntry(ip string) (BlacklistEntry, bool) {
 	return entry, true
 }
 
-// GetFailedAttempts returns all tracked failed attempts
+// GetFailedAttempts returns a snapshot of all tracked failed attempts.
 func (sm *SecurityManager) GetFailedAttempts() map[string]FailedAttempt {
-	result := make(map[string]FailedAttempt)
+	sm.mu.RLock()
 
-	sm.mutex.RLock()
-	for ip, attempt := range sm.failedAttempts {
-		result[ip] = attempt
+	out := make(map[string]FailedAttempt, len(sm.failedAttempts))
+	for ip, a := range sm.failedAttempts {
+		out[ip] = a
 	}
-	sm.mutex.RUnlock()
+	sm.mu.RUnlock()
 
-	return result
+	return out
 }
 
-// GetWrongCallStates returns all tracked wrong call state events
+// GetWrongCallStates returns a snapshot of all tracked wrong-state events.
 func (sm *SecurityManager) GetWrongCallStates() map[string]WrongCallStateEntry {
-	result := make(map[string]WrongCallStateEntry)
+	sm.mu.RLock()
 
-	sm.mutex.RLock()
-	for ip, attempt := range sm.wrongCallStates {
-		result[ip] = attempt
+	out := make(map[string]WrongCallStateEntry, len(sm.wrongStates))
+	for ip, a := range sm.wrongStates {
+		out[ip] = a
 	}
-	sm.mutex.RUnlock()
+	sm.mu.RUnlock()
 
-	return result
+	return out
 }
 
-// UpdateRegistrationStats updates statistics for a successful registration
-func (sm *SecurityManager) UpdateRegistrationStats(ipAddress, userId, domain string) {
-	sm.statsMutex.Lock()
-	defer sm.statsMutex.Unlock()
-
-	sm.statistics.TotalRegistrations++
-	sm.statistics.LastRegistrationTime = time.Now()
+// UpdateRegistrationStats updates statistics for a successful registration.
+// The IP/userID/domain arguments are accepted for API stability but not stored.
+func (sm *SecurityManager) UpdateRegistrationStats(_, _, _ string) {
+	sm.statsMu.Lock()
+	sm.stats.TotalRegistrations++
+	sm.stats.LastRegistrationTime = time.Now()
+	sm.statsMu.Unlock()
 }
 
-// AddToWhitelistBatch adds multiple IPs to the whitelist concurrently
-func (sm *SecurityManager) AddToWhitelistBatch(requests []BatchWhitelistRequest) []BatchWhitelistResult {
-	results := make([]BatchWhitelistResult, len(requests))
+// AddToWhitelistBatch adds multiple IPs concurrently with a worker cap.
+func (sm *SecurityManager) AddToWhitelistBatch(reqs []BatchWhitelistRequest) []BatchWhitelistResult {
+	results := make([]BatchWhitelistResult, len(reqs))
 
-	// Limit concurrent operations to prevent goroutine explosion
-	maxWorkers := 10
-	semaphore := make(chan struct{}, maxWorkers)
+	const maxWorkers = 10
+	sem := make(chan struct{}, maxWorkers)
+
 	var wg sync.WaitGroup
 
-	config := GetConfig()
+	cfg := GetConfig()
 
-	for i, req := range requests {
+	for i, req := range reqs {
 		wg.Add(1)
-		go func(idx int, r BatchWhitelistRequest) {
+
+		go func(idx int, request BatchWhitelistRequest) {
 			defer wg.Done()
+			sem <- struct{}{}
 
-			semaphore <- struct{}{}        // Acquire
-			defer func() { <-semaphore }() // Release
+			defer func() { <-sem }()
 
-			// Apply default domain if needed
-			domain := r.Domain
+			domain := request.Domain
 			if domain == "" {
-				domain = config.FreeSWITCH.DefaultDomain
+				domain = cfg.FreeSWITCH.DefaultDomain
 			}
 
-			err := sm.AddToWhitelist(r.IP, r.UserID, domain, r.Permanent)
+			err := sm.AddToWhitelist(request.IP, request.UserID, domain, request.Permanent)
 			results[idx] = BatchWhitelistResult{
-				IP:        r.IP,
-				UserID:    r.UserID,
-				Domain:    domain,
-				Permanent: r.Permanent,
-				Error:     err,
+				IP: request.IP, UserID: request.UserID, Domain: domain, Permanent: request.Permanent, Error: err,
 			}
 		}(i, req)
 	}
 
 	wg.Wait()
+
 	return results
 }
 
-// AddToBlacklistBatch adds multiple IPs to the blacklist concurrently
-func (sm *SecurityManager) AddToBlacklistBatch(requests []BatchBlacklistRequest) []BatchBlacklistResult {
-	results := make([]BatchBlacklistResult, len(requests))
+// AddToBlacklistBatch adds multiple IPs to the blacklist concurrently.
+func (sm *SecurityManager) AddToBlacklistBatch(reqs []BatchBlacklistRequest) []BatchBlacklistResult {
+	results := make([]BatchBlacklistResult, len(reqs))
 
-	// Limit concurrent operations to prevent goroutine explosion
-	maxWorkers := 10
-	semaphore := make(chan struct{}, maxWorkers)
+	const maxWorkers = 10
+	sem := make(chan struct{}, maxWorkers)
+
 	var wg sync.WaitGroup
 
-	for i, req := range requests {
+	for i, req := range reqs {
 		wg.Add(1)
-		go func(idx int, r BatchBlacklistRequest) {
+
+		go func(idx int, request BatchBlacklistRequest) {
 			defer wg.Done()
+			sem <- struct{}{}
 
-			semaphore <- struct{}{}        // Acquire
-			defer func() { <-semaphore }() // Release
+			defer func() { <-sem }()
 
-			err := sm.AddToBlacklist(r.IP, r.Reason, r.Permanent)
+			err := sm.AddToBlacklist(request.IP, request.Reason, request.Permanent)
 			results[idx] = BatchBlacklistResult{
-				IP:        r.IP,
-				Reason:    r.Reason,
-				Permanent: r.Permanent,
-				Error:     err,
+				IP: request.IP, Reason: request.Reason, Permanent: request.Permanent, Error: err,
 			}
 		}(i, req)
 	}
 
 	wg.Wait()
+
 	return results
 }
 
-// GetIPTablesInfo returns IPTables chain information
+// GetIPTablesInfo returns IPTables chain information.
 func (sm *SecurityManager) GetIPTablesInfo() (map[string]interface{}, error) {
-	rules, err := getIPTablesRules(sm.securityConfig.IPTablesChain)
+	rules, err := getIPTablesRules(sm.cfg.IPTablesChain)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]interface{}{
-		"chain": sm.securityConfig.IPTablesChain,
+		"chain": sm.cfg.IPTablesChain,
 		"rules": rules,
 	}, nil
 }
 
-// ensureIPTablesChain ensures that the iptables chain exists with improved error handling
+// SecurityConfigView returns a read-only view of the in-effect config used
+// by routes. Returns (enabled, autoBlockEnabled).
+func (sm *SecurityManager) SecurityConfigView() (bool, bool) {
+	return sm.cfg.Enabled, sm.cfg.AutoBlockEnabled
+}
+
+// ----------------------------------------------------------------------
+// iptables helpers
+// ----------------------------------------------------------------------
+
+// runIptablesWithRetry executes the given iptables argv with retry on
+// xtables-lock contention. It returns the combined output and the final error.
+func runIptablesWithRetry(args ...string) ([]byte, error) {
+	const maxRetries = 3
+
+	var lastOut []byte
+
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("iptables", args...)
+
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+
+		lastOut, lastErr = out, err
+
+		if strings.Contains(string(out), "xtables lock") && attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+
+			continue
+		}
+
+		break
+	}
+
+	return lastOut, lastErr
+}
+
+// ensureIPTablesChain ensures that the iptables chain exists.
 func ensureIPTablesChain(chain string) error {
 	logger := GetLogger()
 
-	// Check if chain exists
-	checkCmd := exec.Command("iptables", "-L", chain)
-	err := checkCmd.Run()
-
-	if err != nil {
-		// Chain doesn't exist, create it
-		logger.Info("Creating iptables chain %s", chain)
-
-		maxRetries := 3
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			createCmd := exec.Command("iptables", "-N", chain)
-			output, err := createCmd.CombinedOutput()
-
-			if err == nil {
-				break // Success
-			}
-
-			// Check if it's a lock error
-			if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
-				backoff := time.Duration(attempt) * time.Second
-				logger.Debug("iptables lock conflict creating chain, retrying in %v", backoff)
-				time.Sleep(backoff)
-				continue
-			}
-
-			// Check if chain already exists (race condition)
-			if strings.Contains(string(output), "Chain already exists") {
-				logger.Info("Chain %s already exists (created by another process)", chain)
-				break
-			}
-
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to create iptables chain %s after %d attempts: %v, output: %s",
-					chain, maxRetries, err, string(output))
-			}
-		}
-
-		// Add a jump from INPUT to our chain with retry logic
-		logger.Info("Adding jump from INPUT to chain %s", chain)
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			linkCmd := exec.Command("iptables", "-A", "INPUT", "-j", chain)
-			output, err := linkCmd.CombinedOutput()
-
-			if err == nil {
-				break // Success
-			}
-
-			// Check if it's a lock error
-			if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
-				backoff := time.Duration(attempt) * time.Second
-				logger.Debug("iptables lock conflict linking chain, retrying in %v", backoff)
-				time.Sleep(backoff)
-				continue
-			}
-
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to link iptables chain %s to INPUT after %d attempts: %v, output: %s",
-					chain, maxRetries, err, string(output))
-			}
-		}
-	} else {
+	if exec.Command("iptables", "-L", chain).Run() == nil {
 		logger.Info("Iptables chain %s already exists", chain)
+
+		return nil
+	}
+
+	logger.Info("Creating iptables chain %s", chain)
+
+	out, err := runIptablesWithRetry("-N", chain)
+	if err != nil && !strings.Contains(string(out), "Chain already exists") {
+		return fmt.Errorf("creating iptables chain %s: %w: %s", chain, err, out)
+	}
+
+	logger.Info("Adding jump from INPUT to chain %s", chain)
+
+	if out, err := runIptablesWithRetry("-A", "INPUT", "-j", chain); err != nil {
+		return fmt.Errorf("linking iptables chain %s: %w: %s", chain, err, out)
 	}
 
 	return nil
 }
 
-// blockIPWithIptables blocks an IP address using iptables with retry logic
+// blockIPWithIptables installs a DROP rule for the given IP in the chain.
 func blockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
-
-	// First check if the rule already exists
-	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
-	if checkCmd.Run() == nil {
+	if exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP").Run() == nil {
 		logger.Info("IP %s is already blocked in chain %s", ip, chain)
+
 		return nil
 	}
 
-	logger.Info("Adding iptables rule to block IP %s in chain %s", ip, chain)
-
-	// Retry logic for xtables lock
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-A", chain, "-s", ip, "-j", "DROP")
-		output, err := cmd.CombinedOutput()
-
-		if err == nil {
-			logger.Info("Successfully blocked IP %s in chain %s", ip, chain)
-			return nil
-		}
-
-		// Check if it's a lock error
-		if strings.Contains(string(output), "xtables lock") {
-			if attempt < maxRetries {
-				backoff := time.Duration(attempt) * time.Second
-				logger.Debug("iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
-				time.Sleep(backoff)
-				continue
-			}
-		}
-
-		return fmt.Errorf("iptables error after %d attempts: %v, output: %s", attempt, err, string(output))
+	if out, err := runIptablesWithRetry("-A", chain, "-s", ip, "-j", "DROP"); err != nil {
+		return fmt.Errorf("iptables block %s: %w: %s", ip, err, out)
 	}
 
-	return fmt.Errorf("failed to block IP %s after %d attempts", ip, maxRetries)
+	logger.Info("Blocked IP %s in chain %s", ip, chain)
+
+	return nil
 }
 
-// unblockIPWithIptables unblocks an IP address using iptables with existence check
+// unblockIPWithIptables removes a DROP rule for the given IP.
 func unblockIPWithIptables(ip, chain string) error {
 	logger := GetLogger()
+	// iptables -C exits non-zero when the rule does not exist. That's not
+	// an error for us — there's nothing to unblock.
+	ruleExists := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP").Run() == nil
+	if !ruleExists {
+		logger.Debug("IP %s is not blocked in chain %s", ip, chain)
 
-	// First check if the rule exists before trying to remove it
-	checkCmd := exec.Command("iptables", "-C", chain, "-s", ip, "-j", "DROP")
-	if checkCmd.Run() != nil {
-		logger.Debug("IP %s is not currently blocked in chain %s (rule doesn't exist)", ip, chain)
-		return nil // Not an error - the IP is already unblocked
+		return nil
 	}
 
-	logger.Info("Removing iptables rule to unblock IP %s in chain %s", ip, chain)
-
-	// Retry logic for xtables lock
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-D", chain, "-s", ip, "-j", "DROP")
-		output, err := cmd.CombinedOutput()
-
-		if err == nil {
-			logger.Info("Successfully unblocked IP %s in chain %s", ip, chain)
+	if out, err := runIptablesWithRetry("-D", chain, "-s", ip, "-j", "DROP"); err != nil {
+		// "Bad rule" / "does a matching rule exist" → already gone, treat as success.
+		os := string(out)
+		if strings.Contains(os, "Bad rule") || strings.Contains(os, "does a matching rule exist") {
 			return nil
 		}
 
-		// Check if it's a lock error
-		if strings.Contains(string(output), "xtables lock") {
-			if attempt < maxRetries {
-				backoff := time.Duration(attempt) * time.Second
-				logger.Debug("iptables lock conflict, retrying in %v (attempt %d/%d)", backoff, attempt, maxRetries)
-				time.Sleep(backoff)
-				continue
-			}
-		}
-
-		// Check if the rule doesn't exist (common when cleanup runs)
-		if strings.Contains(string(output), "Bad rule") || strings.Contains(string(output), "does a matching rule exist") {
-			logger.Debug("IP %s rule no longer exists in chain %s, considering unblocked", ip, chain)
-			return nil // Not an error - the rule is already gone
-		}
-
-		return fmt.Errorf("iptables error after %d attempts: %v, output: %s", attempt, err, string(output))
+		return fmt.Errorf("iptables unblock %s: %w: %s", ip, err, out)
 	}
 
-	return fmt.Errorf("failed to unblock IP %s after %d attempts", ip, maxRetries)
+	logger.Info("Unblocked IP %s in chain %s", ip, chain)
+
+	return nil
 }
 
-// getIPTablesRules gets the current iptables rules for the chain with improved error handling
-func getIPTablesRules(chain string) ([]string, error) {
+// batchBlockIPs installs DROP rules for many IPs. Each IP is blocked via a
+// direct exec of iptables; the original "batch via sh -c" implementation was
+// removed because it required shell quoting (gosec G204) for marginal savings.
+func (sm *SecurityManager) batchBlockIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+
 	logger := GetLogger()
 
-	logger.Debug("Fetching iptables rules for chain %s", chain)
-
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := exec.Command("iptables", "-S", chain)
-		output, err := cmd.CombinedOutput()
-
-		if err == nil {
-			rules := strings.Split(string(output), "\n")
-			var result []string
-
-			for _, rule := range rules {
-				if rule != "" {
-					result = append(result, rule)
-				}
-			}
-
-			logger.Debug("Found %d rules in iptables chain %s", len(result), chain)
-			return result, nil
+	chain := sm.cfg.IPTablesChain
+	for _, ip := range ips {
+		if err := blockIPWithIptables(ip, chain); err != nil {
+			logger.Error("Failed to block IP %s: %v", ip, err)
 		}
+	}
+}
 
-		// Check if it's a lock error
-		if strings.Contains(string(output), "xtables lock") && attempt < maxRetries {
-			backoff := time.Duration(attempt) * time.Second
-			logger.Debug("iptables lock conflict getting rules, retrying in %v", backoff)
-			time.Sleep(backoff)
-			continue
-		}
+// getIPTablesRules returns the current rules for the given chain.
+func getIPTablesRules(chain string) ([]string, error) {
+	out, err := runIptablesWithRetry("-S", chain)
+	if err != nil {
+		return nil, fmt.Errorf("listing iptables rules: %w: %s", err, out)
+	}
 
-		if attempt == maxRetries {
-			return nil, fmt.Errorf("error getting iptables rules after %d attempts: %v, output: %s",
-				maxRetries, err, string(output))
+	lines := strings.Split(string(out), "\n")
+	rules := make([]string, 0, len(lines))
+
+	for _, l := range lines {
+		if l != "" {
+			rules = append(rules, l)
 		}
 	}
 
-	return nil, fmt.Errorf("failed to get iptables rules after %d attempts", maxRetries)
+	return rules, nil
 }

@@ -14,75 +14,73 @@ import (
 	"github.com/fiorix/go-eventsocket/eventsocket"
 )
 
-// ESLManager handles FreeSWITCH Event Socket Layer connections
+// Static event-queue parameters. The previous code attempted to dynamically
+// resize this channel, but the resize logic closed an in-use channel which
+// races with readers/writers. A generously sized fixed buffer is preferable.
+const (
+	eslEventQueueSize = 8192
+	eslMinWorkers     = 2
+	eslMaxWorkers     = 8
+
+	// unknownUser is the placeholder UserID used when the FreeSWITCH event
+	// did not include a usable user identifier.
+	unknownUser = "unknown"
+
+	// logLevelInfoStr is the string spelling of the "info" log level.
+	logLevelInfoStr = "info"
+)
+
+// ESLManager handles FreeSWITCH Event Socket Layer connections.
 type ESLManager struct {
 	securityManager *SecurityManager
-	eslClient       *eventsocket.Connection
 	eslConfig       ESLConfig
-	eslConnected    bool
+
+	clientMu  sync.RWMutex
+	eslClient *eventsocket.Connection
+	connected atomic.Bool
+
 	eslDisconnected chan bool
-	eslLogLevel     EslLogLevel
-	statistics      struct {
-		ConnectionAttempts int64
-		ConnectionErrors   int64
-		EventsProcessed    int64
-		EventsQueued       int64
-		EventsDropped      int64
+	rateManager     *RateManager
+
+	statistics struct {
+		ConnectionAttempts atomic.Int64
+		ConnectionErrors   atomic.Int64
+		EventsProcessed    atomic.Int64
+		EventsQueued       atomic.Int64
+		EventsDropped      atomic.Int64
 	}
-	rateManager *RateManager
 
-	// Worker pool components
-	eventQueue   chan *eventsocket.Event
-	workerCount  int
-	maxQueueSize int
+	// Worker pool.
+	eventQueue  chan *eventsocket.Event
+	workerCount int
 
-	// Event pool for memory efficiency
 	eventPool *EventPool
 
-	// Dynamic channel sizing
-	channelResizer *ChannelResizer
-	lastQueueSize  int
-
-	// Shutdown mechanism
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	shutdown   bool
-	shutdownMu sync.RWMutex
+	// Lifecycle.
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	shutdown atomic.Bool
 }
 
-// ESLConfig holds ESL-related configuration
+// ESLConfig holds ESL-related configuration.
 type ESLConfig struct {
 	Host             string
 	Port             string
 	Password         string
 	LogLevel         string
 	ReconnectBackoff string
-	WorkerCount      int // Number of worker goroutines
-	MaxQueueSize     int // Maximum events in queue
+	WorkerCount      int
 }
 
-// ChannelResizer manages dynamic channel buffer sizes
-type ChannelResizer struct {
-	baseSize       int
-	currentSize    int
-	maxSize        int
-	lastResize     time.Time
-	resizeInterval time.Duration
-	loadThreshold  float64
-	highLoadCount  int
-	lowLoadCount   int
-	mutex          sync.RWMutex
-}
-
-// EventWorker processes events from the queue
+// EventWorker processes events from the queue.
 type EventWorker struct {
 	id      int
 	manager *ESLManager
 	logger  *Logger
 }
 
-// ProcessedEvent is a reusable event object for the pool
+// ProcessedEvent is a reusable event object held by EventPool.
 type ProcessedEvent struct {
 	EventName     string
 	EventSubclass string
@@ -94,134 +92,54 @@ type ProcessedEvent struct {
 	Headers       map[string]string
 }
 
-// EventPool manages a pool of reusable ProcessedEvent objects
+// EventPool manages a pool of reusable ProcessedEvent objects.
 type EventPool struct {
 	pool sync.Pool
 }
 
-// NewEventPool creates a new event pool
+// eventHeadersInitialCapacity is the initial capacity allocated for
+// ProcessedEvent.Headers. FreeSWITCH events typically have ~10–20 headers.
+const eventHeadersInitialCapacity = 20
+
+// NewEventPool creates a new event pool.
 func NewEventPool() *EventPool {
 	return &EventPool{
 		pool: sync.Pool{
 			New: func() interface{} {
-				return &ProcessedEvent{
-					Headers: make(map[string]string, 20), // Pre-allocate common size
-				}
+				return &ProcessedEvent{Headers: make(map[string]string, eventHeadersInitialCapacity)}
 			},
 		},
 	}
 }
 
-// Get retrieves a ProcessedEvent from the pool
+// Get retrieves a ProcessedEvent from the pool. The pool's New always returns
+// *ProcessedEvent, so the type assertion is safe; we still check it to satisfy
+// the linter and to fail fast if the pool is ever misconfigured.
 func (ep *EventPool) Get() *ProcessedEvent {
-	return ep.pool.Get().(*ProcessedEvent)
-}
-
-// Put returns a ProcessedEvent to the pool after clearing it
-func (ep *EventPool) Put(e *ProcessedEvent) {
-	// Clear the event
-	e.EventName = ""
-	e.EventSubclass = ""
-	e.IPAddress = ""
-	e.UserID = ""
-	e.Domain = ""
-	e.Status = ""
-	e.CallUUID = ""
-
-	// Clear headers map
-	for k := range e.Headers {
-		delete(e.Headers, k)
+	pe, ok := ep.pool.Get().(*ProcessedEvent)
+	if !ok {
+		// Should be impossible: pool only stores *ProcessedEvent.
+		return &ProcessedEvent{Headers: make(map[string]string, eventHeadersInitialCapacity)}
 	}
 
-	ep.pool.Put(e)
+	return pe
 }
 
-// NewChannelResizer creates a new channel resizer
-func NewChannelResizer(baseSize, maxSize int) *ChannelResizer {
-	return &ChannelResizer{
-		baseSize:       baseSize,
-		currentSize:    baseSize,
-		maxSize:        maxSize,
-		lastResize:     time.Now(),
-		resizeInterval: 30 * time.Second, // Check every 30 seconds
-		loadThreshold:  0.7,              // 70% utilization triggers resize
-	}
-}
+// Put returns a ProcessedEvent to the pool after clearing it.
+func (ep *EventPool) Put(pe *ProcessedEvent) {
+	pe.EventName = ""
+	pe.EventSubclass = ""
+	pe.IPAddress = ""
+	pe.UserID = ""
+	pe.Domain = ""
+	pe.Status = ""
+	pe.CallUUID = ""
 
-// CalculateSize determines the appropriate channel size based on load
-func (cr *ChannelResizer) CalculateSize(currentLoad, capacity int64) int {
-	cr.mutex.Lock()
-	defer cr.mutex.Unlock()
-
-	// Don't resize too frequently
-	if time.Since(cr.lastResize) < cr.resizeInterval {
-		return cr.currentSize
+	for k := range pe.Headers {
+		delete(pe.Headers, k)
 	}
 
-	utilization := float64(currentLoad) / float64(capacity)
-
-	// High load detection
-	if utilization > cr.loadThreshold {
-		cr.highLoadCount++
-		cr.lowLoadCount = 0
-
-		// After 3 consecutive high load detections, increase size
-		if cr.highLoadCount >= 3 {
-			newSize := cr.currentSize * 2
-			if newSize > cr.maxSize {
-				newSize = cr.maxSize
-			}
-			if newSize != cr.currentSize {
-				cr.currentSize = newSize
-				cr.lastResize = time.Now()
-				cr.highLoadCount = 0
-			}
-		}
-	} else if utilization < 0.3 { // Low load
-		cr.lowLoadCount++
-		cr.highLoadCount = 0
-
-		// After 5 consecutive low load detections, decrease size
-		if cr.lowLoadCount >= 5 {
-			newSize := cr.currentSize / 2
-			if newSize < cr.baseSize {
-				newSize = cr.baseSize
-			}
-			if newSize != cr.currentSize {
-				cr.currentSize = newSize
-				cr.lastResize = time.Now()
-				cr.lowLoadCount = 0
-			}
-		}
-	} else {
-		// Normal load, reset counters
-		cr.highLoadCount = 0
-		cr.lowLoadCount = 0
-	}
-
-	return cr.currentSize
-}
-
-// GetCurrentSize returns the current channel size
-func (cr *ChannelResizer) GetCurrentSize() int {
-	cr.mutex.RLock()
-	defer cr.mutex.RUnlock()
-	return cr.currentSize
-}
-
-// GetStats returns resizer statistics
-func (cr *ChannelResizer) GetStats() map[string]interface{} {
-	cr.mutex.RLock()
-	defer cr.mutex.RUnlock()
-
-	return map[string]interface{}{
-		"base_size":       cr.baseSize,
-		"current_size":    cr.currentSize,
-		"max_size":        cr.maxSize,
-		"high_load_count": cr.highLoadCount,
-		"low_load_count":  cr.lowLoadCount,
-		"last_resize":     cr.lastResize.Format(time.RFC3339),
-	}
+	ep.pool.Put(pe)
 }
 
 var (
@@ -229,16 +147,57 @@ var (
 	eslManagerOnce sync.Once
 )
 
-// InitESLManager initializes the ESL manager
-func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
-	var err error
+// backoffMultipliers maps an attempt index (0-based, capped) to a multiplier
+// applied to the base backoff. This is preferable to dynamic shift math
+// because it eliminates the int/uint conversion warnings flagged by gosec.
+var backoffMultipliers = [...]int64{1, 2, 4, 8, 16, 32, 64}
+
+// computeBackoff returns the backoff for the given attempt index (1-based).
+// The result is clamped to [base, cap].
+func computeBackoff(base, ceiling time.Duration, attempt int64) time.Duration {
+	if attempt <= 1 {
+		return base
+	}
+
+	idx := attempt - 1
+	if idx >= int64(len(backoffMultipliers)) {
+		idx = int64(len(backoffMultipliers)) - 1
+	}
+
+	d := time.Duration(backoffMultipliers[idx]) * base
+	if d <= 0 || d > ceiling {
+		return ceiling
+	}
+
+	return d
+}
+
+// chooseWorkerCount returns a sensible worker pool size for the host.
+func chooseWorkerCount() int {
+	n := runtime.NumCPU()
+	if n < eslMinWorkers {
+		return eslMinWorkers
+	}
+
+	if n > eslMaxWorkers {
+		return eslMaxWorkers
+	}
+
+	return n
+}
+
+// InitESLManager initializes the ESL manager and returns the singleton.
+// Currently it never returns an error; the connection lifecycle is managed
+// asynchronously by a background goroutine that performs reconnects with
+// exponential backoff.
+func InitESLManager(sm *SecurityManager) *ESLManager {
 	eslManagerOnce.Do(func() {
 		logger := GetLogger()
-		config := GetConfig()
+		cfg := GetConfig()
 
-		// Parse log level
-		var logLevel EslLogLevel = LogLevelInfo
-		switch strings.ToLower(config.Security.ESLLogLevel) {
+		var logLevel EslLogLevel
+
+		switch strings.ToLower(cfg.Security.ESLLogLevel) {
 		case "error":
 			logLevel = LogLevelError
 		case "info":
@@ -247,600 +206,446 @@ func InitESLManager(securityManager *SecurityManager) (*ESLManager, error) {
 			logLevel = LogLevelDebug
 		case "trace":
 			logLevel = LogLevelTrace
+		default:
+			logLevel = LogLevelInfo
 		}
 
 		logger.SetLogLevel(logLevel)
 
-		// Determine worker count (default to number of CPU cores)
-		workerCount := runtime.NumCPU()
-		if workerCount < 2 {
-			workerCount = 2 // Minimum 2 workers
-		}
-		if workerCount > 8 {
-			workerCount = 8 // Cap at 8 workers
-		}
-
-		// Initial queue size - will be dynamically adjusted
-		initialQueueSize := 1000
-		maxQueueSize := 10000
-
-		// Create ESL config
-		eslConfig := ESLConfig{
-			Host:             config.Security.ESLHost,
-			Port:             config.Security.ESLPort,
-			Password:         config.Security.ESLPassword,
-			LogLevel:         config.Security.ESLLogLevel,
-			ReconnectBackoff: config.Security.ReconnectBackoff,
+		workerCount := chooseWorkerCount()
+		ec := ESLConfig{
+			Host:             cfg.Security.ESLHost,
+			Port:             cfg.Security.ESLPort,
+			Password:         cfg.Security.ESLPassword,
+			LogLevel:         cfg.Security.ESLLogLevel,
+			ReconnectBackoff: cfg.Security.ReconnectBackoff,
 			WorkerCount:      workerCount,
-			MaxQueueSize:     maxQueueSize,
 		}
 
-		// Initialize rate manager
-		rateManager := NewRateManager(securityManager)
-
-		// Create context for shutdown
 		ctx, cancel := context.WithCancel(context.Background())
-
-		// Initialize ESL manager
 		eslManager = &ESLManager{
-			securityManager: securityManager,
-			eslConfig:       eslConfig,
+			securityManager: sm,
+			eslConfig:       ec,
 			eslDisconnected: make(chan bool, 1),
-			eslLogLevel:     logLevel,
-			rateManager:     rateManager,
-			eventQueue:      make(chan *eventsocket.Event, initialQueueSize),
-			workerCount:     eslConfig.WorkerCount,
-			maxQueueSize:    eslConfig.MaxQueueSize,
+			rateManager:     NewRateManager(sm),
+			eventQueue:      make(chan *eventsocket.Event, eslEventQueueSize),
+			workerCount:     workerCount,
 			eventPool:       NewEventPool(),
-			channelResizer:  NewChannelResizer(initialQueueSize, maxQueueSize),
-			lastQueueSize:   initialQueueSize,
 			ctx:             ctx,
 			cancel:          cancel,
-			shutdown:        false,
 		}
 
-		logger.Info("Initializing ESL manager with %d workers, initial queue size: %d, max queue size: %d",
-			eslConfig.WorkerCount, initialQueueSize, maxQueueSize)
-
-		// Start worker pool
+		logger.Info("Initializing ESL manager: workers=%d, queue=%d", workerCount, eslEventQueueSize)
 		eslManager.startWorkerPool()
 
-		// Start channel resizer monitor
-		eslManager.wg.Add(1)
-		go eslManager.monitorChannelSize()
-
-		// Start ESL connection
-		logger.Info("Starting ESL connection")
 		eslManager.wg.Add(1)
 		go eslManager.startESLConnection()
 	})
 
-	return eslManager, err
+	return eslManager
 }
 
-// monitorChannelSize monitors and adjusts channel sizes based on load
-func (em *ESLManager) monitorChannelSize() {
-	defer em.wg.Done()
-
-	logger := GetLogger()
-	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-em.ctx.Done():
-			logger.Info("Channel size monitor shutting down")
-			return
-
-		case <-ticker.C:
-			// Calculate current load
-			queueLen := len(em.eventQueue)
-			capacity := cap(em.eventQueue)
-			eventsQueued := atomic.LoadInt64(&em.statistics.EventsQueued)
-
-			// Calculate new size
-			newSize := em.channelResizer.CalculateSize(int64(queueLen), int64(capacity))
-
-			// If size needs to change, recreate the channel
-			if newSize != em.lastQueueSize {
-				logger.Info("Adjusting event queue size from %d to %d (current load: %d/%d)",
-					em.lastQueueSize, newSize, queueLen, capacity)
-
-				// Create new channel
-				newQueue := make(chan *eventsocket.Event, newSize)
-
-				// Transfer existing events
-				close(em.eventQueue)
-				transferred := 0
-				for event := range em.eventQueue {
-					select {
-					case newQueue <- event:
-						transferred++
-					default:
-						// New queue is full, drop event
-						atomic.AddInt64(&em.statistics.EventsDropped, 1)
-					}
-				}
-
-				em.eventQueue = newQueue
-				em.lastQueueSize = newSize
-
-				logger.Info("Channel resize complete, transferred %d events", transferred)
-			}
-
-			// Log statistics periodically
-			if logger.GetLogLevel() >= LogLevelDebug {
-				logger.Debug("Channel monitor - Queue: %d/%d, Events queued: %d, Dropped: %d",
-					queueLen, capacity, eventsQueued,
-					atomic.LoadInt64(&em.statistics.EventsDropped))
-			}
-		}
+// GetESLManager returns the ESL manager instance, initializing it on first call.
+func GetESLManager() *ESLManager {
+	if eslManager == nil {
+		InitESLManager(GetSecurityManager())
 	}
+
+	return eslManager
 }
 
-// startWorkerPool starts the event processing workers
+// startWorkerPool starts the event-processing workers.
 func (em *ESLManager) startWorkerPool() {
 	logger := GetLogger()
-
-	for i := 0; i < em.workerCount; i++ {
-		worker := &EventWorker{
-			id:      i + 1,
-			manager: em,
-			logger:  logger,
-		}
-
+	for i := range em.workerCount {
+		w := &EventWorker{id: i + 1, manager: em, logger: logger}
 		em.wg.Add(1)
-		go worker.run()
 
-		logger.Info("Started event worker #%d", worker.id)
+		go w.run()
+		logger.Info("Started event worker #%d", w.id)
 	}
 }
 
-// run is the main loop for each worker
+// run is the main loop for each worker.
 func (w *EventWorker) run() {
 	defer w.manager.wg.Done()
-
-	w.logger.Debug("Worker #%d started", w.id)
 
 	for {
 		select {
 		case <-w.manager.ctx.Done():
-			w.logger.Debug("Worker #%d shutting down", w.id)
 			return
-
-		case event, ok := <-w.manager.eventQueue:
+		case ev, ok := <-w.manager.eventQueue:
 			if !ok {
-				w.logger.Debug("Worker #%d: event queue closed", w.id)
 				return
 			}
 
-			// Process the event using the memory pool
-			w.processEventWithPool(event)
-
-			// Update statistics
-			atomic.AddInt64(&w.manager.statistics.EventsProcessed, 1)
+			w.processEventWithPool(ev)
+			w.manager.statistics.EventsProcessed.Add(1)
 		}
 	}
 }
 
-// processEventWithPool processes an event using the memory pool
+// processEventWithPool processes an event using the memory pool.
 func (w *EventWorker) processEventWithPool(ev *eventsocket.Event) {
 	startTime := time.Now()
 
-	// Get a processed event from the pool
-	processedEvent := w.manager.eventPool.Get()
-	defer w.manager.eventPool.Put(processedEvent) // Return to pool when done
+	pe := w.manager.eventPool.Get()
+	defer w.manager.eventPool.Put(pe)
 
-	// Extract and store event data in the pooled object
-	processedEvent.EventName = ev.Get("Event-Name")
-	processedEvent.EventSubclass = ev.Get("Event-Subclass")
+	pe.EventName = ev.Get("Event-Name")
+	pe.EventSubclass = ev.Get("Event-Subclass")
 
-	// Log event processing in trace mode
-	if w.logger.GetLogLevel() >= LogLevelTrace {
-		w.logger.Trace("Worker #%d processing event: %s/%s",
-			w.id, processedEvent.EventName, processedEvent.EventSubclass)
+	if w.logger.enabled(LogLevelTrace) {
+		w.logger.Trace("Worker #%d processing event: %s/%s", w.id, pe.EventName, pe.EventSubclass)
 	}
 
-	// Process based on event type
-	switch processedEvent.EventName {
+	switch pe.EventName {
 	case "CUSTOM":
-		switch processedEvent.EventSubclass {
+		switch pe.EventSubclass {
 		case "sofia::register":
-			w.extractRegistrationData(ev, processedEvent)
-			w.handleSuccessfulRegistrationPooled(processedEvent)
+			w.extractRegistrationData(ev, pe)
+			w.handleSuccessfulRegistration(pe)
 		case "sofia::register_failure":
-			w.extractFailedRegistrationData(ev, processedEvent)
-			w.handleFailedRegistrationPooled(processedEvent)
+			w.extractFailedRegistrationData(ev, pe)
+			w.handleFailedRegistration(pe)
 		case "sofia::wrong_call_state":
-			w.extractWrongCallStateData(ev, processedEvent)
-			w.handleWrongCallStatePooled(processedEvent)
+			w.extractWrongCallStateData(ev, pe)
+			w.handleWrongCallState(pe)
 		default:
-			w.logger.Debug("Worker #%d: Unhandled CUSTOM event subclass: %s",
-				w.id, processedEvent.EventSubclass)
+			w.logger.Debug("Worker #%d: unhandled CUSTOM subclass: %s", w.id, pe.EventSubclass)
 		}
 	case "CHANNEL_CREATE":
-		w.extractChannelCreateData(ev, processedEvent)
-		w.handleChannelCreatePooled(processedEvent)
+		w.extractChannelCreateData(ev, pe)
+		w.handleChannelCreate(pe)
 	default:
-		w.logger.Debug("Worker #%d: Unhandled event type: %s", w.id, processedEvent.EventName)
+		w.logger.Debug("Worker #%d: unhandled event type: %s", w.id, pe.EventName)
 	}
 
-	// Log processing time in debug mode
-	if w.logger.GetLogLevel() >= LogLevelDebug {
-		processingTime := time.Since(startTime)
-		w.logger.Debug("Worker #%d processed %s event in %v",
-			w.id, processedEvent.EventName, processingTime)
+	if w.logger.enabled(LogLevelDebug) {
+		w.logger.Debug("Worker #%d processed %s in %v", w.id, pe.EventName, time.Since(startTime))
 	}
 }
 
-// extractRegistrationData extracts registration data into the pooled event
+// firstNonEmpty returns the first non-empty header value from ev.
+func firstNonEmpty(ev *eventsocket.Event, names ...string) string {
+	for _, n := range names {
+		if v := ev.Get(n); v != "" {
+			return v
+		}
+	}
+
+	return ""
+}
+
 func (w *EventWorker) extractRegistrationData(ev *eventsocket.Event, pe *ProcessedEvent) {
 	pe.IPAddress = ev.Get("Network-Ip")
-
-	pe.UserID = ev.Get("From-User")
-	if pe.UserID == "" {
-		pe.UserID = ev.Get("Username")
-	}
-	if pe.UserID == "" {
-		pe.UserID = ev.Get("User_Name")
-	}
-
-	pe.Domain = ev.Get("From-Host")
-	if pe.Domain == "" {
-		pe.Domain = ev.Get("Domain_Name")
-	}
-	if pe.Domain == "" {
-		pe.Domain = ev.Get("Realm")
-	}
-
+	pe.UserID = firstNonEmpty(ev, "From-User", "Username", "User_Name")
+	pe.Domain = firstNonEmpty(ev, "From-Host", "Domain_Name", "Realm")
 	pe.Status = ev.Get("Status")
 }
 
-// extractFailedRegistrationData extracts failed registration data into the pooled event
 func (w *EventWorker) extractFailedRegistrationData(ev *eventsocket.Event, pe *ProcessedEvent) {
 	pe.IPAddress = ev.Get("Network-Ip")
-
-	pe.UserID = ev.Get("To-User")
-	if pe.UserID == "" {
-		pe.UserID = ev.Get("From-User")
-	}
-	if pe.UserID == "" {
-		pe.UserID = ev.Get("Username")
-	}
-	if pe.UserID == "" {
-		pe.UserID = ev.Get("User_Name")
-	}
-
-	pe.Domain = ev.Get("To-Host")
-	if pe.Domain == "" {
-		pe.Domain = ev.Get("From-Host")
-	}
-	if pe.Domain == "" {
-		pe.Domain = ev.Get("Domain_Name")
-	}
-	if pe.Domain == "" {
-		pe.Domain = ev.Get("Realm")
-	}
+	pe.UserID = firstNonEmpty(ev, "To-User", "From-User", "Username", "User_Name")
+	pe.Domain = firstNonEmpty(ev, "To-Host", "From-Host", "Domain_Name", "Realm")
 }
 
-// extractWrongCallStateData extracts wrong call state data into the pooled event
 func (w *EventWorker) extractWrongCallStateData(ev *eventsocket.Event, pe *ProcessedEvent) {
 	pe.IPAddress = ev.Get("Network_Ip")
 	pe.UserID = ev.Get("From_User")
 }
 
-// extractChannelCreateData extracts channel create data into the pooled event
 func (w *EventWorker) extractChannelCreateData(ev *eventsocket.Event, pe *ProcessedEvent) {
 	pe.IPAddress = ev.Get("Variable_sip_network_ip")
-	// Don't use Variable_sip_from_host as fallback - it's a domain/hostname, not an IP
-
 	pe.UserID = ev.Get("Variable_sip_from_user")
 	pe.Domain = ev.Get("Variable_sip_from_host")
 	pe.CallUUID = ev.Get("Unique-ID")
 }
 
-// handleSuccessfulRegistrationPooled handles successful registration with pooled event
-func (w *EventWorker) handleSuccessfulRegistrationPooled(pe *ProcessedEvent) {
-	w.logger.Debug("Worker #%d: Registration info - IP: %s, User: %s, Domain: %s, Status: %s",
-		w.id, pe.IPAddress, pe.UserID, pe.Domain, pe.Status)
+// validIP reports whether s parses as a real IP (not a hostname).
+func validIP(s string) bool { return net.ParseIP(s) != nil }
+
+func (w *EventWorker) handleSuccessfulRegistration(pe *ProcessedEvent) {
+	// The Debug guard avoids the variadic-arg slice allocation when debug is off.
+	if w.logger.enabled(LogLevelDebug) {
+		w.logger.Debug("Worker #%d: registration IP=%s user=%s domain=%s status=%s",
+			w.id, pe.IPAddress, pe.UserID, pe.Domain, pe.Status)
+	}
 
 	if pe.IPAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from registration event", w.id)
+		w.logger.Error("Worker #%d: missing IP from registration event", w.id)
+
 		return
 	}
 
-	// Validate that we have an actual IP address, not a hostname/domain
-	if net.ParseIP(pe.IPAddress) == nil {
-		w.logger.Error("Worker #%d: Invalid IP address '%s' from registration event (likely a hostname/domain)", w.id, pe.IPAddress)
+	if !validIP(pe.IPAddress) {
+		w.logger.Error("Worker #%d: invalid IP %q from registration event", w.id, pe.IPAddress)
+
 		return
 	}
 
 	if pe.UserID == "" {
-		pe.UserID = "unknown"
+		pe.UserID = unknownUser
 	}
 
 	if pe.Domain == "" {
-		config := GetConfig()
-		pe.Domain = config.FreeSWITCH.DefaultDomain
+		pe.Domain = GetConfig().FreeSWITCH.DefaultDomain
 	}
 
-	// Check rate limits
 	if !w.manager.rateManager.CheckRegistrationRate(pe.IPAddress, pe.UserID, pe.Domain) {
-		w.logger.Info("Worker #%d: Registration from IP %s blocked due to rate limiting",
-			w.id, pe.IPAddress)
+		if w.logger.enabled(LogLevelInfo) {
+			w.logger.Info("Worker #%d: registration from %s blocked by rate limit", w.id, pe.IPAddress)
+		}
+
 		return
 	}
 
-	w.logger.Info("Worker #%d: Successful registration from IP %s for user %s@%s",
-		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	// Guarded to avoid the variadic-args slice allocation when info-level
+	// logging is disabled (typical at LogLevelError or higher).
+	if w.logger.enabled(LogLevelInfo) {
+		w.logger.Info("Worker #%d: registration from %s for %s@%s", w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	}
 
-	// Update statistics
 	w.manager.securityManager.UpdateRegistrationStats(pe.IPAddress, pe.UserID, pe.Domain)
 
-	// Auto-whitelist if enabled
-	if w.manager.securityManager.securityConfig.AutoWhitelistOnSuccess {
-		w.logger.Debug("Worker #%d: Auto-whitelisting IP %s for user %s@%s",
-			w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	cfg := w.manager.securityManager.cfg
+	if cfg.AutoWhitelistOnSuccess {
 		if err := w.manager.securityManager.AddToWhitelist(pe.IPAddress, pe.UserID, pe.Domain, false); err != nil {
-			w.logger.Error("Worker #%d: Failed to add IP %s to whitelist: %v", w.id, pe.IPAddress, err)
+			w.logger.Error("Worker #%d: failed to whitelist IP %s: %v", w.id, pe.IPAddress, err)
 		}
 	}
 }
 
-// handleFailedRegistrationPooled handles failed registration with pooled event
-func (w *EventWorker) handleFailedRegistrationPooled(pe *ProcessedEvent) {
-	w.logger.Debug("Worker #%d: Failed registration info - IP: %s, User: %s, Domain: %s",
-		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+func (w *EventWorker) handleFailedRegistration(pe *ProcessedEvent) {
+	if w.logger.enabled(LogLevelDebug) {
+		w.logger.Debug("Worker #%d: failed registration IP=%s user=%s domain=%s",
+			w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	}
 
 	if pe.IPAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from failed registration event", w.id)
+		w.logger.Error("Worker #%d: missing IP from failed registration event", w.id)
+
 		return
 	}
 
-	// Validate that we have an actual IP address, not a hostname/domain
-	if net.ParseIP(pe.IPAddress) == nil {
-		w.logger.Error("Worker #%d: Invalid IP address '%s' from failed registration event (likely a hostname/domain)", w.id, pe.IPAddress)
+	if !validIP(pe.IPAddress) {
+		w.logger.Error("Worker #%d: invalid IP %q from failed registration event", w.id, pe.IPAddress)
+
 		return
 	}
 
 	if pe.UserID == "" {
-		pe.UserID = "unknown"
+		pe.UserID = unknownUser
 	}
 
 	if pe.Domain == "" {
-		config := GetConfig()
-		pe.Domain = config.FreeSWITCH.DefaultDomain
+		pe.Domain = GetConfig().FreeSWITCH.DefaultDomain
 	}
 
-	w.logger.Info("Worker #%d: Failed registration from IP %s for user %s@%s",
-		w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	if w.logger.enabled(LogLevelInfo) {
+		w.logger.Info("Worker #%d: failed registration from %s for %s@%s", w.id, pe.IPAddress, pe.UserID, pe.Domain)
+	}
 
 	w.manager.securityManager.ProcessFailedRegistration(pe.IPAddress, pe.UserID, pe.Domain)
 }
 
-// handleWrongCallStatePooled handles wrong call state with pooled event
-func (w *EventWorker) handleWrongCallStatePooled(pe *ProcessedEvent) {
+func (w *EventWorker) handleWrongCallState(pe *ProcessedEvent) {
 	if pe.IPAddress == "" {
-		w.logger.Error("Worker #%d: Failed to extract IP address from wrong call state event", w.id)
+		w.logger.Error("Worker #%d: missing IP from wrong call state event", w.id)
+
 		return
 	}
 
-	// Validate that we have an actual IP address, not a hostname/domain
-	if net.ParseIP(pe.IPAddress) == nil {
-		w.logger.Error("Worker #%d: Invalid IP address '%s' from wrong call state event (likely a hostname/domain)", w.id, pe.IPAddress)
+	if !validIP(pe.IPAddress) {
+		w.logger.Error("Worker #%d: invalid IP %q from wrong call state event", w.id, pe.IPAddress)
+
 		return
 	}
 
 	if pe.UserID == "" {
-		pe.UserID = "unknown"
+		pe.UserID = unknownUser
 	}
 
-	w.logger.Info("Worker #%d: Wrong call state event from IP %s for user %s",
-		w.id, pe.IPAddress, pe.UserID)
+	if w.logger.enabled(LogLevelInfo) {
+		w.logger.Info("Worker #%d: wrong call state from %s for %s", w.id, pe.IPAddress, pe.UserID)
+	}
 
 	w.manager.securityManager.ProcessWrongCallState(pe.IPAddress, pe.UserID)
 }
 
-// handleChannelCreatePooled handles channel create with pooled event
-func (w *EventWorker) handleChannelCreatePooled(pe *ProcessedEvent) {
+func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 	if pe.IPAddress == "" {
-		w.logger.Debug("Worker #%d: No IP address in channel create event", w.id)
-		return
-	}
-
-	// Validate that we have an actual IP address, not a hostname/domain
-	if net.ParseIP(pe.IPAddress) == nil {
-		w.logger.Debug("Worker #%d: Invalid IP address '%s' from channel create event (likely a hostname/domain)", w.id, pe.IPAddress)
-		return
-	}
-
-	allowed := w.manager.rateManager.CheckCallRate(pe.IPAddress, pe.UserID, pe.Domain)
-
-	if !allowed {
-		w.logger.Info("Worker #%d: Call from IP %s blocked due to rate limiting", w.id, pe.IPAddress)
-
-		if pe.CallUUID != "" && w.manager.eslClient != nil && w.manager.eslConnected {
-			hangupCmd := fmt.Sprintf("uuid_kill %s", pe.CallUUID)
-			_, err := w.manager.eslClient.Send(hangupCmd)
-			if err != nil {
-				w.logger.Error("Worker #%d: Error hanging up rate-limited call %s: %v",
-					w.id, pe.CallUUID, err)
-			} else {
-				w.logger.Info("Worker #%d: Successfully terminated rate-limited call %s",
-					w.id, pe.CallUUID)
-			}
+		if w.logger.enabled(LogLevelDebug) {
+			w.logger.Debug("Worker #%d: no IP in channel create event", w.id)
 		}
+
+		return
+	}
+
+	if !validIP(pe.IPAddress) {
+		if w.logger.enabled(LogLevelDebug) {
+			w.logger.Debug("Worker #%d: invalid IP %q in channel create event", w.id, pe.IPAddress)
+		}
+
+		return
+	}
+
+	if w.manager.rateManager.CheckCallRate(pe.IPAddress, pe.UserID, pe.Domain) {
+		if w.logger.enabled(LogLevelDebug) {
+			w.logger.Debug("Worker #%d: call from %s allowed", w.id, pe.IPAddress)
+		}
+
+		return
+	}
+
+	if w.logger.enabled(LogLevelInfo) {
+		w.logger.Info("Worker #%d: call from %s blocked by rate limit", w.id, pe.IPAddress)
+	}
+
+	if pe.CallUUID == "" {
+		return
+	}
+
+	w.manager.clientMu.RLock()
+	client := w.manager.eslClient
+	w.manager.clientMu.RUnlock()
+
+	if !w.manager.connected.Load() || client == nil {
+		return
+	}
+
+	if _, err := client.Send("uuid_kill " + pe.CallUUID); err != nil {
+		w.logger.Error("Worker #%d: error hanging up rate-limited call %s: %v", w.id, pe.CallUUID, err)
 	} else {
-		w.logger.Debug("Worker #%d: Call from IP %s allowed (within rate limits)", w.id, pe.IPAddress)
+		w.logger.Info("Worker #%d: terminated rate-limited call %s", w.id, pe.CallUUID)
 	}
 }
 
-// GetESLManager returns the ESL manager instance
-func GetESLManager() *ESLManager {
-	if eslManager == nil {
-		securityManager := GetSecurityManager()
-		_, err := InitESLManager(securityManager)
-		if err != nil {
-			GetLogger().Error("Error initializing ESL manager: %v", err)
-		}
-	}
-	return eslManager
-}
-
-// Shutdown gracefully shuts down the ESL manager
+// Shutdown gracefully shuts down the ESL manager.
 func (em *ESLManager) Shutdown() {
+	if !em.shutdown.CompareAndSwap(false, true) {
+		return
+	}
+
 	logger := GetLogger()
 	logger.Info("Shutting down ESL manager...")
 
-	// Set shutdown flag
-	em.shutdownMu.Lock()
-	em.shutdown = true
-	em.shutdownMu.Unlock()
-
-	// Cancel the context to signal shutdown
 	em.cancel()
 
-	// Close ESL connection if connected
-	if em.eslConnected && em.eslClient != nil {
-		em.eslClient.Close()
+	em.clientMu.RLock()
+	client := em.eslClient
+	em.clientMu.RUnlock()
+
+	if em.connected.Load() && client != nil {
+		client.Close()
 	}
 
-	// Don't close event queue here as it might be recreated by monitor
-
-	// Shutdown rate manager
 	if em.rateManager != nil {
 		em.rateManager.Shutdown()
 	}
 
-	// Wait for all goroutines to finish
 	em.wg.Wait()
-
-	// Now safe to close the queue
 	close(em.eventQueue)
 
 	logger.Info("ESL manager shutdown complete")
 }
 
-// isShuttingDown checks if we're in shutdown mode
-func (em *ESLManager) isShuttingDown() bool {
-	em.shutdownMu.RLock()
-	defer em.shutdownMu.RUnlock()
-	return em.shutdown
-}
-
-// startESLConnection connects to the FreeSWITCH ESL interface and listens for events
+// startESLConnection connects to FreeSWITCH ESL and listens for events,
+// reconnecting with exponential backoff on failure.
 func (em *ESLManager) startESLConnection() {
 	defer em.wg.Done()
 
 	logger := GetLogger()
+	baseBackoff, err := time.ParseDuration(em.eslConfig.ReconnectBackoff)
 
-	backoffDuration, err := time.ParseDuration(em.eslConfig.ReconnectBackoff)
-	if err != nil {
-		logger.Error("Error parsing reconnect backoff: %v, using default 5s", err)
-		backoffDuration = 5 * time.Second
+	if err != nil || baseBackoff <= 0 {
+		logger.Error("Error parsing reconnect backoff %q, using 5s: %v", em.eslConfig.ReconnectBackoff, err)
+
+		baseBackoff = 5 * time.Second
 	}
 
-	// Calculate dynamic backoff
-	currentBackoff := backoffDuration
-	connectionAttempts := atomic.LoadInt64(&em.statistics.ConnectionAttempts)
-	if connectionAttempts > 0 {
-		maxBackoff := 60 * time.Second
-		calculatedBackoff := backoffDuration * time.Duration(1<<uint(connectionAttempts-1))
-		if calculatedBackoff > maxBackoff {
-			calculatedBackoff = maxBackoff
-		}
-		currentBackoff = calculatedBackoff
-	}
+	const maxBackoff = 60 * time.Second
 
 	for {
-		// Check if we're shutting down
+		if em.shutdown.Load() {
+			return
+		}
 		select {
 		case <-em.ctx.Done():
-			logger.Info("ESL connection routine shutting down")
 			return
 		default:
 		}
 
-		if em.isShuttingDown() {
-			logger.Info("ESL manager is shutting down, stopping reconnection attempts")
-			return
+		// Compute backoff for this attempt with exponential growth, capped.
+		// A precomputed multiplier table avoids any shift math (and the
+		// associated gosec int-conversion warnings).
+		attempts := em.statistics.ConnectionAttempts.Add(1)
+		backoff := computeBackoff(baseBackoff, maxBackoff, attempts)
+
+		logger.Info("Connecting to FreeSWITCH ESL at %s:%s (attempt #%d)",
+			em.eslConfig.Host, em.eslConfig.Port, attempts)
+
+		port, err := strconv.Atoi(em.eslConfig.Port)
+		if err != nil {
+			logger.Error("Error parsing ESL port %q, using 8021: %v", em.eslConfig.Port, err)
+
+			port = 8021
 		}
 
-		atomic.AddInt64(&em.statistics.ConnectionAttempts, 1)
-		attemptNum := atomic.LoadInt64(&em.statistics.ConnectionAttempts)
+		started := time.Now()
 
-		logger.Info("Attempting to connect to FreeSWITCH ESL (Attempt #%d) at %s:%s",
-			attemptNum, em.eslConfig.Host, em.eslConfig.Port)
-
-		portNum, err := strconv.Atoi(em.eslConfig.Port)
+		client, err := eventsocket.Dial(fmt.Sprintf("%s:%d", em.eslConfig.Host, port), em.eslConfig.Password)
 		if err != nil {
-			logger.Error("Error parsing ESL port: %v, using default 8021", err)
-			portNum = 8021
-		}
-
-		connectionStartTime := time.Now()
-
-		// Create new client
-		eslAddr := fmt.Sprintf("%s:%d", em.eslConfig.Host, portNum)
-		client, err := eventsocket.Dial(eslAddr, em.eslConfig.Password)
-		if err != nil {
-			logger.Error("Failed to connect to FreeSWITCH ESL: %v", err)
-			atomic.AddInt64(&em.statistics.ConnectionErrors, 1)
+			em.statistics.ConnectionErrors.Add(1)
 
 			if strings.Contains(err.Error(), "auth failed") || strings.Contains(err.Error(), "authentication") {
-				logger.Error("Authentication failed! Please check your ESL password.")
+				logger.Error("ESL authentication failed — check the password")
+			} else {
+				logger.Error("Failed to connect to FreeSWITCH ESL: %v", err)
 			}
-
-			// Wait with backoff
 			select {
 			case <-em.ctx.Done():
 				return
-			case <-time.After(currentBackoff):
+			case <-time.After(backoff):
 				continue
 			}
 		}
 
-		connectionDuration := time.Since(connectionStartTime)
-		logger.Info("Successfully connected to FreeSWITCH ESL in %s", connectionDuration)
-
+		logger.Info("Connected to FreeSWITCH ESL in %s", time.Since(started))
+		em.clientMu.Lock()
 		em.eslClient = client
-		em.eslConnected = true
+		em.clientMu.Unlock()
+		em.connected.Store(true)
+		em.statistics.ConnectionAttempts.Store(0) // reset on success
 
-		// Reset connection attempts on success
-		atomic.StoreInt64(&em.statistics.ConnectionAttempts, 0)
-
-		// Subscribe to events
 		em.subscribeToEvents(client)
 
-		// Start event reader
 		em.wg.Add(1)
-		go em.readEvents()
+		go em.readEvents(client)
 
-		// Wait until connection is closed or shutdown
 		select {
 		case <-em.eslDisconnected:
 			logger.Info("Disconnected from FreeSWITCH ESL")
 		case <-em.ctx.Done():
-			logger.Info("ESL connection routine shutting down")
-			if em.eslClient != nil {
-				em.eslClient.Close()
-			}
+			client.Close()
+
 			return
 		}
 
-		em.eslConnected = false
+		em.connected.Store(false)
+		em.clientMu.Lock()
+		em.eslClient = nil
+		em.clientMu.Unlock()
 
-		// Check if we're shutting down before waiting
 		select {
 		case <-em.ctx.Done():
 			return
-		case <-time.After(currentBackoff):
-			// Continue with next connection attempt
+		case <-time.After(backoff):
 		}
 	}
 }
 
-// subscribeToEvents subscribes to the necessary FreeSWITCH events
+// subscribeToEvents subscribes to the necessary FreeSWITCH events.
 func (em *ESLManager) subscribeToEvents(client *eventsocket.Connection) {
 	logger := GetLogger()
 
@@ -850,149 +655,137 @@ func (em *ESLManager) subscribeToEvents(client *eventsocket.Connection) {
 		"event plain CUSTOM sofia::wrong_call_state",
 		"event plain CHANNEL_CREATE",
 	}
-
-	for _, eventCmd := range events {
-		_, err := client.Send(eventCmd)
-		if err != nil {
-			logger.Error("Error subscribing to %s: %v", eventCmd, err)
+	for _, cmd := range events {
+		if _, err := client.Send(cmd); err != nil {
+			logger.Error("Error subscribing to %q: %v", cmd, err)
 		} else {
-			logger.Info("Successfully subscribed to %s", eventCmd)
+			logger.Info("Subscribed to %q", cmd)
 		}
 	}
 }
 
-// readEvents reads events from ESL and queues them for processing
-func (em *ESLManager) readEvents() {
+// readEvents reads events from the given client and queues them for processing.
+// The client argument avoids racing with reconnection swapping em.eslClient.
+func (em *ESLManager) readEvents(client *eventsocket.Connection) {
 	defer em.wg.Done()
 
 	logger := GetLogger()
 	logger.Debug("Event reader started")
 
 	for {
-		if em.isShuttingDown() {
-			logger.Info("Event reader shutting down")
-			em.eslDisconnected <- true
+		if em.shutdown.Load() {
+			select {
+			case em.eslDisconnected <- true:
+			default:
+			}
+
 			return
 		}
 
-		ev, err := em.eslClient.ReadEvent()
+		ev, err := client.ReadEvent()
 		if err != nil {
 			logger.Error("Error reading event: %v", err)
-			em.eslDisconnected <- true
+			select {
+			case em.eslDisconnected <- true:
+			default:
+			}
+
 			return
 		}
 
-		// Update statistics
-		atomic.AddInt64(&em.statistics.EventsQueued, 1)
+		em.statistics.EventsQueued.Add(1)
 
-		// Try to queue the event
 		select {
 		case em.eventQueue <- ev:
-			// Event queued successfully
-
-		case <-time.After(100 * time.Millisecond):
-			// Queue is full, drop the event
-			atomic.AddInt64(&em.statistics.EventsDropped, 1)
-			logger.Error("Event queue full, dropping event")
-
 		case <-em.ctx.Done():
-			logger.Info("Event reader shutting down")
 			return
+		default:
+			em.statistics.EventsDropped.Add(1)
+			logger.Error("Event queue full, dropping event")
 		}
 	}
 }
 
-// SetESLLogLevel sets the logging level for ESL operations
+// SetESLLogLevel sets the logging level for ESL operations.
 func (em *ESLManager) SetESLLogLevel(level string) {
-	logger := GetLogger()
-	logger.SetLogLevelFromString(level)
-
-	switch strings.ToLower(level) {
-	case "error":
-		em.eslLogLevel = LogLevelError
-	case "info":
-		em.eslLogLevel = LogLevelInfo
-	case "debug":
-		em.eslLogLevel = LogLevelDebug
-	case "trace":
-		em.eslLogLevel = LogLevelTrace
-	default:
-		logger.Info("Unknown log level '%s', using 'info'", level)
-		em.eslLogLevel = LogLevelInfo
-	}
-
-	logger.Info("ESL log level set to: %s", level)
+	GetLogger().SetLogLevelFromString(strings.ToLower(level))
+	GetLogger().Info("ESL log level set to: %s", level)
 }
 
-// GetESLStats returns current ESL statistics including channel sizing info
-func (em *ESLManager) GetESLStats() map[string]interface{} {
-	channelStats := em.channelResizer.GetStats()
+// IsConnected reports whether the ESL connection is currently established.
+func (em *ESLManager) IsConnected() bool { return em.connected.Load() }
 
+// Host returns the configured ESL host (read-only after init).
+func (em *ESLManager) Host() string { return em.eslConfig.Host }
+
+// Port returns the configured ESL port (read-only after init).
+func (em *ESLManager) Port() string { return em.eslConfig.Port }
+
+// GetESLStats returns current ESL statistics.
+func (em *ESLManager) GetESLStats() map[string]interface{} {
 	return map[string]interface{}{
-		"connected":           em.eslConnected,
+		"connected":           em.connected.Load(),
 		"host":                em.eslConfig.Host,
 		"port":                em.eslConfig.Port,
-		"connection_attempts": atomic.LoadInt64(&em.statistics.ConnectionAttempts),
-		"connection_errors":   atomic.LoadInt64(&em.statistics.ConnectionErrors),
-		"events_processed":    atomic.LoadInt64(&em.statistics.EventsProcessed),
-		"events_queued":       atomic.LoadInt64(&em.statistics.EventsQueued),
-		"events_dropped":      atomic.LoadInt64(&em.statistics.EventsDropped),
+		"connection_attempts": em.statistics.ConnectionAttempts.Load(),
+		"connection_errors":   em.statistics.ConnectionErrors.Load(),
+		"events_processed":    em.statistics.EventsProcessed.Load(),
+		"events_queued":       em.statistics.EventsQueued.Load(),
+		"events_dropped":      em.statistics.EventsDropped.Load(),
 		"log_level":           em.eslConfig.LogLevel,
 		"worker_count":        em.workerCount,
-		"queue_size":          em.lastQueueSize,
 		"queue_length":        len(em.eventQueue),
 		"queue_capacity":      cap(em.eventQueue),
-		"memory_pool_enabled": true,
-		"dynamic_sizing":      true,
-		"channel_stats":       channelStats,
 	}
 }
 
-// ReconnectESL forces a reconnection to the ESL
+// ReconnectESL forces a reconnection to the ESL.
 func (em *ESLManager) ReconnectESL() {
 	logger := GetLogger()
 
-	if em.eslConnected && em.eslClient != nil {
-		logger.Info("Manually triggering ESL reconnection")
-		em.eslClient.Close()
-		em.eslConnected = false
+	em.clientMu.RLock()
+	client := em.eslClient
+	em.clientMu.RUnlock()
+
+	if em.connected.Load() && client != nil {
+		logger.Info("Triggering ESL reconnection")
+		client.Close()
+		em.connected.Store(false)
 		select {
 		case em.eslDisconnected <- true:
-			// Sent disconnect signal
 		default:
-			// Channel is full or closed, ignore
 		}
 	}
 }
 
-// SendCommand sends a command to FreeSWITCH ESL and returns the response
+// SendCommand sends an ESL api command. Only commands matching one of the
+// allowed-prefix entries (exact match or prefix followed by whitespace) are
+// permitted; this prevents `status` from authorizing `statusand_evil`.
 func (em *ESLManager) SendCommand(command string) (string, error) {
 	logger := GetLogger()
-	config := GetConfig()
+	cfg := GetConfig()
 
-	if !em.eslConnected || em.eslClient == nil {
-		return "", fmt.Errorf("not connected to FreeSWITCH ESL")
+	em.clientMu.RLock()
+	client := em.eslClient
+	em.clientMu.RUnlock()
+
+	if !em.connected.Load() || client == nil {
+		return "", ErrESLNotConnected
 	}
 
-	// Check if command is in the whitelist
-	isAllowed := false
-	for _, allowedCmd := range config.Security.ESLAllowedCommands {
-		if strings.HasPrefix(command, allowedCmd) {
-			isAllowed = true
-			break
-		}
-	}
-
-	if !isAllowed {
+	if !commandAllowed(command, cfg.Security.ESLAllowedCommands) {
 		logger.Error("Command not allowed: %s", command)
-		return "", fmt.Errorf("command not allowed: %s", command)
+
+		return "", fmt.Errorf("%w: %s", ErrESLCommandNotAllowed, command)
 	}
 
 	logger.Debug("Sending command to ESL: %s", command)
-	ev, err := em.eslClient.Send(fmt.Sprintf("api %s", command))
+
+	ev, err := client.Send("api " + command)
 	if err != nil {
 		logger.Error("Error sending command to ESL: %v", err)
-		return "", err
+
+		return "", fmt.Errorf("eventsocket send: %w", err)
 	}
 
 	response := ev.Get("Reply-Text")
@@ -1001,5 +794,32 @@ func (em *ESLManager) SendCommand(command string) (string, error) {
 	}
 
 	logger.Debug("Received response from ESL: %s", response)
+
 	return response, nil
+}
+
+// commandAllowed reports whether cmd is an exact match for an allowed entry,
+// or starts with one of the allowed entries followed by ASCII whitespace.
+//
+// This prevents the prefix-match bug where allowing "status" would also allow
+// "status_evil" or "statusXYZ".
+func commandAllowed(cmd string, allowed []string) bool {
+	for _, prefix := range allowed {
+		if prefix == "" {
+			continue
+		}
+
+		if cmd == prefix {
+			return true
+		}
+
+		if strings.HasPrefix(cmd, prefix) && len(cmd) > len(prefix) {
+			next := cmd[len(prefix)]
+			if next == ' ' || next == '\t' {
+				return true
+			}
+		}
+	}
+
+	return false
 }

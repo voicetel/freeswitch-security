@@ -2,13 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
-// AppConfig holds the application configuration
+// AppConfig holds the application configuration.
 type AppConfig struct {
 	Server struct {
 		Host         string `json:"host"`
@@ -61,14 +63,21 @@ type AppConfig struct {
 	} `json:"security"`
 }
 
+// defaultFreeSWITCHDomain is the placeholder domain used when no
+// configuration value is provided. example.com is the IANA-reserved domain
+// for documentation and examples (RFC 2606).
+const defaultFreeSWITCHDomain = "example.com"
+
 var (
 	config     *AppConfig
 	configOnce sync.Once
 )
 
-// LoadConfig loads configuration from a file
+// LoadConfig loads configuration from a file. Subsequent calls return the
+// cached instance and a nil error.
 func LoadConfig(path string) (*AppConfig, error) {
-	var err error
+	var loadErr error
+
 	configOnce.Do(func() {
 		config = &AppConfig{}
 
@@ -80,7 +89,7 @@ func LoadConfig(path string) (*AppConfig, error) {
 		config.Server.LogResponses = false
 
 		// FreeSWITCH defaults
-		config.FreeSWITCH.DefaultDomain = "example.com"
+		config.FreeSWITCH.DefaultDomain = defaultFreeSWITCHDomain
 
 		// Cache defaults
 		config.Cache.Enabled = true
@@ -116,7 +125,7 @@ func LoadConfig(path string) (*AppConfig, error) {
 		config.Security.UntrustedNetworks = []string{}
 		config.Security.IPTablesChain = "FREESWITCH"
 		config.Security.AutoWhitelistOnSuccess = true
-		config.Security.ESLLogLevel = "info"
+		config.Security.ESLLogLevel = logLevelInfoStr
 		config.Security.ReconnectBackoff = "5s"
 		config.Security.MaxWrongCallStates = 5
 		config.Security.WrongCallStateWindow = "10m"
@@ -133,34 +142,40 @@ func LoadConfig(path string) (*AppConfig, error) {
 		config.Security.RateLimit.CleanupInterval = "5m"
 
 		// Check if config file exists
-		if _, err := os.Stat(path); err == nil {
-			file, err := os.Open(path)
-			if err != nil {
-				log.Printf("Error opening config file: %v", err)
+		if _, statErr := os.Stat(path); statErr == nil {
+			file, openErr := os.Open(path)
+			if openErr != nil {
+				loadErr = fmt.Errorf("opening config file: %w", openErr)
+				log.Printf("Error opening config file: %v", openErr)
+
 				return
 			}
 			defer file.Close()
 
-			decoder := json.NewDecoder(file)
-			err = decoder.Decode(config)
-			if err != nil {
-				log.Printf("Error decoding config file: %v", err)
+			if decErr := json.NewDecoder(file).Decode(config); decErr != nil {
+				loadErr = fmt.Errorf("decoding config file: %w", decErr)
+				log.Printf("Error decoding config file: %v", decErr)
+
 				return
 			}
 		} else {
 			// Create a default config file
-			file, err := os.Create(path)
-			if err != nil {
-				log.Printf("Error creating config file: %v", err)
+			file, createErr := os.Create(path)
+			if createErr != nil {
+				loadErr = fmt.Errorf("creating config file: %w", createErr)
+				log.Printf("Error creating config file: %v", createErr)
+
 				return
 			}
 			defer file.Close()
 
 			encoder := json.NewEncoder(file)
 			encoder.SetIndent("", "  ")
-			err = encoder.Encode(config)
-			if err != nil {
-				log.Printf("Error encoding config file: %v", err)
+
+			if encErr := encoder.Encode(config); encErr != nil {
+				loadErr = fmt.Errorf("encoding config file: %w", encErr)
+				log.Printf("Error encoding config file: %v", encErr)
+
 				return
 			}
 		}
@@ -169,10 +184,10 @@ func LoadConfig(path string) (*AppConfig, error) {
 		loadEnvironmentVariables(config)
 	})
 
-	return config, err
+	return config, loadErr
 }
 
-// GetConfig returns the current configuration
+// GetConfig returns the current configuration.
 func GetConfig() *AppConfig {
 	if config == nil {
 		_, err := LoadConfig("config.json")
@@ -180,161 +195,105 @@ func GetConfig() *AppConfig {
 			log.Fatalf("Error loading configuration: %v", err)
 		}
 	}
+
 	return config
 }
 
-// loadEnvironmentVariables overrides config values with environment variables if set
+// envBool reads a boolean environment variable. If the variable is set to a
+// non-empty value, the dst is overwritten with the parsed value. The strings
+// "true", "1", and "yes" (case-insensitive) parse as true; everything else
+// parses as false.
+func envBool(key string, dst *bool) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return
+	}
+
+	switch strings.ToLower(raw) {
+	case "true", "1", "yes":
+		*dst = true
+	default:
+		*dst = false
+	}
+}
+
+// envString sets *dst to the value of key if the variable is non-empty.
+func envString(key string, dst *string) {
+	if v := os.Getenv(key); v != "" {
+		*dst = v
+	}
+}
+
+// envInt sets *dst to the parsed value of key if the variable parses as an int.
+func envInt(key string, dst *int) {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			*dst = n
+		}
+	}
+}
+
+// envJSONStringSlice unmarshals a JSON array of strings from key into *dst.
+func envJSONStringSlice(key string, dst *[]string) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return
+	}
+
+	var parsed []string
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+		*dst = parsed
+	}
+}
+
+// loadEnvironmentVariables overrides config values with environment variables if set.
 func loadEnvironmentVariables(config *AppConfig) {
-	// Server environment variables
-	if host := os.Getenv("SERVER_HOST"); host != "" {
-		config.Server.Host = host
-	}
-	if port := os.Getenv("SERVER_PORT"); port != "" {
-		config.Server.Port = port
-	}
-	if logReq := os.Getenv("SERVER_LOG_REQUESTS"); logReq != "" {
-		config.Server.LogRequests = (logReq == "true" || logReq == "1" || logReq == "yes")
-	}
-	if logResp := os.Getenv("SERVER_LOG_RESPONSES"); logResp != "" {
-		config.Server.LogResponses = (logResp == "true" || logResp == "1" || logResp == "yes")
-	}
+	// Server
+	envString("SERVER_HOST", &config.Server.Host)
+	envString("SERVER_PORT", &config.Server.Port)
+	envBool("SERVER_LOG_REQUESTS", &config.Server.LogRequests)
+	envBool("SERVER_LOG_RESPONSES", &config.Server.LogResponses)
 
-	// FreeSWITCH environment variables
-	if domain := os.Getenv("FS_DEFAULT_DOMAIN"); domain != "" {
-		config.FreeSWITCH.DefaultDomain = domain
-	}
+	// FreeSWITCH
+	envString("FS_DEFAULT_DOMAIN", &config.FreeSWITCH.DefaultDomain)
 
-	// Cache environment variables
-	if cacheEnabled := os.Getenv("CACHE_ENABLED"); cacheEnabled != "" {
-		config.Cache.Enabled = (cacheEnabled == "true" || cacheEnabled == "1" || cacheEnabled == "yes")
-	}
-	if securityTTL := os.Getenv("CACHE_SECURITY_TTL"); securityTTL != "" {
-		config.Cache.SecurityTTL = securityTTL
-	}
-	if cleanupInterval := os.Getenv("CACHE_CLEANUP_INTERVAL"); cleanupInterval != "" {
-		config.Cache.CleanupInterval = cleanupInterval
-	}
-	if maxEntries := os.Getenv("CACHE_MAX_ENTRIES"); maxEntries != "" {
-		if val, err := strconv.Atoi(maxEntries); err == nil {
-			config.Cache.MaxEntriesInWindow = val
-		}
-	}
-	if maxEntrySize := os.Getenv("CACHE_MAX_ENTRY_SIZE"); maxEntrySize != "" {
-		if val, err := strconv.Atoi(maxEntrySize); err == nil {
-			config.Cache.MaxEntrySize = val
-		}
-	}
-	if shardCount := os.Getenv("CACHE_SHARD_COUNT"); shardCount != "" {
-		if val, err := strconv.Atoi(shardCount); err == nil {
-			config.Cache.ShardCount = val
-		}
-	}
+	// Cache
+	envBool("CACHE_ENABLED", &config.Cache.Enabled)
+	envString("CACHE_SECURITY_TTL", &config.Cache.SecurityTTL)
+	envString("CACHE_CLEANUP_INTERVAL", &config.Cache.CleanupInterval)
+	envInt("CACHE_MAX_ENTRIES", &config.Cache.MaxEntriesInWindow)
+	envInt("CACHE_MAX_ENTRY_SIZE", &config.Cache.MaxEntrySize)
+	envInt("CACHE_SHARD_COUNT", &config.Cache.ShardCount)
 
-	// Security environment variables
-	if secEnabled := os.Getenv("SECURITY_ENABLED"); secEnabled != "" {
-		config.Security.Enabled = (secEnabled == "true" || secEnabled == "1" || secEnabled == "yes")
-	}
-	if eslHost := os.Getenv("SECURITY_ESL_HOST"); eslHost != "" {
-		config.Security.ESLHost = eslHost
-	}
-	if eslPort := os.Getenv("SECURITY_ESL_PORT"); eslPort != "" {
-		config.Security.ESLPort = eslPort
-	}
-	if eslPassword := os.Getenv("SECURITY_ESL_PASSWORD"); eslPassword != "" {
-		config.Security.ESLPassword = eslPassword
-	}
-	// Add environment variable for ESL allowed commands
-	if eslAllowedCommands := os.Getenv("SECURITY_ESL_ALLOWED_COMMANDS"); eslAllowedCommands != "" {
-		var commands []string
-		if err := json.Unmarshal([]byte(eslAllowedCommands), &commands); err == nil {
-			config.Security.ESLAllowedCommands = commands
-		}
-	}
-	if maxFailedStr := os.Getenv("SECURITY_MAX_FAILED_ATTEMPTS"); maxFailedStr != "" {
-		if maxFailed, err := strconv.Atoi(maxFailedStr); err == nil {
-			config.Security.MaxFailedAttempts = maxFailed
-		}
-	}
-	if failedWindow := os.Getenv("SECURITY_FAILED_WINDOW"); failedWindow != "" {
-		config.Security.FailedAttemptsWindow = failedWindow
-	}
-	if autoBlock := os.Getenv("SECURITY_AUTO_BLOCK"); autoBlock != "" {
-		config.Security.AutoBlockEnabled = (autoBlock == "true" || autoBlock == "1" || autoBlock == "yes")
-	}
-	if blockDuration := os.Getenv("SECURITY_BLOCK_DURATION"); blockDuration != "" {
-		config.Security.BlockDuration = blockDuration
-	}
-	if whitelistEnabled := os.Getenv("SECURITY_WHITELIST_ENABLED"); whitelistEnabled != "" {
-		config.Security.WhitelistEnabled = (whitelistEnabled == "true" || whitelistEnabled == "1" || whitelistEnabled == "yes")
-	}
-	if whitelistTTL := os.Getenv("SECURITY_WHITELIST_TTL"); whitelistTTL != "" {
-		config.Security.WhitelistTTL = whitelistTTL
-	}
-	if chain := os.Getenv("SECURITY_IPTABLES_CHAIN"); chain != "" {
-		config.Security.IPTablesChain = chain
-	}
-	if autoWhitelist := os.Getenv("SECURITY_AUTO_WHITELIST_ON_SUCCESS"); autoWhitelist != "" {
-		config.Security.AutoWhitelistOnSuccess = (autoWhitelist == "true" || autoWhitelist == "1" || autoWhitelist == "yes")
-	}
-	if eslLogLevel := os.Getenv("SECURITY_ESL_LOG_LEVEL"); eslLogLevel != "" {
-		config.Security.ESLLogLevel = eslLogLevel
-	}
-	if reconnectBackoff := os.Getenv("SECURITY_RECONNECT_BACKOFF"); reconnectBackoff != "" {
-		config.Security.ReconnectBackoff = reconnectBackoff
-	}
-	if maxWrongCallStates := os.Getenv("SECURITY_MAX_WRONG_CALL_STATES"); maxWrongCallStates != "" {
-		if val, err := strconv.Atoi(maxWrongCallStates); err == nil {
-			config.Security.MaxWrongCallStates = val
-		}
-	}
-	if wrongCallStateWindow := os.Getenv("SECURITY_WRONG_CALL_STATE_WINDOW"); wrongCallStateWindow != "" {
-		config.Security.WrongCallStateWindow = wrongCallStateWindow
-	}
-	if trustedNetworks := os.Getenv("SECURITY_TRUSTED_NETWORKS"); trustedNetworks != "" {
-		var networks []string
-		if err := json.Unmarshal([]byte(trustedNetworks), &networks); err == nil {
-			config.Security.TrustedNetworks = networks
-		}
-	}
+	// Security
+	envBool("SECURITY_ENABLED", &config.Security.Enabled)
+	envString("SECURITY_ESL_HOST", &config.Security.ESLHost)
+	envString("SECURITY_ESL_PORT", &config.Security.ESLPort)
+	envString("SECURITY_ESL_PASSWORD", &config.Security.ESLPassword)
+	envJSONStringSlice("SECURITY_ESL_ALLOWED_COMMANDS", &config.Security.ESLAllowedCommands)
+	envInt("SECURITY_MAX_FAILED_ATTEMPTS", &config.Security.MaxFailedAttempts)
+	envString("SECURITY_FAILED_WINDOW", &config.Security.FailedAttemptsWindow)
+	envBool("SECURITY_AUTO_BLOCK", &config.Security.AutoBlockEnabled)
+	envString("SECURITY_BLOCK_DURATION", &config.Security.BlockDuration)
+	envBool("SECURITY_WHITELIST_ENABLED", &config.Security.WhitelistEnabled)
+	envString("SECURITY_WHITELIST_TTL", &config.Security.WhitelistTTL)
+	envString("SECURITY_IPTABLES_CHAIN", &config.Security.IPTablesChain)
+	envBool("SECURITY_AUTO_WHITELIST_ON_SUCCESS", &config.Security.AutoWhitelistOnSuccess)
+	envString("SECURITY_ESL_LOG_LEVEL", &config.Security.ESLLogLevel)
+	envString("SECURITY_RECONNECT_BACKOFF", &config.Security.ReconnectBackoff)
+	envInt("SECURITY_MAX_WRONG_CALL_STATES", &config.Security.MaxWrongCallStates)
+	envString("SECURITY_WRONG_CALL_STATE_WINDOW", &config.Security.WrongCallStateWindow)
+	envJSONStringSlice("SECURITY_TRUSTED_NETWORKS", &config.Security.TrustedNetworks)
+	envJSONStringSlice("SECURITY_UNTRUSTED_NETWORKS", &config.Security.UntrustedNetworks)
 
-	// Added environment variable for untrusted networks
-	if untrustedNetworks := os.Getenv("SECURITY_UNTRUSTED_NETWORKS"); untrustedNetworks != "" {
-		var networks []string
-		if err := json.Unmarshal([]byte(untrustedNetworks), &networks); err == nil {
-			config.Security.UntrustedNetworks = networks
-		}
-	}
-
-	// Rate Limit environment variables
-	if rateLimitEnabled := os.Getenv("SECURITY_RATE_LIMIT_ENABLED"); rateLimitEnabled != "" {
-		config.Security.RateLimit.Enabled = (rateLimitEnabled == "true" || rateLimitEnabled == "1" || rateLimitEnabled == "yes")
-	}
-	if callRateLimit := os.Getenv("SECURITY_RATE_LIMIT_CALL_LIMIT"); callRateLimit != "" {
-		if val, err := strconv.Atoi(callRateLimit); err == nil {
-			config.Security.RateLimit.CallRateLimit = val
-		}
-	}
-	if callRateInterval := os.Getenv("SECURITY_RATE_LIMIT_CALL_INTERVAL"); callRateInterval != "" {
-		config.Security.RateLimit.CallRateInterval = callRateInterval
-	}
-	if registrationLimit := os.Getenv("SECURITY_RATE_LIMIT_REG_LIMIT"); registrationLimit != "" {
-		if val, err := strconv.Atoi(registrationLimit); err == nil {
-			config.Security.RateLimit.RegistrationLimit = val
-		}
-	}
-	if registrationWindow := os.Getenv("SECURITY_RATE_LIMIT_REG_WINDOW"); registrationWindow != "" {
-		config.Security.RateLimit.RegistrationWindow = registrationWindow
-	}
-	if autoBlockOnExceed := os.Getenv("SECURITY_RATE_LIMIT_AUTO_BLOCK"); autoBlockOnExceed != "" {
-		config.Security.RateLimit.AutoBlockOnExceed = true
-	}
-	if rateLimitBlockDuration := os.Getenv("SECURITY_RATE_LIMIT_BLOCK_DURATION"); rateLimitBlockDuration != "" {
-		config.Security.RateLimit.BlockDuration = rateLimitBlockDuration
-	}
-	if whitelistBypass := os.Getenv("SECURITY_RATE_LIMIT_WHITELIST_BYPASS"); whitelistBypass != "" {
-		config.Security.RateLimit.WhitelistBypass = (whitelistBypass == "true" || whitelistBypass == "1" || whitelistBypass == "yes")
-	}
-	if rateLimitCleanupInterval := os.Getenv("SECURITY_RATE_LIMIT_CLEANUP_INTERVAL"); rateLimitCleanupInterval != "" {
-		config.Security.RateLimit.CleanupInterval = rateLimitCleanupInterval
-	}
+	// Rate limit
+	envBool("SECURITY_RATE_LIMIT_ENABLED", &config.Security.RateLimit.Enabled)
+	envInt("SECURITY_RATE_LIMIT_CALL_LIMIT", &config.Security.RateLimit.CallRateLimit)
+	envString("SECURITY_RATE_LIMIT_CALL_INTERVAL", &config.Security.RateLimit.CallRateInterval)
+	envInt("SECURITY_RATE_LIMIT_REG_LIMIT", &config.Security.RateLimit.RegistrationLimit)
+	envString("SECURITY_RATE_LIMIT_REG_WINDOW", &config.Security.RateLimit.RegistrationWindow)
+	envBool("SECURITY_RATE_LIMIT_AUTO_BLOCK", &config.Security.RateLimit.AutoBlockOnExceed)
+	envString("SECURITY_RATE_LIMIT_BLOCK_DURATION", &config.Security.RateLimit.BlockDuration)
+	envBool("SECURITY_RATE_LIMIT_WHITELIST_BYPASS", &config.Security.RateLimit.WhitelistBypass)
+	envString("SECURITY_RATE_LIMIT_CLEANUP_INTERVAL", &config.Security.RateLimit.CleanupInterval)
 }

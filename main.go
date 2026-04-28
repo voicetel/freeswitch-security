@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,10 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var (
-	// Global server instance for graceful shutdown
-	httpServer *http.Server
-)
+// Global server instance for graceful shutdown.
+var httpServer *http.Server
 
 func main() {
 	// Load configuration
@@ -34,6 +33,7 @@ func main() {
 		if err := InitCache(); err != nil {
 			log.Fatalf("Failed to initialize cache: %v", err)
 		}
+
 		log.Println("Cache system initialized")
 	} else {
 		log.Println("Cache system is disabled")
@@ -41,21 +41,14 @@ func main() {
 
 	// Initialize security manager if enabled
 	var securityManager *SecurityManager
+
 	var eslManager *ESLManager
 
 	if config.Security.Enabled {
-		if err := InitSecurityManager(); err != nil {
-			log.Fatalf("Failed to initialize security manager: %v", err)
-		}
+		InitSecurityManager()
 
-		// Get security manager instance
 		securityManager = GetSecurityManager()
-
-		// Initialize ESL manager after security manager
-		eslManager, err = InitESLManager(securityManager)
-		if err != nil {
-			log.Printf("Failed to initialize ESL manager: %v", err)
-		}
+		eslManager = InitESLManager(securityManager)
 
 		log.Println("Security manager initialized")
 	} else {
@@ -73,18 +66,21 @@ func main() {
 	// Register routes
 	registerRoutes(router)
 
-	// Create HTTP server
+	// Create HTTP server. ReadHeaderTimeout protects against Slowloris-style
+	// attacks that hold the connection open by trickling header bytes.
 	host := config.Server.Host
 	port := config.Server.Port
 	httpServer = &http.Server{
-		Addr:    fmt.Sprintf("%s:%s", host, port),
-		Handler: router,
+		Addr:              fmt.Sprintf("%s:%s", host, port),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Start server in a goroutine
 	go func() {
-		fmt.Printf("Starting FreeSWITCH Security server on %s:%s...\n", host, port)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("Starting FreeSWITCH Security server on %s:%s...", host, port)
+
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
@@ -103,6 +99,7 @@ func main() {
 
 	// Shutdown sequence
 	log.Println("Shutting down HTTP server...")
+
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server forced to shutdown: %v", err)
 	}

@@ -3,26 +3,24 @@ package main
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
-// EslLogLevel defines the verbosity of ESL logging
-type EslLogLevel int
+// EslLogLevel defines the verbosity of ESL logging.
+type EslLogLevel int32
 
 const (
-	// LogLevelError logs only errors
 	LogLevelError EslLogLevel = iota
-	// LogLevelInfo logs connection info and errors
 	LogLevelInfo
-	// LogLevelDebug logs all ESL activities including messages
 	LogLevelDebug
-	// LogLevelTrace logs everything with full content
 	LogLevelTrace
 )
 
-// Logger provides a centralized logging interface
+// Logger provides a centralized, low-overhead logging interface.
+// Level is stored as an atomic int32 so the level check on every
+// Info/Debug/Trace call is lock-free.
 type Logger struct {
-	logLevel EslLogLevel
-	mutex    sync.RWMutex
+	level atomic.Int32
 }
 
 var (
@@ -30,28 +28,27 @@ var (
 	globalLoggerOnce sync.Once
 )
 
-// GetLogger returns the singleton logger instance
+// GetLogger returns the singleton logger instance.
 func GetLogger() *Logger {
 	globalLoggerOnce.Do(func() {
-		globalLogger = &Logger{
-			logLevel: LogLevelInfo, // Default to info level
-		}
+		globalLogger = &Logger{}
+		globalLogger.level.Store(int32(LogLevelInfo))
 	})
+
 	return globalLogger
 }
 
-// SetLogLevel sets the logging level
+// SetLogLevel sets the logging level.
 func (l *Logger) SetLogLevel(level EslLogLevel) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	l.logLevel = level
+	l.level.Store(int32(level))
 }
 
-// SetLogLevelFromString sets the logging level from a string representation
-func (l *Logger) SetLogLevelFromString(levelStr string) {
-	var level EslLogLevel = LogLevelInfo // Default to info level
+// SetLogLevelFromString sets the logging level from a string.
+// Unknown values default to info.
+func (l *Logger) SetLogLevelFromString(name string) {
+	level := LogLevelInfo
 
-	switch levelStr {
+	switch name {
 	case "error":
 		level = LogLevelError
 	case "info":
@@ -61,61 +58,67 @@ func (l *Logger) SetLogLevelFromString(levelStr string) {
 	case "trace":
 		level = LogLevelTrace
 	default:
-		log.Printf("Unknown log level '%s', using 'info'", levelStr)
+		log.Printf("Unknown log level %q, using 'info'", name)
 	}
 
 	l.SetLogLevel(level)
 }
 
-// GetLogLevel returns the current logging level
+// GetLogLevel returns the current log level.
 func (l *Logger) GetLogLevel() EslLogLevel {
-	l.mutex.RLock()
-	defer l.mutex.RUnlock()
-	return l.logLevel
+	return EslLogLevel(l.level.Load())
 }
 
-// Error logs error messages
+// enabled reports whether the given level is currently active.
+// It is intentionally inlinable.
+func (l *Logger) enabled(level EslLogLevel) bool {
+	return int32(level) <= l.level.Load()
+}
+
 func (l *Logger) Error(format string, args ...interface{}) {
-	if LogLevelError <= l.GetLogLevel() {
+	if l.enabled(LogLevelError) {
 		log.Printf("[ESL ERROR] "+format, args...)
 	}
 }
 
-// Info logs informational messages
 func (l *Logger) Info(format string, args ...interface{}) {
-	if LogLevelInfo <= l.GetLogLevel() {
+	if l.enabled(LogLevelInfo) {
 		log.Printf("[ESL INFO] "+format, args...)
 	}
 }
 
-// Debug logs debug messages
 func (l *Logger) Debug(format string, args ...interface{}) {
-	if LogLevelDebug <= l.GetLogLevel() {
+	if l.enabled(LogLevelDebug) {
 		log.Printf("[ESL DEBUG] "+format, args...)
 	}
 }
 
-// Trace logs trace messages (highest verbosity)
 func (l *Logger) Trace(format string, args ...interface{}) {
-	if LogLevelTrace <= l.GetLogLevel() {
+	if l.enabled(LogLevelTrace) {
 		log.Printf("[ESL TRACE] "+format, args...)
 	}
 }
 
-// Log is a generic logging function that respects the log level
+// Log emits a message at the given level if the level is currently enabled.
 func (l *Logger) Log(level EslLogLevel, format string, args ...interface{}) {
-	if level <= l.GetLogLevel() {
-		prefix := ""
-		switch level {
-		case LogLevelError:
-			prefix = "[ESL ERROR] "
-		case LogLevelInfo:
-			prefix = "[ESL INFO] "
-		case LogLevelDebug:
-			prefix = "[ESL DEBUG] "
-		case LogLevelTrace:
-			prefix = "[ESL TRACE] "
-		}
-		log.Printf(prefix+format, args...)
+	if !l.enabled(level) {
+		return
 	}
+
+	var prefix string
+
+	switch level {
+	case LogLevelError:
+		prefix = "[ESL ERROR] "
+	case LogLevelInfo:
+		prefix = "[ESL INFO] "
+	case LogLevelDebug:
+		prefix = "[ESL DEBUG] "
+	case LogLevelTrace:
+		prefix = "[ESL TRACE] "
+	default:
+		prefix = "[ESL ?] "
+	}
+
+	log.Printf(prefix+format, args...)
 }

@@ -70,16 +70,23 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 ## ⚡ Performance Characteristics
 
 Benchmarked with the in-repo suite (`make bench`, statistically validated
-with `benchstat`); figures from a 12th-gen mobile CPU:
+with `benchstat`); figures from a 12th-gen mobile CPU (absolute numbers are
+machine-dependent — the architecture below is the point):
 
-- **Event Pipeline**: ~350 ns/event end-to-end (queue → worker → rate +
-  security checks) at 4 workers — millions of events/second of headroom
-- **Registration Hot Path**: ~230 ns with auto-whitelist enabled, zero
-  allocations (in-place whitelist refresh, atomic statistics)
-- **Rate Checks**: ~45–95 ns serial; counters sharded across 16 locks for
-  contention-free multi-source traffic
-- **Memory Efficiency**: pooled event objects, 3 allocs/event in steady state
-- **IPTables Integration**: batch operations reduce fork/exec overhead
+- **Event Pipeline**: sub-microsecond per event end-to-end (queue → worker →
+  rate + security checks). Each worker drains its **own** queue with the
+  reader round-robining across them, so receivers never contend on a single
+  channel lock (~40% faster pipeline than the shared-queue design)
+- **Allocation-free IP handling**: `net/netip` on every per-event path — the
+  trusted-network and rate checks parse and match without heap allocations
+  (cut the per-event IP work 27–50%)
+- **Rate Checks**: per-IP counters sharded across 16 locks for contention-free
+  multi-source traffic
+- **Registration Hot Path**: in-place whitelist refresh + atomic statistics
+  keep the worker off the lock and off the batch-ticker stall
+- **Memory Efficiency**: pooled event objects, ~3 allocs/event in steady state
+- **Firewall**: kernel ipset (O(1) membership, in-kernel ban expiry) behind a
+  single iptables rule
 - **Worker Pool**: sized from CPU count (2–8 workers)
 
 ## 🛠 Installation

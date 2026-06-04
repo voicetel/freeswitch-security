@@ -214,7 +214,7 @@ func newServerESLManager(tb testing.TB, srv *fakeESL, workers, queueSize int) *E
 		},
 		eslDisconnected: make(chan bool, 1),
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, queueSize),
+		queueSize:       queueSize,
 		workerCount:     workers,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,
@@ -606,7 +606,7 @@ func TestESLManager_BogusBackoff(t *testing.T) {
 		},
 		eslDisconnected: make(chan bool, 1),
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, 8),
+		queueSize:       8,
 		workerCount:     1,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,
@@ -695,7 +695,7 @@ func TestESLManager_ShutdownFlagStopsLoops(t *testing.T) {
 	// release the workers.
 	em.cancel()
 	em.readersWg.Wait()
-	close(em.eventQueue)
+	em.closeWorkerQueues()
 	em.workersWg.Wait()
 }
 
@@ -723,7 +723,7 @@ func TestESLManager_ShutdownDuringDialBackoff(t *testing.T) {
 		},
 		eslDisconnected: make(chan bool, 1),
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, 8),
+		queueSize:       8,
 		workerCount:     1,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,

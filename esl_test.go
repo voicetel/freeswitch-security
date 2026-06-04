@@ -681,7 +681,7 @@ func TestWorkerPool_ProcessAndDrain(t *testing.T) {
 	em := &ESLManager{
 		securityManager: sm,
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, 16),
+		queueSize:       16,
 		workerCount:     2,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,
@@ -690,29 +690,29 @@ func TestWorkerPool_ProcessAndDrain(t *testing.T) {
 
 	em.startWorkerPool()
 
-	em.eventQueue <- makeEvent(map[string]string{
+	em.dispatchEvent(makeEvent(map[string]string{
 		hdrEventName:     eventNameCustom,
 		hdrEventSubclass: eventSubRegisterFail,
 		hdrNetworkIP:     "203.0.113.145",
 		hdrToUser:        testUserVictim,
 		hdrToHost:        testDomainVictim,
-	})
+	}))
 
-	em.eventQueue <- makeEvent(map[string]string{
+	em.dispatchEvent(makeEvent(map[string]string{
 		hdrEventName:     eventNameCustom,
 		hdrEventSubclass: "sofia::nonsense", // unhandled subclass branch
-	})
+	}))
 
-	em.eventQueue <- makeEvent(map[string]string{
+	em.dispatchEvent(makeEvent(map[string]string{
 		hdrEventName: evHeartbeat, // unhandled event-type branch
-	})
+	}))
 
 	if !waitFor(func() bool { return em.statistics.EventsProcessed.Load() >= 3 }) {
 		t.Fatal("workers did not process queued events")
 	}
 
 	// Closing the queue must end the workers (range loop termination).
-	close(em.eventQueue)
+	em.closeWorkerQueues()
 	em.workersWg.Wait()
 	cancel()
 }
@@ -727,7 +727,7 @@ func TestWorkerPool_CloseEmptyQueue(t *testing.T) {
 	em := &ESLManager{
 		securityManager: sm,
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, 1),
+		queueSize:       1,
 		workerCount:     2,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,
@@ -735,7 +735,7 @@ func TestWorkerPool_CloseEmptyQueue(t *testing.T) {
 	}
 
 	em.startWorkerPool()
-	close(em.eventQueue) // workers exit when the (empty) queue closes
+	em.closeWorkerQueues() // workers exit when their queues close
 	em.workersWg.Wait()
 	cancel()
 }

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -29,11 +29,11 @@ func newTestSecurityManager(tb testing.TB) *SecurityManager {
 	// Suppress noisy log output during tests; raise via -v if needed.
 	GetLogger().SetLogLevel(LogLevelError)
 
-	trusted := make([]*net.IPNet, 0, 1)
+	trusted := make([]netip.Prefix, 0, 1)
 
-	_, n, err := net.ParseCIDR(testTrustedCIDR)
+	prefix, err := netip.ParsePrefix(testTrustedCIDR)
 	if err == nil {
-		trusted = append(trusted, n)
+		trusted = append(trusted, prefix.Masked())
 	}
 
 	ctx, cancel := context.WithCancel(tb.Context())
@@ -622,12 +622,12 @@ func TestIPInTrustedNetwork_MultipleCIDRs(t *testing.T) {
 
 	cidrs := []string{"127.0.0.0/8", testTrustedCIDR, testPrivateCIDR}
 	for _, cidr := range cidrs {
-		_, n, err := net.ParseCIDR(cidr)
+		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		sm.trustedNetworks = append(sm.trustedNetworks, n)
+		sm.trustedNetworks = append(sm.trustedNetworks, prefix.Masked())
 	}
 
 	cases := []struct {
@@ -641,8 +641,8 @@ func TestIPInTrustedNetwork_MultipleCIDRs(t *testing.T) {
 		{"8.8.8.8", false},
 	}
 	for _, c := range cases {
-		ip := net.ParseIP(c.ip)
-		if got := sm.ipInTrustedNetwork(ip); got != c.want {
+		addr := netip.MustParseAddr(c.ip)
+		if got := sm.ipInTrustedNetwork(addr); got != c.want {
 			t.Errorf("ipInTrustedNetwork(%s) = %v, want %v", c.ip, got, c.want)
 		}
 	}
@@ -850,12 +850,12 @@ func BenchmarkIsIPWhitelisted_TrustedHit_ManyNets(b *testing.B) {
 	sm.trustedNetworks = sm.trustedNetworks[:0]
 
 	for _, cidr := range cidrs {
-		_, n, err := net.ParseCIDR(cidr)
+		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
 			b.Fatal(err)
 		}
 
-		sm.trustedNetworks = append(sm.trustedNetworks, n)
+		sm.trustedNetworks = append(sm.trustedNetworks, prefix.Masked())
 	}
 
 	b.ReportAllocs()

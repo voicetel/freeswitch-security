@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -44,7 +44,7 @@ type SecurityManager struct {
 	wrongStates    map[string]WrongCallStateEntry
 
 	// Read-mostly. trustedNetworks is set at init and never mutated.
-	trustedNetworks []*net.IPNet
+	trustedNetworks []netip.Prefix
 
 	// untrustedPatterns is a constant-time lookup table of exact-match
 	// patterns. Mutated under mu.
@@ -272,17 +272,17 @@ func InitSecurityManager() {
 
 		logger.SetLogLevelFromString(cfg.Security.ESLLogLevel)
 
-		trusted := make([]*net.IPNet, 0, len(cfg.Security.TrustedNetworks))
+		trusted := make([]netip.Prefix, 0, len(cfg.Security.TrustedNetworks))
 
 		for _, s := range cfg.Security.TrustedNetworks {
-			_, network, err := net.ParseCIDR(s)
+			prefix, err := netip.ParsePrefix(s)
 			if err != nil {
 				logger.Error("Error parsing trusted network %q: %v", s, err)
 
 				continue
 			}
 
-			trusted = append(trusted, network)
+			trusted = append(trusted, prefix.Masked())
 		}
 
 		untrusted := make(map[string]struct{}, len(cfg.Security.UntrustedNetworks))
@@ -537,9 +537,9 @@ func (sm *SecurityManager) RemoveFromBlacklist(ip string) {
 // trusted networks). It is a hot path: callers may invoke it once per packet.
 //
 // The fast path checks the explicit whitelist map first to avoid the cost of
-// net.ParseIP, which dominates the function under profiling. ParseIP is only
-// called when the explicit whitelist misses AND there is at least one trusted
-// network configured.
+// parsing the address, which dominates the function under profiling. The parse
+// happens only when the explicit whitelist misses AND there is at least one
+// trusted network configured.
 func (sm *SecurityManager) IsIPWhitelisted(ipStr string) bool {
 	sm.mu.RLock()
 	entry, mapHit := sm.whitelist[ipStr]
@@ -556,12 +556,12 @@ func (sm *SecurityManager) IsIPWhitelisted(ipStr string) bool {
 		return false
 	}
 
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
+	addr, err := netip.ParseAddr(ipStr)
+	if err != nil {
 		return false
 	}
 
-	return sm.ipInTrustedNetwork(ip)
+	return sm.ipInTrustedNetwork(addr)
 }
 
 // IsIPBlacklisted reports whether the given IP is currently blacklisted.
@@ -902,8 +902,8 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 
 	sm.mu.Lock()
 	for _, req := range batch {
-		ip := net.ParseIP(req.IP)
-		if ip == nil {
+		addr, err := netip.ParseAddr(req.IP)
+		if err != nil {
 			if req.Response != nil {
 				req.Response <- fmt.Errorf("%w: %s", ErrInvalidIP, req.IP)
 			}
@@ -919,7 +919,7 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 			continue
 		}
 
-		if sm.ipInTrustedNetwork(ip) {
+		if sm.ipInTrustedNetwork(addr) {
 			if req.Response != nil {
 				req.Response <- fmt.Errorf("%w: %s", ErrIPInTrustedNetwork, req.IP)
 			}
@@ -963,9 +963,9 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 
 // ipInTrustedNetwork must be called with sm.mu held (or while trustedNetworks
 // is otherwise known to be stable, which is always after init).
-func (sm *SecurityManager) ipInTrustedNetwork(ip net.IP) bool {
-	for _, n := range sm.trustedNetworks {
-		if n.Contains(ip) {
+func (sm *SecurityManager) ipInTrustedNetwork(addr netip.Addr) bool {
+	for _, prefix := range sm.trustedNetworks {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}
@@ -1022,7 +1022,8 @@ func (sm *SecurityManager) processBatchWhitelist(batch []WhitelistRequest) {
 
 	sm.mu.Lock()
 	for _, req := range batch {
-		if net.ParseIP(req.IP) == nil {
+		_, parseErr := netip.ParseAddr(req.IP)
+		if parseErr != nil {
 			if req.Response != nil {
 				req.Response <- fmt.Errorf("%w: %s", ErrInvalidIP, req.IP)
 			}
@@ -1123,8 +1124,8 @@ func (sm *SecurityManager) processBatchFailedAttempts(batch []FailedAttemptReque
 			continue
 		}
 
-		ip := net.ParseIP(req.IP)
-		if ip == nil || sm.ipInTrustedNetwork(ip) {
+		addr, err := netip.ParseAddr(req.IP)
+		if err != nil || sm.ipInTrustedNetwork(addr) {
 			continue
 		}
 
@@ -1222,8 +1223,8 @@ func (sm *SecurityManager) processBatchWrongStates(batch []WrongStateRequest) {
 			continue
 		}
 
-		ip := net.ParseIP(req.IP)
-		if ip == nil || sm.ipInTrustedNetwork(ip) {
+		addr, err := netip.ParseAddr(req.IP)
+		if err != nil || sm.ipInTrustedNetwork(addr) {
 			continue
 		}
 
@@ -1315,8 +1316,8 @@ func (sm *SecurityManager) ipListStatus(ipStr string) (bool, bool) {
 		return false, false
 	}
 
-	ip := net.ParseIP(ipStr)
-	if ip != nil && sm.ipInTrustedNetwork(ip) {
+	addr, err := netip.ParseAddr(ipStr)
+	if err == nil && sm.ipInTrustedNetwork(addr) {
 		return true, false
 	}
 

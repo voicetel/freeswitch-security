@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
+	"net/netip"
 	"runtime"
 	"strconv"
 	"strings"
@@ -58,9 +58,13 @@ type ESLManager struct {
 		EventsDropped      atomic.Int64
 	}
 
-	// Worker pool.
-	eventQueue  chan *eventsocket.Event
-	workerCount int
+	// Worker pool. Each worker drains its own queue; the reader round-robins
+	// events across them so receivers never contend on a single channel lock
+	// (the shared-queue chanrecv/lock-spin was the top realistic-pipeline cost).
+	workerQueues []chan *eventsocket.Event
+	queueSize    int
+	dispatchNext atomic.Uint32
+	workerCount  int
 
 	eventPool *EventPool
 
@@ -90,6 +94,7 @@ type EventWorker struct {
 	id      int
 	manager *ESLManager
 	logger  *Logger
+	queue   chan *eventsocket.Event
 }
 
 // ProcessedEvent is a reusable event object held by EventPool.
@@ -230,7 +235,7 @@ func InitESLManager(sm *SecurityManager) *ESLManager {
 			eslConfig:       ec,
 			eslDisconnected: make(chan bool, 1),
 			rateManager:     NewRateManager(sm),
-			eventQueue:      make(chan *eventsocket.Event, eslEventQueueSize),
+			queueSize:       eslEventQueueSize,
 			workerCount:     workerCount,
 			eventPool:       NewEventPool(),
 			ctx:             ctx,
@@ -265,7 +270,7 @@ func GetESLManager() *ESLManager {
 func (w *EventWorker) run() {
 	defer w.manager.workersWg.Done()
 
-	for ev := range w.manager.eventQueue {
+	for ev := range w.queue {
 		w.processEventWithPool(ev)
 		w.manager.statistics.EventsProcessed.Add(1)
 	}
@@ -360,7 +365,11 @@ func (w *EventWorker) extractChannelCreateData(ev *eventsocket.Event, pe *Proces
 }
 
 // validIP reports whether s parses as a real IP (not a hostname).
-func validIP(s string) bool { return net.ParseIP(s) != nil }
+func validIP(s string) bool {
+	_, err := netip.ParseAddr(s)
+
+	return err == nil
+}
 
 func (w *EventWorker) handleSuccessfulRegistration(pe *ProcessedEvent) {
 	// The Debug guard avoids the variadic-arg slice allocation when debug is off.
@@ -546,9 +555,9 @@ func (em *ESLManager) Shutdown() {
 	}
 
 	// Readers (connection loop + event reader) are the only queue senders;
-	// they must exit before the queue closes, then the workers drain it.
+	// they must exit before the queues close, then the workers drain them.
 	em.readersWg.Wait()
-	close(em.eventQueue)
+	em.closeWorkerQueues()
 	em.workersWg.Wait()
 
 	logger.Info("ESL manager shutdown complete")
@@ -582,8 +591,8 @@ func (em *ESLManager) GetESLStats() map[string]any {
 		"events_dropped":      em.statistics.EventsDropped.Load(),
 		"log_level":           em.eslConfig.LogLevel,
 		"worker_count":        em.workerCount,
-		"queue_length":        len(em.eventQueue),
-		"queue_capacity":      cap(em.eventQueue),
+		"queue_length":        em.queueLen(),
+		"queue_capacity":      em.queueCap(),
 	}
 }
 
@@ -650,14 +659,79 @@ func (em *ESLManager) SendCommand(command string) (string, error) {
 // startWorkerPool starts the event-processing workers.
 func (em *ESLManager) startWorkerPool() {
 	logger := GetLogger()
+
+	// Spread the total queue capacity across the per-worker queues so the
+	// aggregate buffer matches the old single-queue size.
+	per := 1
+	if em.workerCount > 0 {
+		per = max(1, em.queueSize/em.workerCount)
+	}
+
+	em.workerQueues = make([]chan *eventsocket.Event, em.workerCount)
+
 	for i := range em.workerCount {
-		w := &EventWorker{id: i + 1, manager: em, logger: logger}
+		queue := make(chan *eventsocket.Event, per)
+		em.workerQueues[i] = queue
+		w := &EventWorker{id: i + 1, manager: em, logger: logger, queue: queue}
 		em.workersWg.Add(1)
 
 		go w.run()
 
 		logger.Info("Started event worker #%d", w.id)
 	}
+}
+
+// dispatchEvent hands an event to a worker queue round-robin. The send is
+// non-blocking: a full target queue (or no workers) drops the event and counts
+// it, which is the right back-pressure policy under an attack-rate event flood.
+func (em *ESLManager) dispatchEvent(ev *eventsocket.Event) {
+	em.statistics.EventsQueued.Add(1)
+
+	count := len(em.workerQueues)
+	if count == 0 {
+		em.statistics.EventsDropped.Add(1)
+
+		return
+	}
+
+	// A uint32 round-robin counter: int(uint32) cannot overflow on 64-bit,
+	// and wrapping at 2^32 is harmless for round-robin dispatch.
+	idx := int(em.dispatchNext.Add(1)-1) % count
+
+	select {
+	case em.workerQueues[idx] <- ev:
+	default:
+		em.statistics.EventsDropped.Add(1)
+		GetLogger().Error("Worker queue %d full, dropping event", idx)
+	}
+}
+
+// closeWorkerQueues closes every worker queue, ending the worker range loops.
+// Call only after all senders (the event reader) have stopped.
+func (em *ESLManager) closeWorkerQueues() {
+	for _, queue := range em.workerQueues {
+		close(queue)
+	}
+}
+
+// queueLen reports the total events buffered across all worker queues.
+func (em *ESLManager) queueLen() int {
+	total := 0
+	for _, queue := range em.workerQueues {
+		total += len(queue)
+	}
+
+	return total
+}
+
+// queueCap reports the aggregate worker-queue capacity.
+func (em *ESLManager) queueCap() int {
+	total := 0
+	for _, queue := range em.workerQueues {
+		total += cap(queue)
+	}
+
+	return total
 }
 
 // reconnectBaseBackoff parses the configured reconnect backoff, falling back
@@ -839,16 +913,7 @@ func (em *ESLManager) readEvents(client *eventsocket.Connection) {
 			return
 		}
 
-		em.statistics.EventsQueued.Add(1)
-
-		select {
-		case em.eventQueue <- ev:
-		case <-em.ctx.Done():
-			return
-		default:
-			em.statistics.EventsDropped.Add(1)
-			logger.Error("Event queue full, dropping event")
-		}
+		em.dispatchEvent(ev)
 	}
 }
 

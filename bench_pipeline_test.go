@@ -119,7 +119,7 @@ func BenchmarkEventPipeline_RealisticMix(b *testing.B) {
 	em := &ESLManager{
 		securityManager: sm,
 		rateManager:     rm,
-		eventQueue:      make(chan *eventsocket.Event, eslEventQueueSize),
+		queueSize:       eslEventQueueSize,
 		workerCount:     pipelineWorkers,
 		eventPool:       NewEventPool(),
 		ctx:             ctx,
@@ -129,7 +129,7 @@ func BenchmarkEventPipeline_RealisticMix(b *testing.B) {
 	em.startWorkerPool()
 	b.Cleanup(func() {
 		cancel()
-		close(em.eventQueue)
+		em.closeWorkerQueues()
 		em.workersWg.Wait()
 	})
 
@@ -140,7 +140,7 @@ func BenchmarkEventPipeline_RealisticMix(b *testing.B) {
 	b.ResetTimer()
 
 	for i := range b.N {
-		em.eventQueue <- events[i%pipelineEventVariety]
+		em.workerQueues[i%len(em.workerQueues)] <- events[i%pipelineEventVariety]
 	}
 
 	// Throughput includes the drain: the pipeline is done when the workers

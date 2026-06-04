@@ -128,7 +128,7 @@ All log messages follow a consistent, parseable format:
 
 **Example Messages:**
 ```log
-[ESL INFO] Security manager initialized with dynamic channel sizing
+[ESL INFO] Security manager initialized
 [ESL INFO] Successfully connected to FreeSWITCH ESL in 25.3ms
 [ESL INFO] Auto-blocking IP 203.0.113.25 - Exceeded max failed registrations (5)
 [ESL INFO] Resized failed attempt channel from 5000 to 10000 (high load detected)

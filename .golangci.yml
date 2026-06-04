@@ -1,0 +1,131 @@
+version: "2"
+linters:
+  default: all
+  settings:
+    cyclop:
+      max-complexity: 20
+    depguard:
+      rules:
+        Main:
+          allow:
+            - $gostd
+            - github.com/voicetel/freeswitch-security
+            - github.com/allegro/bigcache/v3
+            - github.com/fiorix/go-eventsocket/eventsocket
+            - github.com/gin-gonic/gin
+    exhaustruct:
+      include:
+        - github.com/voicetel/freeswitch-security\.effective.*Config$
+    funlen:
+      lines: 120
+      statements: 60
+    gocognit:
+      min-complexity: 30
+    gocyclo:
+      min-complexity: 20
+    lll:
+      line-length: 140
+    mnd:
+      ignored-numbers:
+        - "0"
+        - "1"
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "10"
+        - "20"
+        - "30"
+        - "50"
+        - "60"
+        - "100"
+        - "200"
+        - "400"
+        - "500"
+        - "504"
+        - "1000"
+        - "1024"
+      ignored-functions:
+        - time.*
+        - strconv.*
+        - make
+        - context.WithTimeout
+        - context.WithDeadline
+        - http.StatusText
+    nestif:
+      min-complexity: 6
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+          disabled: true
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+    varnamelen:
+      min-name-length: 2
+      ignore-names:
+        - id
+        - ip
+        - ok
+        - mu
+        - wg
+        - ev
+        - bc
+        - cs
+        - ms
+        - rp
+        - rl
+        - cr
+        - cf
+        - dn
+        - nm
+      ignore-decls:
+        - tb testing.TB
+        - t testing.T
+        - b testing.B
+        - c *gin.Context
+        - i int
+        - n int
+        - w *EventWorker
+        - sm *SecurityManager
+        - em *ESLManager
+        - rm *RateManager
+        - cm *CacheManager
+        - rp *RequestProcessor
+        - pe *ProcessedEvent
+        - rc *RateCounter
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - goprintffuncname
+        path: logging\.go
+      - linters:
+          - gochecknoglobals
+        text: (securityManager|cacheManager|eslManager|globalLogger|requestProcessor|httpServer|backoffMultipliers|config|secManagerOnce|cacheManagerOnce|eslManagerOnce|globalLoggerOnce|processorOnce|configOnce|execCommand|sinkBool|sinkString|sinkStrings|sinkDuration|fakeExecMu|fakeExecBehaviors) is a global variable
+      - linters:
+          - containedctx
+        text: found a struct that contains a context\.Context field
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

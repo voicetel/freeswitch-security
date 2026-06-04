@@ -1,5 +1,10 @@
 # FreeSWITCH Security
 
+[![CI](https://github.com/voicetel/freeswitch-security/actions/workflows/ci.yml/badge.svg)](https://github.com/voicetel/freeswitch-security/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/voicetel/freeswitch-security)](https://goreportcard.com/report/github.com/voicetel/freeswitch-security)
+[![Go Reference](https://pkg.go.dev/badge/github.com/voicetel/freeswitch-security.svg)](https://pkg.go.dev/github.com/voicetel/freeswitch-security)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A high-performance security application for FreeSWITCH that provides comprehensive protection against VoIP attacks through real-time event monitoring, intelligent rate limiting, and dynamic threat response. Built with Go for maximum performance and scalability.
 
 ## 🚀 Features
@@ -10,12 +15,12 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 - **Failed Registration Tracking**: Multi-layered detection of authentication attacks
 - **Wrong Call State Detection**: Identify toll fraud and system abuse attempts
 - **Untrusted Network Filtering**: Pattern-based blocking of known malicious domains
-- **Dynamic Channel Management**: Self-adjusting queue sizes based on load patterns
+- **Bounded Work Queues**: Generously sized fixed buffers with non-blocking enqueue and drop accounting
 
 ### High-Performance Architecture
 - **Channel-Based Processing**: Asynchronous event handling with worker pools
 - **Memory Pool Management**: Efficient object reuse to minimize garbage collection
-- **Dynamic Channel Resizing**: Automatic scaling of internal buffers based on load
+- **Sharded Rate Counters**: Per-IP counters across 16 lock shards eliminate contention under multi-source load
 - **Batch Operations**: Optimized batch processing for IPTables and cache operations
 - **Thread-Safe Operations**: Concurrent access support with fine-grained locking
 
@@ -23,7 +28,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 - **Multi-Worker Event Processing**: Configurable worker pools for high-throughput event handling
 - **Automatic Reconnection**: Exponential backoff with connection resilience
 - **Memory-Optimized Event Handling**: Object pooling for zero-allocation event processing
-- **Dynamic Queue Management**: Self-adjusting event queues to handle traffic spikes
+- **Lock-Free Hot Paths**: Atomic statistics and in-place whitelist refresh keep workers from blocking
 - **Comprehensive Event Support**: Registration, call creation, and security events
 - **Secure Command Interface**: Whitelist-based command execution with audit logging
 
@@ -46,13 +51,16 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 ```
 ├── main.go              # Application entry point and graceful shutdown
 ├── config.go            # Configuration management with environment variable support
-├── cache.go             # High-performance caching with channel-based operations
-├── security.go          # Core security engine with dynamic channel management
+├── cache.go             # High-performance caching backed by BigCache
+├── security.go          # Core security engine: lists, batching, iptables
 ├── esl.go               # Event Socket Layer integration with worker pools
-├── rate.go              # Intelligent rate limiting with automatic cleanup
+├── rate.go              # Sharded per-IP rate limiting with automatic cleanup
 ├── routes.go            # REST API with request processing pipeline
 ├── logging.go           # Centralized logging system with configurable levels
-├── config.json          # Application configuration file
+├── pprof.go             # Optional loopback-only pprof diagnostics server
+├── Makefile             # Build, test, lint, coverage, and benchmark targets
+├── *_test.go            # Hermetic test suite (no FreeSWITCH or iptables needed)
+├── config.json.example  # Annotated configuration example
 ├── README.md            # This comprehensive documentation
 ├── logging.md           # Detailed logging system documentation
 ├── iptables.md          # IPTables integration and security guide
@@ -61,12 +69,18 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 
 ## ⚡ Performance Characteristics
 
-- **Event Processing**: 10,000+ events/second with sub-millisecond latency
-- **Memory Efficiency**: Object pooling reduces GC pressure by 90%+
-- **Dynamic Scaling**: Automatic queue resizing handles 10x traffic spikes
-- **Cache Performance**: Sub-microsecond lookups with 99%+ hit rates
-- **IPTables Integration**: Batch operations reduce system call overhead
-- **Worker Pool**: Auto-scaling based on CPU cores (2-8 workers)
+Benchmarked with the in-repo suite (`make bench`, statistically validated
+with `benchstat`); figures from a 12th-gen mobile CPU:
+
+- **Event Pipeline**: ~350 ns/event end-to-end (queue → worker → rate +
+  security checks) at 4 workers — millions of events/second of headroom
+- **Registration Hot Path**: ~230 ns with auto-whitelist enabled, zero
+  allocations (in-place whitelist refresh, atomic statistics)
+- **Rate Checks**: ~45–95 ns serial; counters sharded across 16 locks for
+  contention-free multi-source traffic
+- **Memory Efficiency**: pooled event objects, 3 allocs/event in steady state
+- **IPTables Integration**: batch operations reduce fork/exec overhead
+- **Worker Pool**: sized from CPU count (2–8 workers)
 
 ## 🛠 Installation
 
@@ -83,25 +97,24 @@ A high-performance security application for FreeSWITCH that provides comprehensi
    ```bash
    git clone https://github.com/voicetel/freeswitch-security.git
    cd freeswitch-security
-   go mod tidy
-   go build -o freeswitch-security .
+   make build    # static, stripped binary in bin/
    ```
 
 2. **Configure Application**:
    ```bash
    # The application creates a default config.json on first run
-   ./freeswitch-security
+   ./bin/freeswitch-security
    # Edit config.json with your settings, then restart
    ```
 
 3. **Set Permissions** (for IPTables integration):
    ```bash
    # Option 1: Run as root
-   sudo ./freeswitch-security
+   sudo ./bin/freeswitch-security
 
    # Option 2: Grant CAP_NET_ADMIN capability
-   sudo setcap cap_net_admin=+ep ./freeswitch-security
-   ./freeswitch-security
+   sudo setcap cap_net_admin=+ep ./bin/freeswitch-security
+   ./bin/freeswitch-security
    ```
 
 ## ⚙️ Configuration
@@ -211,6 +224,22 @@ and `BenchmarkRegistrationAutoWhitelist`, a canary guarding the registration
 hot path (~230 ns; it regresses to ~100 ms if a blocking whitelist call is
 ever reintroduced). Validate changes with `benchstat` over `-count=10` runs.
 
+## 🧪 Development & Testing
+
+```bash
+make build      # static, stripped binary in bin/
+make test       # race-enabled test suite
+make coverage   # coverage report (currently ~98% of statements)
+make quality    # format check + vet + lint + race tests with coverage
+make bench      # benchmark suite (-count=10, benchstat-ready)
+make lint       # golangci-lint with the repo configuration
+```
+
+The test suite is fully **hermetic**: an in-process FreeSWITCH ESL server
+and a faked iptables layer mean tests never touch a real FreeSWITCH, never
+modify host firewall state, and need no special privileges. CI runs the
+same chain on every push and pull request.
+
 ## 🔧 FreeSWITCH Configuration
 
 ### Enable Event Socket Module
@@ -245,7 +274,6 @@ ever reintroduced). Validate changes with `benchstat` over `-count=10` runs.
 | `GET` | `/system/stats` | System resource usage |
 | `GET` | `/security/status` | Security system overview |
 | `GET` | `/security/stats` | Detailed security statistics |
-| `GET` | `/security/channels` | Dynamic channel statistics |
 
 ### Security Management
 
@@ -397,9 +425,6 @@ The application uses **DROP** instead of **REJECT** for superior security:
 # Check system performance
 GET /system/stats
 
-# Monitor channel dynamics
-GET /security/channels
-
 # Cache performance metrics
 GET /cache/stats
 
@@ -443,30 +468,24 @@ export SECURITY_ESL_LOG_LEVEL=debug
 
 # Monitor resource usage
 watch -n 1 'curl -s http://localhost:8080/system/stats | jq'
-
-# Check queue health
-curl http://localhost:8080/security/channels | jq '.current_queue_lengths'
 ```
 
 ## 🚀 Advanced Features
 
-### Dynamic Channel Management
+### Bounded Queue Design
 
-The application automatically adjusts internal buffer sizes based on load:
-
-- **High Load Detection**: Increases buffer sizes when >70% utilized
-- **Low Load Optimization**: Reduces memory usage when <30% utilized
-- **Gradual Scaling**: Prevents thrashing with hysteresis
-- **Statistics Tracking**: Comprehensive metrics for tuning
+Internal queues use generously sized fixed buffers with non-blocking
+enqueue. Overflow drops are counted and reported through the stats
+endpoints rather than blocking event readers — predictable behavior under
+attack-level load, with no resize races.
 
 ### Memory Pool Optimization
 
-Event processing uses object pools for zero-allocation performance:
+Event processing uses object pools for low-allocation performance:
 
-- **Pre-allocated Objects**: Reusable event structures
-- **Garbage Collection Reduction**: 90%+ reduction in GC pressure
-- **Memory Efficiency**: Predictable memory usage patterns
-- **High Throughput**: Sustained 10,000+ events/second processing
+- **Pre-allocated Objects**: Reusable event structures via `sync.Pool`
+- **Steady State**: 3 allocations per event through the full pipeline
+- **Predictable Memory**: fixed-capacity queues bound worst-case usage
 
 ### Batch Processing
 

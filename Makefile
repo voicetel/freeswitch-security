@@ -10,7 +10,8 @@
 # ---------------------------------------------------------------------------
 
 GO      ?= go
-BINARY  := freeswitch-security
+BIN_DIR := bin
+BINARY  := $(BIN_DIR)/freeswitch-security
 
 GOFLAGS ?= -buildvcs=false -trimpath
 LDFLAGS := -ldflags "-s -w"
@@ -26,13 +27,15 @@ export CGO_ENABLED := 0
 .PHONY: build run clean fmt vet lint test coverage quality bench
 
 build:
+	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY) .
 
 run: build
 	./$(BINARY)
 
 clean:
-	rm -f $(BINARY) $(BINARY).test coverage.out coverage.html
+	rm -rf $(BIN_DIR) coverage.out coverage.html
+	rm -f freeswitch-security freeswitch-security.test
 
 fmt:
 	gofmt -w .

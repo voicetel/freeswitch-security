@@ -26,7 +26,8 @@ go.sum
 # env file
 .env
 
-# bin as per instructions
+# build output
+bin/
 freeswitch-security
 
 # config file

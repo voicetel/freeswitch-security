@@ -7,13 +7,27 @@ import (
 	"time"
 )
 
-// RateManager handles rate-limiting for calls and registrations.
-type RateManager struct {
-	securityManager *SecurityManager
+// rateShardCount is the number of counter shards. Power of two so the shard
+// selector reduces to a mask. Sixteen shards removes essentially all of the
+// mutex contention the profiler attributes to a single counter lock while
+// keeping the per-manager footprint trivial.
+const rateShardCount = 16
 
+// rateShard holds one slice of the per-IP counters under its own lock.
+type rateShard struct {
 	mu        sync.Mutex
 	callRates map[string]*RateCounter
 	regRates  map[string]*RateCounter
+}
+
+// RateManager handles rate-limiting for calls and registrations.
+//
+// Counters are sharded by IP: the mutex profile showed the previous single
+// lock serializing every CheckCallRate/CheckRegistrationRate caller.
+type RateManager struct {
+	securityManager *SecurityManager
+
+	shards [rateShardCount]rateShard
 
 	cfg effectiveRateConfig
 
@@ -21,6 +35,10 @@ type RateManager struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
+
+// shardMixPrime spreads the two tail bytes across shards; any small odd
+// prime works.
+const shardMixPrime = 31
 
 // RateLimitConfig holds rate-limiting configuration (JSON shape).
 type RateLimitConfig struct {
@@ -80,23 +98,34 @@ func NewRateManager(sm *SecurityManager) *RateManager {
 		CleanupInterval:   parseDurationOr(rl.CleanupInterval, 5*time.Minute),
 	}
 
+	rm := newRateManagerWithConfig(sm, eff)
+
+	logger.Info("Rate limiting initialized — enabled=%t calls=%d/%s regs=%d/%s",
+		eff.Enabled, eff.CallRateLimit, eff.CallRateInterval, eff.RegistrationLimit, eff.RegWindow)
+
+	return rm
+}
+
+// newRateManagerWithConfig builds a rate manager from an already-validated
+// config. The cleanup loop is started only when rate limiting is enabled.
+func newRateManagerWithConfig(sm *SecurityManager, eff effectiveRateConfig) *RateManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	rm := &RateManager{
 		securityManager: sm,
-		callRates:       make(map[string]*RateCounter),
-		regRates:        make(map[string]*RateCounter),
 		cfg:             eff,
 		ctx:             ctx,
 		cancel:          cancel,
+	}
+
+	for i := range rm.shards {
+		rm.shards[i].callRates = make(map[string]*RateCounter)
+		rm.shards[i].regRates = make(map[string]*RateCounter)
 	}
 
 	if eff.Enabled {
 		rm.wg.Add(1)
 		go rm.cleanupLoop()
 	}
-
-	logger.Info("Rate limiting initialized — enabled=%t calls=%d/%s regs=%d/%s",
-		eff.Enabled, eff.CallRateLimit, eff.CallRateInterval, eff.RegistrationLimit, eff.RegWindow)
 
 	return rm
 }
@@ -117,6 +146,105 @@ func (rm *RateManager) CheckCallRate(ip, userID, domain string) bool {
 // CheckRegistrationRate reports whether the IP is permitted to register again.
 func (rm *RateManager) CheckRegistrationRate(ip, userID, domain string) bool {
 	return rm.checkRate(ip, userID, domain, false)
+}
+
+// GetCallRates returns a snapshot of current per-IP call counters.
+func (rm *RateManager) GetCallRates() map[string]RateCounter {
+	out := make(map[string]RateCounter)
+
+	for i := range rm.shards {
+		shard := &rm.shards[i]
+
+		shard.mu.Lock()
+		for ip, rc := range shard.callRates {
+			out[ip] = *rc
+		}
+		shard.mu.Unlock()
+	}
+
+	return out
+}
+
+// GetRegistrationRates returns a snapshot of current per-IP registration counters.
+func (rm *RateManager) GetRegistrationRates() map[string]RateCounter {
+	out := make(map[string]RateCounter)
+
+	for i := range rm.shards {
+		shard := &rm.shards[i]
+
+		shard.mu.Lock()
+		for ip, rc := range shard.regRates {
+			out[ip] = *rc
+		}
+		shard.mu.Unlock()
+	}
+
+	return out
+}
+
+// CleanupNow runs a single cleanup pass synchronously. Exposed for tests.
+// Returns (removedCalls, removedRegs).
+func (rm *RateManager) CleanupNow() (int, int) {
+	now := time.Now()
+
+	var removedCalls, removedRegs int
+
+	for i := range rm.shards {
+		shard := &rm.shards[i]
+
+		shard.mu.Lock()
+
+		for ip, rc := range shard.callRates {
+			if now.Sub(rc.FirstRequest) > rm.cfg.CallRateInterval {
+				delete(shard.callRates, ip)
+
+				removedCalls++
+			}
+		}
+
+		for ip, rc := range shard.regRates {
+			if now.Sub(rc.FirstRequest) > rm.cfg.RegWindow {
+				delete(shard.regRates, ip)
+
+				removedRegs++
+			}
+		}
+
+		shard.mu.Unlock()
+	}
+
+	return removedCalls, removedRegs
+}
+
+// RateLimitConfigView returns a snapshot of the rate config used by routes.
+func (rm *RateManager) RateLimitConfigView() map[string]any {
+	return map[string]any{
+		keyEnabled:             rm.cfg.Enabled,
+		"call_rate_limit":      rm.cfg.CallRateLimit,
+		"call_rate_interval":   rm.cfg.CallRateInterval.String(),
+		"registration_limit":   rm.cfg.RegistrationLimit,
+		"registration_window":  rm.cfg.RegWindow.String(),
+		"auto_block_on_exceed": rm.cfg.AutoBlockOnExceed,
+		"block_duration":       rm.cfg.BlockDuration.String(),
+		"whitelist_bypass":     rm.cfg.WhitelistBypass,
+		"cleanup_interval":     rm.cfg.CleanupInterval.String(),
+	}
+}
+
+// shardFor picks the shard for an IP. The tail bytes are the highest-entropy
+// part of dotted-quad addresses; a full hash is unnecessary for contention
+// spreading and would tax the serial fast path.
+func (rm *RateManager) shardFor(ip string) *rateShard {
+	if ip == "" {
+		return &rm.shards[0]
+	}
+
+	h := uint(ip[len(ip)-1])
+	if len(ip) > 1 {
+		h = h*shardMixPrime + uint(ip[len(ip)-2])
+	}
+
+	return &rm.shards[h%rateShardCount]
 }
 
 // checkRate is the shared implementation for call and registration rate checks.
@@ -141,27 +269,30 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 	}
 
 	var (
-		bucket   map[string]*RateCounter
 		window   time.Duration
 		limit    int
 		bucketID string
 	)
 
 	if isCall {
-		bucket = rm.callRates
 		window = rm.cfg.CallRateInterval
 		limit = rm.cfg.CallRateLimit
 		bucketID = "call"
 	} else {
-		bucket = rm.regRates
 		window = rm.cfg.RegWindow
 		limit = rm.cfg.RegistrationLimit
 		bucketID = "registration"
 	}
 
 	now := time.Now()
+	shard := rm.shardFor(ip)
 
-	rm.mu.Lock()
+	shard.mu.Lock()
+
+	bucket := shard.callRates
+	if !isCall {
+		bucket = shard.regRates
+	}
 
 	rc, ok := bucket[ip]
 	if !ok || now.Sub(rc.FirstRequest) > window {
@@ -172,7 +303,7 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 			UserIDs:      appendUnique(nil, userID),
 			Domains:      appendUnique(nil, domain),
 		}
-		rm.mu.Unlock()
+		shard.mu.Unlock()
 
 		return true
 	}
@@ -183,7 +314,7 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 	rc.Domains = appendUnique(rc.Domains, domain)
 	exceeded := rc.Count > limit
 	currentCount := rc.Count
-	rm.mu.Unlock()
+	shard.mu.Unlock()
 
 	if !exceeded {
 		return true
@@ -197,61 +328,6 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 	}
 
 	return false
-}
-
-// GetCallRates returns a snapshot of current per-IP call counters.
-func (rm *RateManager) GetCallRates() map[string]RateCounter {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	out := make(map[string]RateCounter, len(rm.callRates))
-	for ip, rc := range rm.callRates {
-		out[ip] = *rc
-	}
-
-	return out
-}
-
-// GetRegistrationRates returns a snapshot of current per-IP registration counters.
-func (rm *RateManager) GetRegistrationRates() map[string]RateCounter {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	out := make(map[string]RateCounter, len(rm.regRates))
-	for ip, rc := range rm.regRates {
-		out[ip] = *rc
-	}
-
-	return out
-}
-
-// CleanupNow runs a single cleanup pass synchronously. Exposed for tests.
-// Returns (removedCalls, removedRegs).
-func (rm *RateManager) CleanupNow() (int, int) {
-	now := time.Now()
-
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	var removedCalls, removedRegs int
-
-	for ip, rc := range rm.callRates {
-		if now.Sub(rc.FirstRequest) > rm.cfg.CallRateInterval {
-			delete(rm.callRates, ip)
-
-			removedCalls++
-		}
-	}
-
-	for ip, rc := range rm.regRates {
-		if now.Sub(rc.FirstRequest) > rm.cfg.RegWindow {
-			delete(rm.regRates, ip)
-
-			removedRegs++
-		}
-	}
-
-	return removedCalls, removedRegs
 }
 
 func (rm *RateManager) cleanupLoop() {
@@ -272,20 +348,5 @@ func (rm *RateManager) cleanupLoop() {
 			c, r := rm.CleanupNow()
 			logger.Debug("Rate cleanup: removed %d call rates, %d registration rates", c, r)
 		}
-	}
-}
-
-// RateLimitConfigView returns a snapshot of the rate config used by routes.
-func (rm *RateManager) RateLimitConfigView() map[string]interface{} {
-	return map[string]interface{}{
-		"enabled":              rm.cfg.Enabled,
-		"call_rate_limit":      rm.cfg.CallRateLimit,
-		"call_rate_interval":   rm.cfg.CallRateInterval.String(),
-		"registration_limit":   rm.cfg.RegistrationLimit,
-		"registration_window":  rm.cfg.RegWindow.String(),
-		"auto_block_on_exceed": rm.cfg.AutoBlockOnExceed,
-		"block_duration":       rm.cfg.BlockDuration.String(),
-		"whitelist_bypass":     rm.cfg.WhitelistBypass,
-		"cleanup_interval":     rm.cfg.CleanupInterval.String(),
 	}
 }

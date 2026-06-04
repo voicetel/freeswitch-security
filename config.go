@@ -17,6 +17,8 @@ type AppConfig struct {
 		Port         string `json:"port"`
 		LogRequests  bool   `json:"log_requests"`
 		LogResponses bool   `json:"log_responses"`
+		PprofEnabled bool   `json:"pprof_enabled"`
+		PprofAddr    string `json:"pprof_addr"`
 	} `json:"server"`
 	FreeSWITCH struct {
 		DefaultDomain string `json:"default_domain"`
@@ -73,115 +75,133 @@ var (
 	configOnce sync.Once
 )
 
+// defaultConfig returns an AppConfig populated with all defaults.
+func defaultConfig() *AppConfig {
+	cfg := &AppConfig{}
+
+	// Server defaults
+	cfg.Server.Host = "127.0.0.1"
+	cfg.Server.Port = "8088"
+	cfg.Server.LogRequests = true
+	cfg.Server.LogResponses = false
+	cfg.Server.PprofEnabled = false
+	cfg.Server.PprofAddr = defaultPprofAddr
+
+	// FreeSWITCH defaults
+	cfg.FreeSWITCH.DefaultDomain = defaultFreeSWITCHDomain
+
+	// Cache defaults
+	cfg.Cache.Enabled = true
+	cfg.Cache.SecurityTTL = "5m"         // 5 minutes for security cache
+	cfg.Cache.CleanupInterval = "5m"     // 5 minutes cleanup
+	cfg.Cache.MaxEntriesInWindow = 10000 // Maximum items in cache window
+	cfg.Cache.MaxEntrySize = 500         // Maximum entry size in KB
+	cfg.Cache.ShardCount = 1024          // Number of shards in BigCache
+
+	// Security defaults
+	cfg.Security.Enabled = true
+	cfg.Security.ESLHost = "127.0.0.1"
+	cfg.Security.ESLPort = "8021"
+	cfg.Security.ESLPassword = "ClueCon"
+	// Default allowed ESL commands (common, safe commands)
+	cfg.Security.ESLAllowedCommands = []string{
+		"status",
+		"uptime",
+		"version",
+	}
+	cfg.Security.MaxFailedAttempts = 5
+	cfg.Security.FailedAttemptsWindow = "10m"
+	cfg.Security.AutoBlockEnabled = true
+	cfg.Security.BlockDuration = "1h"
+	cfg.Security.WhitelistEnabled = true
+	cfg.Security.WhitelistTTL = "24h"
+	cfg.Security.TrustedNetworks = []string{
+		"127.0.0.1/8",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+	}
+	cfg.Security.UntrustedNetworks = []string{}
+	cfg.Security.IPTablesChain = "FREESWITCH"
+	cfg.Security.AutoWhitelistOnSuccess = true
+	cfg.Security.ESLLogLevel = logLevelInfoStr
+	cfg.Security.ReconnectBackoff = "5s"
+	cfg.Security.MaxWrongCallStates = 5
+	cfg.Security.WrongCallStateWindow = "10m"
+
+	// Rate Limit defaults - centralized here
+	cfg.Security.RateLimit.Enabled = true
+	cfg.Security.RateLimit.CallRateLimit = 20
+	cfg.Security.RateLimit.CallRateInterval = "1m"
+	cfg.Security.RateLimit.RegistrationLimit = 10
+	cfg.Security.RateLimit.RegistrationWindow = "1m"
+	cfg.Security.RateLimit.AutoBlockOnExceed = true
+	cfg.Security.RateLimit.BlockDuration = "15m"
+	cfg.Security.RateLimit.WhitelistBypass = true
+	cfg.Security.RateLimit.CleanupInterval = "5m"
+
+	return cfg
+}
+
+// buildConfig constructs the configuration: defaults, then overrides from the
+// file at path (creating a default config file when none exists), then
+// environment-variable overrides. On error it returns the partially populated
+// config alongside the error, mirroring the legacy LoadConfig behavior of
+// leaving defaults in place when the file cannot be used.
+func buildConfig(path string) (*AppConfig, error) {
+	cfg := defaultConfig()
+
+	// Check if config file exists
+	_, statErr := os.Stat(path)
+	if statErr == nil {
+		file, openErr := os.Open(path)
+		if openErr != nil {
+			log.Printf("Error opening config file: %v", openErr)
+
+			return cfg, fmt.Errorf("opening config file: %w", openErr)
+		}
+		defer file.Close()
+
+		decErr := json.NewDecoder(file).Decode(cfg)
+		if decErr != nil {
+			log.Printf("Error decoding config file: %v", decErr)
+
+			return cfg, fmt.Errorf("decoding config file: %w", decErr)
+		}
+	} else {
+		// Create a default config file
+		file, createErr := os.Create(path)
+		if createErr != nil {
+			log.Printf("Error creating config file: %v", createErr)
+
+			return cfg, fmt.Errorf("creating config file: %w", createErr)
+		}
+		defer file.Close()
+
+		encoder := json.NewEncoder(file)
+		encoder.SetIndent("", "  ")
+
+		encErr := encoder.Encode(cfg)
+		if encErr != nil {
+			log.Printf("Error encoding config file: %v", encErr)
+
+			return cfg, fmt.Errorf("encoding config file: %w", encErr)
+		}
+	}
+
+	// Override with environment variables if set
+	loadEnvironmentVariables(cfg)
+
+	return cfg, nil
+}
+
 // LoadConfig loads configuration from a file. Subsequent calls return the
 // cached instance and a nil error.
 func LoadConfig(path string) (*AppConfig, error) {
 	var loadErr error
 
 	configOnce.Do(func() {
-		config = &AppConfig{}
-
-		// Set defaults
-		// Server defaults
-		config.Server.Host = "127.0.0.1"
-		config.Server.Port = "8088"
-		config.Server.LogRequests = true
-		config.Server.LogResponses = false
-
-		// FreeSWITCH defaults
-		config.FreeSWITCH.DefaultDomain = defaultFreeSWITCHDomain
-
-		// Cache defaults
-		config.Cache.Enabled = true
-		config.Cache.SecurityTTL = "5m"         // 5 minutes for security cache
-		config.Cache.CleanupInterval = "5m"     // 5 minutes cleanup
-		config.Cache.MaxEntriesInWindow = 10000 // Maximum items in cache window
-		config.Cache.MaxEntrySize = 500         // Maximum entry size in KB
-		config.Cache.ShardCount = 1024          // Number of shards in BigCache
-
-		// Security defaults
-		config.Security.Enabled = true
-		config.Security.ESLHost = "127.0.0.1"
-		config.Security.ESLPort = "8021"
-		config.Security.ESLPassword = "ClueCon"
-		// Default allowed ESL commands (common, safe commands)
-		config.Security.ESLAllowedCommands = []string{
-			"status",
-			"uptime",
-			"version",
-		}
-		config.Security.MaxFailedAttempts = 5
-		config.Security.FailedAttemptsWindow = "10m"
-		config.Security.AutoBlockEnabled = true
-		config.Security.BlockDuration = "1h"
-		config.Security.WhitelistEnabled = true
-		config.Security.WhitelistTTL = "24h"
-		config.Security.TrustedNetworks = []string{
-			"127.0.0.1/8",
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-		}
-		config.Security.UntrustedNetworks = []string{}
-		config.Security.IPTablesChain = "FREESWITCH"
-		config.Security.AutoWhitelistOnSuccess = true
-		config.Security.ESLLogLevel = logLevelInfoStr
-		config.Security.ReconnectBackoff = "5s"
-		config.Security.MaxWrongCallStates = 5
-		config.Security.WrongCallStateWindow = "10m"
-
-		// Rate Limit defaults - centralized here
-		config.Security.RateLimit.Enabled = true
-		config.Security.RateLimit.CallRateLimit = 20
-		config.Security.RateLimit.CallRateInterval = "1m"
-		config.Security.RateLimit.RegistrationLimit = 10
-		config.Security.RateLimit.RegistrationWindow = "1m"
-		config.Security.RateLimit.AutoBlockOnExceed = true
-		config.Security.RateLimit.BlockDuration = "15m"
-		config.Security.RateLimit.WhitelistBypass = true
-		config.Security.RateLimit.CleanupInterval = "5m"
-
-		// Check if config file exists
-		if _, statErr := os.Stat(path); statErr == nil {
-			file, openErr := os.Open(path)
-			if openErr != nil {
-				loadErr = fmt.Errorf("opening config file: %w", openErr)
-				log.Printf("Error opening config file: %v", openErr)
-
-				return
-			}
-			defer file.Close()
-
-			if decErr := json.NewDecoder(file).Decode(config); decErr != nil {
-				loadErr = fmt.Errorf("decoding config file: %w", decErr)
-				log.Printf("Error decoding config file: %v", decErr)
-
-				return
-			}
-		} else {
-			// Create a default config file
-			file, createErr := os.Create(path)
-			if createErr != nil {
-				loadErr = fmt.Errorf("creating config file: %w", createErr)
-				log.Printf("Error creating config file: %v", createErr)
-
-				return
-			}
-			defer file.Close()
-
-			encoder := json.NewEncoder(file)
-			encoder.SetIndent("", "  ")
-
-			if encErr := encoder.Encode(config); encErr != nil {
-				loadErr = fmt.Errorf("encoding config file: %w", encErr)
-				log.Printf("Error encoding config file: %v", encErr)
-
-				return
-			}
-		}
-
-		// Override with environment variables if set
-		loadEnvironmentVariables(config)
+		config, loadErr = buildConfig(path)
 	})
 
 	return config, loadErr
@@ -226,10 +246,14 @@ func envString(key string, dst *string) {
 
 // envInt sets *dst to the parsed value of key if the variable parses as an int.
 func envInt(key string, dst *int) {
-	if raw := os.Getenv(key); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			*dst = n
-		}
+	raw := os.Getenv(key)
+	if raw == "" {
+		return
+	}
+
+	n, err := strconv.Atoi(raw)
+	if err == nil {
+		*dst = n
 	}
 }
 
@@ -241,7 +265,9 @@ func envJSONStringSlice(key string, dst *[]string) {
 	}
 
 	var parsed []string
-	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+
+	err := json.Unmarshal([]byte(raw), &parsed)
+	if err == nil {
 		*dst = parsed
 	}
 }
@@ -253,6 +279,8 @@ func loadEnvironmentVariables(config *AppConfig) {
 	envString("SERVER_PORT", &config.Server.Port)
 	envBool("SERVER_LOG_REQUESTS", &config.Server.LogRequests)
 	envBool("SERVER_LOG_RESPONSES", &config.Server.LogResponses)
+	envBool("SERVER_PPROF_ENABLED", &config.Server.PprofEnabled)
+	envString("SERVER_PPROF_ADDR", &config.Server.PprofAddr)
 
 	// FreeSWITCH
 	envString("FS_DEFAULT_DOMAIN", &config.FreeSWITCH.DefaultDomain)

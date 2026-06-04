@@ -1,23 +1,32 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 // TestMain installs gin's TestMode globally before any test runs, suppressing
-// gin's debug banner. Using TestMain rather than init() keeps test setup
-// localized to the testing package's lifecycle.
+// gin's debug banner, and replaces the iptables exec seam with the in-process
+// fake (see exec_fake_test.go) so tests never touch host firewall state.
+// Using TestMain rather than init() keeps test setup localized to the testing
+// package's lifecycle.
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
+
+	execCommand = fakeExecCommand
+
 	os.Exit(m.Run())
 }
 
@@ -61,10 +70,10 @@ func doJSON(tb testing.TB, router http.Handler, method, url, body string) *httpt
 
 	var req *http.Request
 	if reader != nil {
-		req = httptest.NewRequest(method, url, reader)
+		req = httptest.NewRequestWithContext(context.Background(), method, url, reader)
 		req.Header.Set("Content-Type", "application/json")
 	} else {
-		req = httptest.NewRequest(method, url, http.NoBody)
+		req = httptest.NewRequestWithContext(context.Background(), method, url, http.NoBody)
 	}
 
 	rec := httptest.NewRecorder()
@@ -116,7 +125,8 @@ func TestRoute_Whitelist_GetByIP(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)
 
-	if err := sm.AddToWhitelist("203.0.113.8", "bob", "x.example", false); err != nil {
+	err := sm.AddToWhitelist("203.0.113.8", testUserBob, "x.example", false)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,7 +138,9 @@ func TestRoute_Whitelist_GetByIP(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+
+	err = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -136,7 +148,7 @@ func TestRoute_Whitelist_GetByIP(t *testing.T) {
 		t.Errorf("expected whitelisted=true, got %v", resp)
 	}
 
-	if resp["user_id"] != "bob" {
+	if resp["user_id"] != testUserBob {
 		t.Errorf("expected user_id=bob, got %v", resp["user_id"])
 	}
 
@@ -157,7 +169,9 @@ func TestRoute_Whitelist_List(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSecurityManager(t)
-	if err := sm.AddToWhitelist("203.0.113.9", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist("203.0.113.9", "u", "d", false)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -169,7 +183,9 @@ func TestRoute_Whitelist_List(t *testing.T) {
 	}
 
 	var listing map[string]WhitelistEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
+
+	err = json.Unmarshal(rec.Body.Bytes(), &listing)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,7 +198,9 @@ func TestRoute_Whitelist_Delete(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSecurityManager(t)
-	if err := sm.AddToWhitelist("203.0.113.10", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist(testIPSample, "u", "d", false)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,7 +211,7 @@ func TestRoute_Whitelist_Delete(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
 
-	if sm.IsIPWhitelisted("203.0.113.10") {
+	if sm.IsIPWhitelisted(testIPSample) {
 		t.Error("expected IP to be removed from whitelist")
 	}
 }
@@ -266,6 +284,7 @@ func TestRoute_Blacklist_Add_GetCheck_Delete(t *testing.T) {
 	}
 
 	var resp map[string]any
+
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 
 	if resp["blacklisted"] != true {
@@ -314,19 +333,13 @@ func TestRoute_Untrusted_AddListRemove(t *testing.T) {
 	}
 
 	var patterns []string
-	if err := json.Unmarshal(rec.Body.Bytes(), &patterns); err != nil {
+
+	err := json.Unmarshal(rec.Body.Bytes(), &patterns)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	found := false
-
-	for _, p := range patterns {
-		if p == "bad.example" {
-			found = true
-
-			break
-		}
-	}
+	found := slices.Contains(patterns, "bad.example")
 
 	if !found {
 		t.Errorf("listing missing 'bad.example': %v", patterns)
@@ -339,6 +352,7 @@ func TestRoute_Untrusted_AddListRemove(t *testing.T) {
 	}
 
 	var testResp map[string]any
+
 	_ = json.Unmarshal(rec.Body.Bytes(), &testResp)
 
 	if testResp["is_untrusted"] != true {
@@ -379,7 +393,9 @@ func TestRoute_SystemStats(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -397,7 +413,7 @@ func TestRoute_Health(t *testing.T) {
 
 	router := gin.New()
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{testCmdStatus: "ok"})
 	})
 
 	rec := doJSON(t, router, "GET", "/health", "")
@@ -473,7 +489,7 @@ func TestRoute_Whitelist_ConcurrentAdds(t *testing.T) {
 			body := fmt.Sprintf(`{"ip":%q,"user_id":"u","domain":"d"}`, ip)
 
 			for j := 0; j < 10 && ctx.Err() == nil; j++ {
-				req := httptest.NewRequest(http.MethodPost, "/security/whitelist",
+				req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/security/whitelist",
 					strings.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
 
@@ -488,6 +504,560 @@ func TestRoute_Whitelist_ConcurrentAdds(t *testing.T) {
 			}
 		}(i)
 	}
+
+	wg.Wait()
+}
+
+// ----- Request processor -----
+
+// newTestRequestProcessor builds an isolated RequestProcessor (bypassing the
+// singleton) with running workers, torn down via t.Cleanup.
+func newTestRequestProcessor(tb testing.TB, sm *SecurityManager, em *ESLManager) *RequestProcessor {
+	tb.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rp := &RequestProcessor{
+		securityManager: sm,
+		eslManager:      em,
+		statusRequests:  make(chan StatusRequest, 8),
+		commandRequests: make(chan CommandRequest, 8),
+		workerCount:     2,
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+
+	for range rp.workerCount {
+		rp.wg.Add(2)
+
+		go rp.processStatusRequests()
+		go rp.processCommandRequests()
+	}
+
+	tb.Cleanup(rp.Shutdown)
+
+	return rp
+}
+
+func TestRequestProcessor_StatusTypes(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{}
+	rp := newTestRequestProcessor(t, sm, em)
+
+	for _, typ := range []string{statusTypeSecurity, "esl", "whitelist", "blacklist", "failed", "wrong-states"} {
+		respChan := make(chan StatusResponse, 1)
+		rp.statusRequests <- StatusRequest{Type: typ, Response: respChan}
+
+		resp := <-respChan
+		if resp.Error != nil {
+			t.Errorf("status %q: %v", typ, resp.Error)
+		}
+
+		if resp.Data == nil {
+			t.Errorf("status %q: nil data", typ)
+		}
+	}
+
+	// Unknown type returns ErrUnknownStatusType.
+	respChan := make(chan StatusResponse, 1)
+	rp.statusRequests <- StatusRequest{Type: testBogusValue, Response: respChan}
+
+	if resp := <-respChan; !errors.Is(resp.Error, ErrUnknownStatusType) {
+		t.Errorf("expected ErrUnknownStatusType, got %v", resp.Error)
+	}
+}
+
+func TestRequestProcessor_Command_NotConnected(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{} // never connected
+	rp := newTestRequestProcessor(t, sm, em)
+
+	respChan := make(chan CommandResponse, 1)
+	rp.commandRequests <- CommandRequest{Command: testCmdStatus, Response: respChan}
+
+	if resp := <-respChan; !errors.Is(resp.Error, ErrESLNotConnected) {
+		t.Errorf("expected ErrESLNotConnected, got %v", resp.Error)
+	}
+}
+
+// ----- Handlers not covered by the per-group route tests -----
+
+func TestRoute_SecurityStatusHandler(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{eslConfig: ESLConfig{Host: "192.0.2.9", Port: "8021"}}
+
+	router := gin.New()
+	router.GET("/security/status", securityStatusHandler(sm, em))
+
+	rec := doJSON(t, router, "GET", "/security/status", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+
+	var resp map[string]any
+
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp["enabled"] != true || resp["esl_connected"] != false {
+		t.Errorf("unexpected response: %v", resp)
+	}
+
+	if resp["esl_host"] != "192.0.2.9" {
+		t.Errorf("esl_host = %v", resp["esl_host"])
+	}
+}
+
+func TestRoute_SecurityStatsHandler(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	sm.UpdateRegistrationStats("203.0.113.160", "u", "d")
+
+	router := gin.New()
+	router.GET("/security/stats", securityStatsHandler(sm))
+
+	rec := doJSON(t, router, "GET", "/security/stats", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+
+	var stats SecurityStats
+
+	err := json.Unmarshal(rec.Body.Bytes(), &stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if stats.TotalRegistrations != 1 {
+		t.Errorf("TotalRegistrations = %d, want 1", stats.TotalRegistrations)
+	}
+}
+
+func TestRoute_IptablesHandler(t *testing.T) {
+	t.Parallel()
+
+	const chain = "TEST_HTTP_IPTABLES"
+
+	registerIptablesBehavior(t, chain, func(_ []string) (string, int) {
+		return "-N " + chain + "\n", 0
+	})
+
+	sm := newTestSecurityManager(t)
+	sm.cfg.IPTablesChain = chain
+
+	router := gin.New()
+	router.GET("/security/iptables", iptablesHandler(sm))
+
+	rec := doJSON(t, router, "GET", "/security/iptables", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+
+	// Error path: a chain with no registered behavior fails to list.
+	sm.cfg.IPTablesChain = "TEST_HTTP_IPTABLES_MISSING"
+
+	rec = doJSON(t, router, "GET", "/security/iptables", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for failing chain, got %d", rec.Code)
+	}
+}
+
+func TestRoute_RateLimit(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	rm := newTestRateManager(t, sm, defaultTestRateConfig())
+	_ = rm.CheckCallRate("203.0.113.161", "u", "d")
+	_ = rm.CheckRegistrationRate("203.0.113.162", "u", "d")
+
+	router := gin.New()
+	g := router.Group("/security")
+	registerRateLimitRoutes(g, rm)
+
+	rec := doJSON(t, router, "GET", "/security/rate-limit", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("config status=%d", rec.Code)
+	}
+
+	var cfg map[string]any
+
+	err := json.Unmarshal(rec.Body.Bytes(), &cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg["enabled"] != true {
+		t.Errorf("enabled = %v", cfg["enabled"])
+	}
+
+	rec = doJSON(t, router, "GET", "/security/rate-limit/calls", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("calls status=%d", rec.Code)
+	}
+
+	var calls map[string]RateCounter
+
+	err = json.Unmarshal(rec.Body.Bytes(), &calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := calls["203.0.113.161"]; !ok {
+		t.Errorf("calls listing missing IP: %v", calls)
+	}
+
+	rec = doJSON(t, router, "GET", "/security/rate-limit/registrations", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("registrations status=%d", rec.Code)
+	}
+}
+
+func TestRoute_ESL(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{eslConfig: ESLConfig{Host: "192.0.2.10", Port: "8021", LogLevel: logLevelErrorStr}}
+	rp := newTestRequestProcessor(t, sm, em)
+
+	router := gin.New()
+	g := router.Group("/security")
+	registerESLRoutes(g, em, rp)
+
+	// Stats.
+	rec := doJSON(t, router, "GET", "/security/esl", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("esl stats status=%d", rec.Code)
+	}
+
+	// Log level: happy path and binding error. Restore the global level after.
+	old := GetLogger().GetLogLevel()
+	defer GetLogger().SetLogLevel(old)
+
+	rec = doJSON(t, router, "POST", "/security/esl/log_level", `{"level":"error"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("log_level status=%d body=%s", rec.Code, rec.Body)
+	}
+
+	rec = doJSON(t, router, "POST", "/security/esl/log_level", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("log_level missing field: expected 400, got %d", rec.Code)
+	}
+
+	// Reconnect on a disconnected manager is a no-op but must succeed.
+	rec = doJSON(t, router, "POST", "/security/esl/reconnect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reconnect status=%d", rec.Code)
+	}
+
+	// Command: not connected → 500; binding error → 400.
+	rec = doJSON(t, router, "POST", "/security/esl/command", `{"command":"status"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("command (not connected): expected 500, got %d body=%s", rec.Code, rec.Body)
+	}
+
+	rec = doJSON(t, router, "POST", "/security/esl/command", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("command missing field: expected 400, got %d", rec.Code)
+	}
+}
+
+func TestRoute_Blacklist_Batch(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newBlacklistRouter(sm)
+
+	body := `[
+		{"ip":"203.0.113.220","reason":"a"},
+		{"ip":"203.0.113.221","reason":"b"},
+		{"ip":"not-an-ip","reason":"c"}
+	]`
+
+	rec := doJSON(t, router, "POST", "/security/blacklist/batch", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !sm.IsIPBlacklisted("203.0.113.220") || !sm.IsIPBlacklisted("203.0.113.221") {
+		t.Error("expected first two IPs to be blacklisted")
+	}
+
+	// Binding error and oversized batch.
+	rec = doJSON(t, router, "POST", "/security/blacklist/batch", `{"not":"an array"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for malformed batch, got %d", rec.Code)
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString("[")
+
+	for i := range 1001 {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+
+		sb.WriteString(`{"ip":"203.0.113.1"}`)
+	}
+
+	sb.WriteString("]")
+
+	rec = doJSON(t, router, "POST", "/security/blacklist/batch", sb.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for oversized batch, got %d", rec.Code)
+	}
+}
+
+func TestRoute_Blacklist_Add_Malformed(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newBlacklistRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/blacklist", `{"reason":"missing ip"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing ip, got %d", rec.Code)
+	}
+
+	rec = doJSON(t, router, "POST", "/security/blacklist", `{"ip":"not-an-ip"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid ip, got %d", rec.Code)
+	}
+}
+
+func TestRoute_Whitelist_DefaultDomain(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newWhitelistRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/whitelist",
+		`{"ip":"203.0.113.222","user_id":"nodomain"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+
+	entry, ok := sm.GetWhitelistEntry("203.0.113.222")
+	if !ok {
+		t.Fatal("entry missing after add")
+	}
+
+	if entry.Domain != GetConfig().FreeSWITCH.DefaultDomain {
+		t.Errorf("Domain = %q, want config default", entry.Domain)
+	}
+}
+
+func TestRoute_Untrusted_AddMalformed(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newUntrustedRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/untrusted-networks", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing pattern, got %d", rec.Code)
+	}
+}
+
+func TestCacheResponse_MarshalError(t *testing.T) {
+	t.Parallel()
+
+	// Channels cannot be marshaled; the error must be swallowed after logging.
+	CacheResponse("marshal-error-key", make(chan int))
+
+	if cm := GetCacheManager(); cm != nil {
+		if _, ok := cm.GetSecurityItem("route:marshal-error-key"); ok {
+			t.Error("unmarshalable value must not be cached")
+		}
+	}
+}
+
+func TestCacheMiddleware_NonGETPassesThrough(t *testing.T) {
+	t.Parallel()
+
+	router := gin.New()
+	handled := false
+
+	router.POST("/cached", CacheMiddleware("post-key"), func(c *gin.Context) {
+		handled = true
+
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	rec := doJSON(t, router, "POST", "/cached", `{}`)
+	if rec.Code != http.StatusOK || !handled {
+		t.Errorf("POST must bypass the cache: status=%d handled=%v", rec.Code, handled)
+	}
+}
+
+// TestRequestProcessor_ExitsOnClosedChannels covers the !ok branches of both
+// worker loops: channels are closed without canceling the context.
+func TestRequestProcessor_ExitsOnClosedChannels(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	rp := &RequestProcessor{
+		securityManager: sm,
+		eslManager:      em,
+		statusRequests:  make(chan StatusRequest),
+		commandRequests: make(chan CommandRequest),
+		workerCount:     1,
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+
+	rp.wg.Add(2)
+
+	go rp.processStatusRequests()
+	go rp.processCommandRequests()
+
+	close(rp.statusRequests)
+	close(rp.commandRequests)
+
+	rp.wg.Wait() // workers must exit via the !ok branch
+}
+
+// TestRequestProcessor_ResponseTimeouts covers the worker-side response
+// timeouts: the caller never reads the response channel. The two waits (5s
+// and 10s) run concurrently and in parallel with the rest of the suite.
+func TestRequestProcessor_ResponseTimeouts(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{}
+	rp := newTestRequestProcessor(t, sm, em)
+
+	// Unbuffered response channels that nothing ever reads.
+	rp.statusRequests <- StatusRequest{Type: statusTypeSecurity, Response: make(chan StatusResponse)}
+
+	rp.commandRequests <- CommandRequest{Command: testCmdStatus, Response: make(chan CommandResponse)}
+
+	// Prove the workers survive the abandoned responses and keep serving.
+	if !waitFor(func() bool {
+		respChan := make(chan StatusResponse, 1)
+
+		select {
+		case rp.statusRequests <- StatusRequest{Type: statusTypeSecurity, Response: respChan}:
+		default:
+			return false
+		}
+
+		select {
+		case resp := <-respChan:
+			return resp.Error == nil
+		case <-time.After(8 * time.Second):
+			return false
+		}
+	}) {
+		t.Error("worker did not recover after abandoned response channels")
+	}
+}
+
+func TestRoute_Whitelist_AddTimeout(t *testing.T) {
+	t.Parallel()
+
+	// A saturated manager makes AddToWhitelist fail after its 1s enqueue
+	// timeout; the route must surface a 400.
+	sm := newSaturatedSecurityManager()
+	router := newWhitelistRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/whitelist",
+		`{"ip":"203.0.113.240","user_id":"u","domain":"d"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 when whitelist enqueue times out, got %d", rec.Code)
+	}
+}
+
+func TestRoute_Whitelist_BatchMalformed(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newWhitelistRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/whitelist/batch", `{"not":"an array"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for malformed whitelist batch, got %d", rec.Code)
+	}
+}
+
+func TestRoute_Untrusted_AddDuplicate(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	router := newUntrustedRouter(sm)
+
+	rec := doJSON(t, router, "POST", "/security/untrusted-networks", `{"pattern":"dup.example"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first add status=%d", rec.Code)
+	}
+
+	rec = doJSON(t, router, "POST", "/security/untrusted-networks", `{"pattern":"dup.example"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for duplicate pattern, got %d", rec.Code)
+	}
+}
+
+// TestRouteESLCommand_Timeouts covers the 504 arms of the /esl/command route:
+// queue-full (outer ctx.Done) and execution timeout (inner ctx.Done). Both
+// 10s waits run concurrently.
+func TestRouteESLCommand_Timeouts(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	em := &ESLManager{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// No workers: a zero-capacity queue forces the enqueue to block (queue
+	// timeout); a one-slot queue accepts the request but nothing answers
+	// (execution timeout).
+	stuck := &RequestProcessor{
+		securityManager: sm, eslManager: em,
+		statusRequests:  make(chan StatusRequest),
+		commandRequests: make(chan CommandRequest),
+		ctx:             ctx, cancel: cancel,
+	}
+	unanswered := &RequestProcessor{
+		securityManager: sm, eslManager: em,
+		statusRequests:  make(chan StatusRequest, 1),
+		commandRequests: make(chan CommandRequest, 1),
+		ctx:             ctx, cancel: cancel,
+	}
+
+	stuckRouter := gin.New()
+	registerESLRoutes(stuckRouter.Group("/security"), em, stuck)
+
+	unansweredRouter := gin.New()
+	registerESLRoutes(unansweredRouter.Group("/security"), em, unanswered)
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		rec := doJSON(t, stuckRouter, "POST", "/security/esl/command", `{"command":"status"}`)
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Errorf("queue timeout: expected 504, got %d", rec.Code)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+
+		rec := doJSON(t, unansweredRouter, "POST", "/security/esl/command", `{"command":"status"}`)
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Errorf("execution timeout: expected 504, got %d", rec.Code)
+		}
+	}()
 
 	wg.Wait()
 }

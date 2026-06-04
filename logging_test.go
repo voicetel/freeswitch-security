@@ -17,6 +17,7 @@ func captureLog(tb testing.TB, fn func()) string {
 
 	oldOut := log.Writer()
 	oldFlags := log.Flags()
+
 	log.SetOutput(&buf)
 	log.SetFlags(0)
 
@@ -24,6 +25,7 @@ func captureLog(tb testing.TB, fn func()) string {
 		log.SetOutput(oldOut)
 		log.SetFlags(oldFlags)
 	}()
+
 	fn()
 
 	return buf.String()
@@ -87,10 +89,10 @@ func TestLogger_SetFromString(t *testing.T) {
 		input string
 		want  EslLogLevel
 	}{
-		{"error", LogLevelError},
-		{"info", LogLevelInfo},
-		{"debug", LogLevelDebug},
-		{"trace", LogLevelTrace},
+		{logLevelErrorStr, LogLevelError},
+		{logLevelInfoStr, LogLevelInfo},
+		{logLevelDebugStr, LogLevelDebug},
+		{logLevelTraceStr, LogLevelTrace},
 		{"unknown", LogLevelInfo}, // default
 	}
 
@@ -134,6 +136,7 @@ func BenchmarkLogger_Disabled(b *testing.B) {
 	logger.SetLogLevel(LogLevelError)
 	// Discard log output so the call cost itself is measured.
 	old := log.Writer()
+
 	log.SetOutput(&bytes.Buffer{})
 	b.Cleanup(func() { log.SetOutput(old) })
 
@@ -150,6 +153,7 @@ func BenchmarkLogger_Enabled(b *testing.B) {
 	logger.SetLogLevel(LogLevelDebug)
 
 	old := log.Writer()
+
 	log.SetOutput(&bytes.Buffer{})
 	b.Cleanup(func() { log.SetOutput(old) })
 
@@ -169,5 +173,77 @@ func BenchmarkLogger_GetLevel(b *testing.B) {
 
 	for range b.N {
 		_ = logger.GetLogLevel()
+	}
+}
+
+// TestLogger_Log — not parallel: captureLog swaps log.SetOutput globally.
+//
+//nolint:paralleltest // global log.SetOutput swap
+func TestLogger_Log(t *testing.T) {
+	logger := &Logger{}
+	logger.SetLogLevel(LogLevelTrace)
+
+	out := captureLog(t, func() {
+		logger.Log(LogLevelError, "e%d", 1)
+		logger.Log(LogLevelInfo, "i%d", 2)
+		logger.Log(LogLevelDebug, "d%d", 3)
+		logger.Log(LogLevelTrace, "t%d", 4)
+		logger.Log(EslLogLevel(99), "x%d", 5) // unknown level → "?" prefix, but suppressed (99 > trace)
+	})
+
+	cases := []string{
+		"[ESL ERROR] e1",
+		"[ESL INFO] i2",
+		"[ESL DEBUG] d3",
+		"[ESL TRACE] t4",
+	}
+	for _, want := range cases {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, "x5") {
+		t.Errorf("level above threshold must be suppressed:\n%s", out)
+	}
+}
+
+//nolint:paralleltest // global log.SetOutput swap
+func TestLogger_Log_UnknownLevelPrefix(t *testing.T) {
+	logger := &Logger{}
+	// Raise the threshold high enough that the unknown level is enabled.
+	logger.level.Store(100)
+
+	out := captureLog(t, func() {
+		logger.Log(EslLogLevel(99), "weird")
+	})
+
+	if !strings.Contains(out, "[ESL ?] weird") {
+		t.Errorf("expected fallback prefix, got:\n%s", out)
+	}
+}
+
+//nolint:paralleltest // global log.SetOutput swap
+func TestLogger_Log_SuppressedBelowThreshold(t *testing.T) {
+	logger := &Logger{}
+	logger.SetLogLevel(LogLevelError)
+
+	out := captureLog(t, func() {
+		logger.Log(LogLevelDebug, "hidden")
+	})
+
+	if strings.Contains(out, "hidden") {
+		t.Errorf("debug message must be suppressed at error level:\n%s", out)
+	}
+}
+
+func TestGetLogger_Singleton(t *testing.T) {
+	t.Parallel()
+
+	first := GetLogger()
+	second := GetLogger()
+
+	if first != second {
+		t.Error("GetLogger must return the same instance")
 	}
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -10,20 +9,12 @@ import (
 )
 
 // newTestRateManager builds a rate manager with a configurable, isolated
-// effectiveRateConfig. It does not start the cleanup loop unless Enabled is
-// true; if started, it is torn down via t.Cleanup.
+// effectiveRateConfig. The cleanup loop runs only when Enabled is true; the
+// manager is torn down via t.Cleanup.
 func newTestRateManager(tb testing.TB, sm *SecurityManager, eff effectiveRateConfig) *RateManager {
 	tb.Helper()
 
-	ctx, cancel := context.WithCancel(tb.Context())
-	rm := &RateManager{
-		securityManager: sm,
-		callRates:       make(map[string]*RateCounter),
-		regRates:        make(map[string]*RateCounter),
-		cfg:             eff,
-		ctx:             ctx,
-		cancel:          cancel,
-	}
+	rm := newRateManagerWithConfig(sm, eff)
 	tb.Cleanup(rm.Shutdown)
 
 	return rm
@@ -80,7 +71,9 @@ func TestRateManager_WhitelistBypass(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSecurityManager(t)
-	if err := sm.AddToWhitelist("203.0.113.3", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist("203.0.113.3", "u", "d", false)
+	if err != nil {
 		t.Fatalf("AddToWhitelist: %v", err)
 	}
 
@@ -97,7 +90,9 @@ func TestRateManager_BlacklistedDenied(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSecurityManager(t)
-	if err := sm.AddToBlacklist("203.0.113.4", "test", false); err != nil {
+
+	err := sm.AddToBlacklist("203.0.113.4", "test", false)
+	if err != nil {
 		t.Fatalf("AddToBlacklist: %v", err)
 	}
 
@@ -209,7 +204,9 @@ func BenchmarkCheckCallRate_NewIP(b *testing.B) {
 
 func BenchmarkCheckCallRate_Whitelisted(b *testing.B) {
 	sm := newTestSecurityManager(b)
-	if err := sm.AddToWhitelist("203.0.113.50", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist(testIPWhitelisted, "u", "d", false)
+	if err != nil {
 		b.Fatal(err)
 	}
 
@@ -219,7 +216,7 @@ func BenchmarkCheckCallRate_Whitelisted(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_ = rm.CheckCallRate("203.0.113.50", "u", "d")
+		_ = rm.CheckCallRate(testIPWhitelisted, "u", "d")
 	}
 }
 
@@ -253,7 +250,9 @@ func BenchmarkCheckRegistrationRate_NewIP(b *testing.B) {
 
 func BenchmarkCheckRegistrationRate_Whitelisted(b *testing.B) {
 	sm := newTestSecurityManager(b)
-	if err := sm.AddToWhitelist("203.0.113.50", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist(testIPWhitelisted, "u", "d", false)
+	if err != nil {
 		b.Fatal(err)
 	}
 
@@ -262,13 +261,14 @@ func BenchmarkCheckRegistrationRate_Whitelisted(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_ = rm.CheckRegistrationRate("203.0.113.50", "u", "d")
+		_ = rm.CheckRegistrationRate(testIPWhitelisted, "u", "d")
 	}
 }
 
 // ----- Parallel rate-limit benchmarks: surface mutex contention. -----
 
-// BenchmarkCheckCallRate_NewIP_Parallel measures contention on rm.mu when many
+// BenchmarkCheckCallRate_NewIP_Parallel measures contention on the counter
+// shard lock when many
 // goroutines concurrently increment the SAME counter (worst-case write storm).
 func BenchmarkCheckCallRate_NewIP_Parallel(b *testing.B) {
 	sm := newTestSecurityManager(b)
@@ -291,7 +291,9 @@ func BenchmarkCheckCallRate_NewIP_Parallel(b *testing.B) {
 // Reveals RWMutex reader-counter atomic contention.
 func BenchmarkCheckCallRate_Whitelisted_Parallel(b *testing.B) {
 	sm := newTestSecurityManager(b)
-	if err := sm.AddToWhitelist("203.0.113.50", "u", "d", false); err != nil {
+
+	err := sm.AddToWhitelist(testIPWhitelisted, "u", "d", false)
+	if err != nil {
 		b.Fatal(err)
 	}
 
@@ -301,7 +303,7 @@ func BenchmarkCheckCallRate_Whitelisted_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_ = rm.CheckCallRate("203.0.113.50", "u", "d")
+			_ = rm.CheckCallRate(testIPWhitelisted, "u", "d")
 		}
 	})
 }
@@ -315,7 +317,7 @@ func BenchmarkCheckCallRate_DistinctIPs_Parallel(b *testing.B) {
 	cfg.CallRateLimit = 1 << 30
 	rm := newTestRateManager(b, sm, cfg)
 
-	var counter int64
+	var counter atomic.Int64
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -324,7 +326,7 @@ func BenchmarkCheckCallRate_DistinctIPs_Parallel(b *testing.B) {
 		// Each goroutine claims a private IP range derived from a global counter.
 		// Within a goroutine, the IP cycles through 256 values to avoid hitting
 		// the rate limiter's window check on the same IP repeatedly.
-		base := atomic.AddInt64(&counter, 1)
+		base := counter.Add(1)
 
 		i := 0
 		for pb.Next() {
@@ -333,4 +335,138 @@ func BenchmarkCheckCallRate_DistinctIPs_Parallel(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// ----- Snapshot getters and config view -----
+
+func TestRateManager_RateSnapshots(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	rm := newTestRateManager(t, sm, defaultTestRateConfig())
+
+	_ = rm.CheckCallRate("203.0.113.210", "alice", "x.example")
+	_ = rm.CheckCallRate("203.0.113.210", "bob", "y.example")
+	_ = rm.CheckRegistrationRate("203.0.113.211", testUserCarol, "z.example")
+
+	calls := rm.GetCallRates()
+
+	rc, ok := calls["203.0.113.210"]
+	if !ok {
+		t.Fatalf("call snapshot missing IP: %v", calls)
+	}
+
+	if rc.Count != 2 || len(rc.UserIDs) != 2 {
+		t.Errorf("unexpected call counter: %+v", rc)
+	}
+
+	regs := rm.GetRegistrationRates()
+	if _, ok := regs["203.0.113.211"]; !ok {
+		t.Errorf("registration snapshot missing IP: %v", regs)
+	}
+
+	// Snapshots must be copies: mutating them must not affect the manager.
+	rc.Count = 9999
+
+	if rm.GetCallRates()["203.0.113.210"].Count == 9999 {
+		t.Error("GetCallRates must return copies")
+	}
+}
+
+func TestRateManager_ConfigView(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	cfg := defaultTestRateConfig()
+	rm := newTestRateManager(t, sm, cfg)
+
+	view := rm.RateLimitConfigView()
+
+	if view["enabled"] != cfg.Enabled {
+		t.Errorf("enabled = %v", view["enabled"])
+	}
+
+	if view["call_rate_limit"] != cfg.CallRateLimit {
+		t.Errorf("call_rate_limit = %v", view["call_rate_limit"])
+	}
+
+	if view["call_rate_interval"] != cfg.CallRateInterval.String() {
+		t.Errorf("call_rate_interval = %v", view["call_rate_interval"])
+	}
+
+	if view["whitelist_bypass"] != cfg.WhitelistBypass {
+		t.Errorf("whitelist_bypass = %v", view["whitelist_bypass"])
+	}
+}
+
+func TestRateManager_CleanupLoop(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	cfg := defaultTestRateConfig()
+	cfg.CallRateInterval = 10 * time.Millisecond
+	cfg.RegWindow = 10 * time.Millisecond
+	cfg.CleanupInterval = 20 * time.Millisecond
+	rm := newTestRateManager(t, sm, cfg)
+
+	_ = rm.CheckCallRate("203.0.113.212", "u", "d")
+	_ = rm.CheckRegistrationRate("203.0.113.212", "u", "d")
+
+	// The constructor started the production cleanup loop (Enabled=true);
+	// it must expire both entries.
+	if !waitFor(func() bool {
+		return len(rm.GetCallRates()) == 0 && len(rm.GetRegistrationRates()) == 0
+	}) {
+		t.Error("cleanupLoop did not expire stale counters")
+	}
+}
+
+// TestNewRateManager exercises the production constructor against the global
+// config (config.json). The configured cleanup loop is shut down via Shutdown.
+func TestNewRateManager(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSecurityManager(t)
+	rm := NewRateManager(sm)
+
+	t.Cleanup(rm.Shutdown)
+
+	rl := GetConfig().Security.RateLimit
+
+	if rm.cfg.Enabled != rl.Enabled {
+		t.Errorf("Enabled = %v, want %v", rm.cfg.Enabled, rl.Enabled)
+	}
+
+	if rm.cfg.CallRateLimit != rl.CallRateLimit {
+		t.Errorf("CallRateLimit = %d, want %d", rm.cfg.CallRateLimit, rl.CallRateLimit)
+	}
+
+	if rm.cfg.CallRateInterval != parseDurationOr(rl.CallRateInterval, time.Minute) {
+		t.Errorf("CallRateInterval = %v", rm.cfg.CallRateInterval)
+	}
+
+	if rm.cfg.BlockDuration != parseDurationOr(rl.BlockDuration, defaultRateBlockDuration) {
+		t.Errorf("BlockDuration = %v", rm.cfg.BlockDuration)
+	}
+
+	for i := range rm.shards {
+		if rm.shards[i].callRates == nil || rm.shards[i].regRates == nil {
+			t.Fatalf("shard %d maps must be initialized", i)
+		}
+	}
+}
+
+func TestRateManager_AutoBlockOnExceed(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	cfg := defaultTestRateConfig()
+	cfg.AutoBlockOnExceed = true
+	cfg.CallRateLimit = 1
+	rm := newTestRateManager(t, sm, cfg)
+
+	const ip = "203.0.113.213"
+
+	_ = rm.CheckCallRate(ip, "u", "d")
+	_ = rm.CheckCallRate(ip, "u", "d") // exceeds; queues async blacklist
+
+	if !waitFor(func() bool { return sm.IsIPBlacklisted(ip) }) {
+		t.Error("expected auto-block to blacklist the IP")
+	}
 }

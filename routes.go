@@ -30,14 +30,14 @@ type RequestProcessor struct {
 	cancel      context.CancelFunc
 }
 
-// Request types.
+// StatusRequest asks a processor worker for one of the status snapshots.
 type StatusRequest struct {
 	Type     string
 	Response chan StatusResponse
 }
 
 type StatusResponse struct {
-	Data  interface{}
+	Data  any
 	Error error
 }
 
@@ -50,6 +50,21 @@ type CommandResponse struct {
 	Result string
 	Error  error
 }
+
+// JSON keys used across the HTTP responses.
+const (
+	respKeyError   = "error"
+	respKeyStatus  = "status"
+	respKeyMessage = "message"
+	respKeySuccess = "success"
+
+	// statusTypeSecurity is the processor status-request type for security
+	// statistics; the other types appear once each in the dispatch switch.
+	statusTypeSecurity = "security"
+
+	// keyEnabled is the shared "enabled" key emitted by several JSON views.
+	keyEnabled = "enabled"
+)
 
 var (
 	requestProcessor *RequestProcessor
@@ -82,6 +97,14 @@ func InitRequestProcessor(sm *SecurityManager, em *ESLManager) *RequestProcessor
 	return requestProcessor
 }
 
+// Shutdown shuts down the request processor.
+func (rp *RequestProcessor) Shutdown() {
+	rp.cancel()
+	close(rp.statusRequests)
+	close(rp.commandRequests)
+	rp.wg.Wait()
+}
+
 // processStatusRequests handles status requests.
 func (rp *RequestProcessor) processStatusRequests() {
 	defer rp.wg.Done()
@@ -91,11 +114,15 @@ func (rp *RequestProcessor) processStatusRequests() {
 		case <-rp.ctx.Done():
 			return
 
-		case req := <-rp.statusRequests:
+		case req, ok := <-rp.statusRequests:
+			if !ok {
+				return
+			}
+
 			var response StatusResponse
 
 			switch req.Type {
-			case "security":
+			case statusTypeSecurity:
 				response.Data = rp.securityManager.GetSecurityStats()
 			case "esl":
 				response.Data = rp.eslManager.GetESLStats()
@@ -129,7 +156,11 @@ func (rp *RequestProcessor) processCommandRequests() {
 		case <-rp.ctx.Done():
 			return
 
-		case req := <-rp.commandRequests:
+		case req, ok := <-rp.commandRequests:
+			if !ok {
+				return
+			}
+
 			var response CommandResponse
 
 			// Execute command
@@ -144,14 +175,6 @@ func (rp *RequestProcessor) processCommandRequests() {
 			}
 		}
 	}
-}
-
-// Shutdown shuts down the request processor.
-func (rp *RequestProcessor) Shutdown() {
-	rp.cancel()
-	close(rp.statusRequests)
-	close(rp.commandRequests)
-	rp.wg.Wait()
 }
 
 // CacheMiddleware provides transparent caching for GET requests. Cached
@@ -184,7 +207,7 @@ func CacheMiddleware(cacheKey string) gin.HandlerFunc {
 }
 
 // CacheResponse caches the JSON response after handler execution.
-func CacheResponse(cacheKey string, data interface{}) {
+func CacheResponse(cacheKey string, data any) {
 	cache := GetCacheManager()
 	if cache == nil || !cache.enabled {
 		return
@@ -218,7 +241,7 @@ func registerRoutes(router *gin.Engine) {
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
-			"status": "ok",
+			respKeyStatus: "ok",
 		})
 	})
 
@@ -231,13 +254,15 @@ func registerRoutes(router *gin.Engine) {
 	// Cache control endpoints
 	router.POST("/cache/security/clear", func(c *gin.Context) {
 		cache := GetCacheManager()
-		if err := cache.ClearSecurityCache(); err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+
+		err := cache.ClearSecurityCache()
+		if err != nil {
+			c.JSON(500, gin.H{respKeyError: err.Error()})
 
 			return
 		}
 
-		c.JSON(200, gin.H{"status": "security cache cleared"})
+		c.JSON(200, gin.H{respKeyStatus: "security cache cleared"})
 	})
 
 	// Register security routes if security is enabled
@@ -294,7 +319,7 @@ func securityStatusHandler(sm *SecurityManager, em *ESLManager) gin.HandlerFunc 
 	return func(c *gin.Context) {
 		enabled, autoBlock := sm.SecurityConfigView()
 		c.JSON(200, gin.H{
-			"enabled":         enabled,
+			keyEnabled:        enabled,
 			"auto_block":      autoBlock,
 			"whitelist_count": len(sm.GetWhitelistedIPs()),
 			"blacklist_count": len(sm.GetBlacklistedIPs()),
@@ -317,7 +342,7 @@ func iptablesHandler(sm *SecurityManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		data, err := sm.GetIPTablesInfo()
 		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+			c.JSON(500, gin.H{respKeyError: err.Error()})
 
 			return
 		}
@@ -343,15 +368,17 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				Permanent bool   `json:"permanent"`
 			}
 
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&req)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			// Validate IP address
-			if err := validateIP(req.IP); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err = validateIP(req.IP)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
@@ -362,14 +389,17 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				req.Domain = config.FreeSWITCH.DefaultDomain
 			}
 
-			err := sm.AddToWhitelist(req.IP, req.UserID, req.Domain, req.Permanent)
+			err = sm.AddToWhitelist(req.IP, req.UserID, req.Domain, req.Permanent)
 			if err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
-			c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s added to whitelist for %s@%s", req.IP, req.UserID, req.Domain)})
+			c.JSON(200, gin.H{
+				respKeyStatus:  respKeySuccess,
+				respKeyMessage: fmt.Sprintf("IP %s added to whitelist for %s@%s", req.IP, req.UserID, req.Domain),
+			})
 		})
 
 		// Batch add to whitelist
@@ -381,14 +411,15 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				Permanent bool   `json:"permanent"`
 			}
 
-			if err := c.ShouldBindJSON(&batch); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&batch)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			if len(batch) > 1000 {
-				c.JSON(400, gin.H{"error": "batch size exceeds limit of 1000"})
+				c.JSON(400, gin.H{respKeyError: "batch size exceeds limit of 1000"})
 
 				return
 			}
@@ -411,9 +442,9 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 
 			for i, res := range results {
 				if res.Error != nil {
-					responseResults[i] = gin.H{"ip": res.IP, "error": res.Error.Error()}
+					responseResults[i] = gin.H{"ip": res.IP, respKeyError: res.Error.Error()}
 				} else {
-					responseResults[i] = gin.H{"ip": res.IP, "status": "success"}
+					responseResults[i] = gin.H{"ip": res.IP, respKeyStatus: respKeySuccess}
 				}
 			}
 
@@ -424,7 +455,7 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 		whitelist.DELETE("/:ip", func(c *gin.Context) {
 			ip := c.Param("ip")
 			sm.RemoveFromWhitelist(ip)
-			c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s removed from whitelist", ip)})
+			c.JSON(200, gin.H{respKeyStatus: respKeySuccess, respKeyMessage: fmt.Sprintf("IP %s removed from whitelist", ip)})
 		})
 
 		// Check if IP is whitelisted
@@ -467,27 +498,29 @@ func registerBlacklistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				Permanent bool   `json:"permanent"`
 			}
 
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&req)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			// Validate IP address
-			if err := validateIP(req.IP); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
-
-				return
-			}
-
-			err := sm.AddToBlacklist(req.IP, req.Reason, req.Permanent)
+			err = validateIP(req.IP)
 			if err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
-			c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s added to blacklist", req.IP)})
+			err = sm.AddToBlacklist(req.IP, req.Reason, req.Permanent)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
+
+				return
+			}
+
+			c.JSON(200, gin.H{respKeyStatus: respKeySuccess, respKeyMessage: fmt.Sprintf("IP %s added to blacklist", req.IP)})
 		})
 
 		// Batch add to blacklist
@@ -498,14 +531,15 @@ func registerBlacklistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				Permanent bool   `json:"permanent"`
 			}
 
-			if err := c.ShouldBindJSON(&batch); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&batch)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			if len(batch) > 1000 {
-				c.JSON(400, gin.H{"error": "batch size exceeds limit of 1000"})
+				c.JSON(400, gin.H{respKeyError: "batch size exceeds limit of 1000"})
 
 				return
 			}
@@ -527,9 +561,9 @@ func registerBlacklistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 
 			for i, res := range results {
 				if res.Error != nil {
-					responseResults[i] = gin.H{"ip": res.IP, "error": res.Error.Error()}
+					responseResults[i] = gin.H{"ip": res.IP, respKeyError: res.Error.Error()}
 				} else {
-					responseResults[i] = gin.H{"ip": res.IP, "status": "success"}
+					responseResults[i] = gin.H{"ip": res.IP, respKeyStatus: respKeySuccess}
 				}
 			}
 
@@ -540,7 +574,7 @@ func registerBlacklistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 		blacklist.DELETE("/:ip", func(c *gin.Context) {
 			ip := c.Param("ip")
 			sm.RemoveFromBlacklist(ip)
-			c.JSON(200, gin.H{"status": "success", "message": fmt.Sprintf("IP %s removed from blacklist", ip)})
+			c.JSON(200, gin.H{respKeyStatus: respKeySuccess, respKeyMessage: fmt.Sprintf("IP %s removed from blacklist", ip)})
 		})
 
 		// Check if IP is blacklisted
@@ -568,16 +602,17 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 				Level string `binding:"required" json:"level"` // error, info, debug, trace
 			}
 
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&req)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			eslManager.SetESLLogLevel(req.Level)
 			c.JSON(200, gin.H{
-				"status":  "success",
-				"message": "ESL log level set to " + req.Level,
+				respKeyStatus:  respKeySuccess,
+				respKeyMessage: "ESL log level set to " + req.Level,
 			})
 		})
 
@@ -585,8 +620,8 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 		esl.POST("/reconnect", func(c *gin.Context) {
 			eslManager.ReconnectESL()
 			c.JSON(200, gin.H{
-				"status":  "success",
-				"message": "ESL reconnection initiated",
+				respKeyStatus:  respKeySuccess,
+				respKeyMessage: "ESL reconnection initiated",
 			})
 		})
 
@@ -596,8 +631,9 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 				Command string `binding:"required" json:"command"`
 			}
 
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&req)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
@@ -615,7 +651,7 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 				select {
 				case resp := <-respChan:
 					if resp.Error != nil {
-						c.JSON(500, gin.H{"error": resp.Error.Error()})
+						c.JSON(500, gin.H{respKeyError: resp.Error.Error()})
 					} else {
 						c.JSON(200, gin.H{
 							"command":  req.Command,
@@ -623,10 +659,10 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 						})
 					}
 				case <-ctx.Done():
-					c.JSON(504, gin.H{"error": "command execution timeout"})
+					c.JSON(504, gin.H{respKeyError: "command execution timeout"})
 				}
 			case <-ctx.Done():
-				c.JSON(504, gin.H{"error": "command queue timeout"})
+				c.JSON(504, gin.H{respKeyError: "command queue timeout"})
 			}
 		})
 	}
@@ -666,22 +702,23 @@ func registerUntrustedRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 				Pattern string `binding:"required" json:"pattern"`
 			}
 
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+			err := c.ShouldBindJSON(&req)
+			if err != nil {
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
-			err := sm.AddUntrustedNetwork(req.Pattern)
+			err = sm.AddUntrustedNetwork(req.Pattern)
 			if err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			c.JSON(200, gin.H{
-				"status":  "success",
-				"message": fmt.Sprintf("Pattern '%s' added to untrusted networks", req.Pattern),
+				respKeyStatus:  respKeySuccess,
+				respKeyMessage: fmt.Sprintf("Pattern '%s' added to untrusted networks", req.Pattern),
 			})
 		})
 
@@ -691,14 +728,14 @@ func registerUntrustedRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 
 			err := sm.RemoveUntrustedNetwork(pattern)
 			if err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
+				c.JSON(400, gin.H{respKeyError: err.Error()})
 
 				return
 			}
 
 			c.JSON(200, gin.H{
-				"status":  "success",
-				"message": fmt.Sprintf("Pattern '%s' removed from untrusted networks", pattern),
+				respKeyStatus:  respKeySuccess,
+				respKeyMessage: fmt.Sprintf("Pattern '%s' removed from untrusted networks", pattern),
 			})
 		})
 

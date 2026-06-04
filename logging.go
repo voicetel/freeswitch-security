@@ -43,21 +43,36 @@ func (l *Logger) SetLogLevel(level EslLogLevel) {
 	l.level.Store(int32(level))
 }
 
+// String spellings of the log levels, shared by the parser, config defaults,
+// and tests.
+const (
+	logLevelErrorStr = "error"
+	logLevelDebugStr = "debug"
+	logLevelTraceStr = "trace"
+)
+
+// eslLogLevelFromString maps a level name to its EslLogLevel. The second
+// return reports whether the name was recognized; unknown names map to info.
+func eslLogLevelFromString(name string) (EslLogLevel, bool) {
+	switch name {
+	case logLevelErrorStr:
+		return LogLevelError, true
+	case logLevelInfoStr:
+		return LogLevelInfo, true
+	case logLevelDebugStr:
+		return LogLevelDebug, true
+	case logLevelTraceStr:
+		return LogLevelTrace, true
+	default:
+		return LogLevelInfo, false
+	}
+}
+
 // SetLogLevelFromString sets the logging level from a string.
 // Unknown values default to info.
 func (l *Logger) SetLogLevelFromString(name string) {
-	level := LogLevelInfo
-
-	switch name {
-	case "error":
-		level = LogLevelError
-	case "info":
-		level = LogLevelInfo
-	case "debug":
-		level = LogLevelDebug
-	case "trace":
-		level = LogLevelTrace
-	default:
+	level, ok := eslLogLevelFromString(name)
+	if !ok {
 		log.Printf("Unknown log level %q, using 'info'", name)
 	}
 
@@ -69,38 +84,32 @@ func (l *Logger) GetLogLevel() EslLogLevel {
 	return EslLogLevel(l.level.Load())
 }
 
-// enabled reports whether the given level is currently active.
-// It is intentionally inlinable.
-func (l *Logger) enabled(level EslLogLevel) bool {
-	return int32(level) <= l.level.Load()
-}
-
-func (l *Logger) Error(format string, args ...interface{}) {
+func (l *Logger) Error(format string, args ...any) {
 	if l.enabled(LogLevelError) {
 		log.Printf("[ESL ERROR] "+format, args...)
 	}
 }
 
-func (l *Logger) Info(format string, args ...interface{}) {
+func (l *Logger) Info(format string, args ...any) {
 	if l.enabled(LogLevelInfo) {
 		log.Printf("[ESL INFO] "+format, args...)
 	}
 }
 
-func (l *Logger) Debug(format string, args ...interface{}) {
+func (l *Logger) Debug(format string, args ...any) {
 	if l.enabled(LogLevelDebug) {
 		log.Printf("[ESL DEBUG] "+format, args...)
 	}
 }
 
-func (l *Logger) Trace(format string, args ...interface{}) {
+func (l *Logger) Trace(format string, args ...any) {
 	if l.enabled(LogLevelTrace) {
 		log.Printf("[ESL TRACE] "+format, args...)
 	}
 }
 
 // Log emits a message at the given level if the level is currently enabled.
-func (l *Logger) Log(level EslLogLevel, format string, args ...interface{}) {
+func (l *Logger) Log(level EslLogLevel, format string, args ...any) {
 	if !l.enabled(level) {
 		return
 	}
@@ -121,4 +130,10 @@ func (l *Logger) Log(level EslLogLevel, format string, args ...interface{}) {
 	}
 
 	log.Printf(prefix+format, args...)
+}
+
+// enabled reports whether the given level is currently active.
+// It is intentionally inlinable.
+func (l *Logger) enabled(level EslLogLevel) bool {
+	return int32(level) <= l.level.Load()
 }

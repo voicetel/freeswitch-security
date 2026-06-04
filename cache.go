@@ -22,6 +22,9 @@ type CacheManager struct {
 	enabled     bool
 	securityTTL time.Duration
 
+	// closed makes Shutdown idempotent: bigcache panics on a second Close.
+	closed atomic.Bool
+
 	// Statistics. All fields are accessed via atomic operations.
 	stats CacheStats
 }
@@ -41,56 +44,59 @@ var (
 	cacheManagerOnce sync.Once
 )
 
+// newCacheManagerFromConfig builds a CacheManager from the given app config.
+// Unparsable durations fall back to 5 minutes; a disabled config yields a
+// no-op manager and no error.
+func newCacheManagerFromConfig(cfg *AppConfig) (*CacheManager, error) {
+	if !cfg.Cache.Enabled {
+		log.Println("Cache is disabled in configuration")
+
+		return &CacheManager{enabled: false}, nil
+	}
+
+	securityTTL, err := time.ParseDuration(cfg.Cache.SecurityTTL)
+	if err != nil {
+		log.Printf("Error parsing security TTL, using default 5m: %v", err)
+
+		securityTTL = 5 * time.Minute
+	}
+
+	cleanupInterval, err := time.ParseDuration(cfg.Cache.CleanupInterval)
+	if err != nil {
+		log.Printf("Error parsing cleanup interval, using default 5m: %v", err)
+
+		cleanupInterval = 5 * time.Minute
+	}
+
+	bcCfg := bigcache.DefaultConfig(securityTTL)
+	bcCfg.CleanWindow = cleanupInterval
+	bcCfg.MaxEntriesInWindow = cfg.Cache.MaxEntriesInWindow
+	bcCfg.MaxEntrySize = cfg.Cache.MaxEntrySize
+	bcCfg.Shards = cfg.Cache.ShardCount
+	bcCfg.Verbose = cfg.Server.LogRequests
+
+	bc, err := bigcache.New(context.Background(), bcCfg)
+	if err != nil {
+		log.Printf("Error initializing security cache: %v", err)
+
+		return nil, fmt.Errorf("initializing bigcache: %w", err)
+	}
+
+	log.Printf("Cache initialized - security TTL: %s", securityTTL)
+
+	return &CacheManager{
+		cache:       bc,
+		enabled:     true,
+		securityTTL: securityTTL,
+	}, nil
+}
+
 // InitCache initializes the cache manager.
 func InitCache() error {
 	var initErr error
 
 	cacheManagerOnce.Do(func() {
-		cfg := GetConfig()
-		if !cfg.Cache.Enabled {
-			log.Println("Cache is disabled in configuration")
-
-			cacheManager = &CacheManager{enabled: false}
-
-			return
-		}
-
-		securityTTL, err := time.ParseDuration(cfg.Cache.SecurityTTL)
-		if err != nil {
-			log.Printf("Error parsing security TTL, using default 5m: %v", err)
-
-			securityTTL = 5 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(cfg.Cache.CleanupInterval)
-		if err != nil {
-			log.Printf("Error parsing cleanup interval, using default 5m: %v", err)
-
-			cleanupInterval = 5 * time.Minute
-		}
-
-		bcCfg := bigcache.DefaultConfig(securityTTL)
-		bcCfg.CleanWindow = cleanupInterval
-		bcCfg.MaxEntriesInWindow = cfg.Cache.MaxEntriesInWindow
-		bcCfg.MaxEntrySize = cfg.Cache.MaxEntrySize
-		bcCfg.Shards = cfg.Cache.ShardCount
-		bcCfg.Verbose = cfg.Server.LogRequests
-
-		bc, err := bigcache.New(context.Background(), bcCfg)
-		if err != nil {
-			initErr = fmt.Errorf("initializing bigcache: %w", err)
-			log.Printf("Error initializing security cache: %v", err)
-
-			return
-		}
-
-		cacheManager = &CacheManager{
-			cache:       bc,
-			enabled:     true,
-			securityTTL: securityTTL,
-		}
-
-		log.Printf("Cache initialized - security TTL: %s", securityTTL)
+		cacheManager, initErr = newCacheManagerFromConfig(GetConfig())
 	})
 
 	if cacheManager != nil && cacheManager.enabled && cacheManager.cache == nil {
@@ -107,7 +113,8 @@ func (cm *CacheManager) CacheSecurityItem(key string, data []byte) {
 		return
 	}
 
-	if err := cm.cache.Set(key, data); err != nil {
+	err := cm.cache.Set(key, data)
+	if err != nil {
 		cm.stats.WriteErrors.Add(1)
 		GetLogger().Error("cache set %q: %v", key, err)
 
@@ -144,7 +151,8 @@ func (cm *CacheManager) DeleteSecurityItem(key string) {
 		return
 	}
 
-	if err := cm.cache.Delete(key); err != nil {
+	err := cm.cache.Delete(key)
+	if err != nil {
 		if !errors.Is(err, bigcache.ErrEntryNotFound) {
 			cm.stats.DeleteErrors.Add(1)
 		}
@@ -161,7 +169,8 @@ func (cm *CacheManager) ClearSecurityCache() error {
 		return nil
 	}
 
-	if err := cm.cache.Reset(); err != nil {
+	err := cm.cache.Reset()
+	if err != nil {
 		return fmt.Errorf("bigcache reset: %w", err)
 	}
 
@@ -169,15 +178,15 @@ func (cm *CacheManager) ClearSecurityCache() error {
 }
 
 // GetCacheStats returns cache statistics.
-func (cm *CacheManager) GetCacheStats() map[string]interface{} {
-	stats := map[string]interface{}{"enabled": cm.enabled}
+func (cm *CacheManager) GetCacheStats() map[string]any {
+	stats := map[string]any{"enabled": cm.enabled}
 	if !cm.enabled {
 		return stats
 	}
 
 	if cm.cache != nil {
 		bc := cm.cache.Stats()
-		stats["security"] = map[string]interface{}{
+		stats["security"] = map[string]any{
 			"hits":       bc.Hits,
 			"misses":     bc.Misses,
 			"collisions": bc.Collisions,
@@ -187,7 +196,7 @@ func (cm *CacheManager) GetCacheStats() map[string]interface{} {
 		}
 	}
 
-	stats["operations"] = map[string]interface{}{
+	stats["operations"] = map[string]any{
 		"writes":        cm.stats.Writes.Load(),
 		"reads":         cm.stats.Reads.Load(),
 		"deletes":       cm.stats.Deletes.Load(),
@@ -199,13 +208,18 @@ func (cm *CacheManager) GetCacheStats() map[string]interface{} {
 	return stats
 }
 
-// Shutdown closes the underlying cache.
+// Shutdown closes the underlying cache. It is safe to call multiple times.
 func (cm *CacheManager) Shutdown() {
 	if cm == nil || !cm.enabled || cm.cache == nil {
 		return
 	}
 
-	if err := cm.cache.Close(); err != nil {
+	if !cm.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	err := cm.cache.Close()
+	if err != nil {
 		log.Printf("Error closing cache: %v", err)
 	}
 }
@@ -213,7 +227,8 @@ func (cm *CacheManager) Shutdown() {
 // GetCacheManager returns the cache manager instance, initializing it on first call.
 func GetCacheManager() *CacheManager {
 	if cacheManager == nil {
-		if err := InitCache(); err != nil {
+		err := InitCache()
+		if err != nil {
 			log.Printf("Error initializing cache: %v", err)
 		}
 	}

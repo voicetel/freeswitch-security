@@ -114,7 +114,9 @@ A high-performance security application for FreeSWITCH that provides comprehensi
     "host": "127.0.0.1",
     "port": "8080",
     "log_requests": true,
-    "log_responses": false
+    "log_responses": false,
+    "pprof_enabled": false,
+    "pprof_addr": "127.0.0.1:6060"
   },
   "freeswitch": {
     "default_domain": "your-domain.com"
@@ -190,6 +192,24 @@ Override any configuration value using environment variables:
 | `SECURITY_MAX_FAILED_ATTEMPTS` | Failed attempts threshold | `10` |
 | `SECURITY_AUTO_BLOCK` | Enable auto-blocking | `true` |
 | `SECURITY_TRUSTED_NETWORKS` | Trusted networks (JSON array) | `["10.0.0.0/8"]` |
+| `SERVER_PPROF_ENABLED` | Enable pprof diagnostics server | `true` |
+| `SERVER_PPROF_ADDR` | pprof bind address (keep loopback) | `127.0.0.1:6060` |
+
+## 📈 Profiling & Performance
+
+Setting `server.pprof_enabled` exposes Go's `net/http/pprof` diagnostics on a
+**dedicated, loopback-only** listener (`server.pprof_addr`, default
+`127.0.0.1:6060`) — never on the public API port:
+
+```bash
+go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+```
+
+The benchmark suite includes `BenchmarkEventPipeline_RealisticMix`, a
+production-shaped end-to-end pipeline benchmark (~350 ns/event at 4 workers),
+and `BenchmarkRegistrationAutoWhitelist`, a canary guarding the registration
+hot path (~230 ns; it regresses to ~100 ms if a blocking whitelist call is
+ever reintroduced). Validate changes with `benchstat` over `-count=10` runs.
 
 ## 🔧 FreeSWITCH Configuration
 

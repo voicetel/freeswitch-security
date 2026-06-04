@@ -3,7 +3,7 @@ linters:
   default: all
   settings:
     cyclop:
-      max-complexity: 20
+      max-complexity: 15
     depguard:
       rules:
         Main:
@@ -22,7 +22,7 @@ linters:
     gocognit:
       min-complexity: 30
     gocyclo:
-      min-complexity: 20
+      min-complexity: 15
     lll:
       line-length: 140
     mnd:

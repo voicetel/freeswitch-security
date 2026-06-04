@@ -660,19 +660,52 @@ func (em *ESLManager) startWorkerPool() {
 	}
 }
 
+// reconnectBaseBackoff parses the configured reconnect backoff, falling back
+// to five seconds on a missing or unusable value.
+func (em *ESLManager) reconnectBaseBackoff(logger *Logger) time.Duration {
+	baseBackoff, err := time.ParseDuration(em.eslConfig.ReconnectBackoff)
+	if err != nil || baseBackoff <= 0 {
+		logger.Error("Error parsing reconnect backoff %q, using 5s: %v", em.eslConfig.ReconnectBackoff, err)
+
+		return 5 * time.Second
+	}
+
+	return baseBackoff
+}
+
+// dialESL parses the configured port (falling back to 8021) and dials the
+// event socket, classifying authentication failures in the log output.
+func (em *ESLManager) dialESL(logger *Logger) (*eventsocket.Connection, error) {
+	port, err := strconv.Atoi(em.eslConfig.Port)
+	if err != nil {
+		logger.Error("Error parsing ESL port %q, using 8021: %v", em.eslConfig.Port, err)
+
+		port = 8021
+	}
+
+	client, err := eventsocket.Dial(fmt.Sprintf("%s:%d", em.eslConfig.Host, port), em.eslConfig.Password)
+	if err != nil {
+		em.statistics.ConnectionErrors.Add(1)
+
+		if strings.Contains(err.Error(), "auth failed") || strings.Contains(err.Error(), "authentication") {
+			logger.Error("ESL authentication failed — check the password")
+		} else {
+			logger.Error("Failed to connect to FreeSWITCH ESL: %v", err)
+		}
+
+		return nil, fmt.Errorf("dialing ESL: %w", err)
+	}
+
+	return client, nil
+}
+
 // startESLConnection connects to FreeSWITCH ESL and listens for events,
 // reconnecting with exponential backoff on failure.
 func (em *ESLManager) startESLConnection() {
 	defer em.readersWg.Done()
 
 	logger := GetLogger()
-	baseBackoff, err := time.ParseDuration(em.eslConfig.ReconnectBackoff)
-
-	if err != nil || baseBackoff <= 0 {
-		logger.Error("Error parsing reconnect backoff %q, using 5s: %v", em.eslConfig.ReconnectBackoff, err)
-
-		baseBackoff = 5 * time.Second
-	}
+	baseBackoff := em.reconnectBaseBackoff(logger)
 
 	const maxBackoff = 60 * time.Second
 
@@ -704,25 +737,10 @@ func (em *ESLManager) startESLConnection() {
 		default:
 		}
 
-		port, err := strconv.Atoi(em.eslConfig.Port)
-		if err != nil {
-			logger.Error("Error parsing ESL port %q, using 8021: %v", em.eslConfig.Port, err)
-
-			port = 8021
-		}
-
 		started := time.Now()
 
-		client, err := eventsocket.Dial(fmt.Sprintf("%s:%d", em.eslConfig.Host, port), em.eslConfig.Password)
+		client, err := em.dialESL(logger)
 		if err != nil {
-			em.statistics.ConnectionErrors.Add(1)
-
-			if strings.Contains(err.Error(), "auth failed") || strings.Contains(err.Error(), "authentication") {
-				logger.Error("ESL authentication failed — check the password")
-			} else {
-				logger.Error("Failed to connect to FreeSWITCH ESL: %v", err)
-			}
-
 			select {
 			case <-em.ctx.Done():
 				return

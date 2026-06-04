@@ -42,32 +42,10 @@ func run(shutdownChan <-chan os.Signal) error {
 	logger := GetLogger()
 	logger.SetLogLevelFromString(config.Security.ESLLogLevel)
 
-	// Initialize cache if enabled
-	if config.Cache.Enabled {
-		err := InitCache()
-		if err != nil {
-			return fmt.Errorf("failed to initialize cache: %w", err)
-		}
-
-		log.Println("Cache system initialized")
-	} else {
-		log.Println("Cache system is disabled")
-	}
-
-	// Initialize security manager if enabled
-	var securityManager *SecurityManager
-
-	var eslManager *ESLManager
-
-	if config.Security.Enabled {
-		InitSecurityManager()
-
-		securityManager = GetSecurityManager()
-		eslManager = InitESLManager(securityManager)
-
-		log.Println("Security manager initialized")
-	} else {
-		log.Println("Security system is disabled")
+	// Initialize cache and the security/ESL managers as configured.
+	securityManager, eslManager, err := initSubsystems(config)
+	if err != nil {
+		return err
 	}
 
 	// Set Gin mode
@@ -125,19 +103,56 @@ func run(shutdownChan <-chan os.Signal) error {
 		log.Printf("Received signal %s, initiating graceful shutdown...", sig)
 	}
 
-	// Create a context with timeout for shutdown
+	gracefulShutdown(pprofServer, eslManager, securityManager)
+
+	return nil
+}
+
+// initSubsystems brings up the cache and, when enabled, the security and ESL
+// managers, mirroring the configuration flags.
+func initSubsystems(config *AppConfig) (*SecurityManager, *ESLManager, error) {
+	if config.Cache.Enabled {
+		err := InitCache()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to initialize cache: %w", err)
+		}
+
+		log.Println("Cache system initialized")
+	} else {
+		log.Println("Cache system is disabled")
+	}
+
+	var securityManager *SecurityManager
+
+	var eslManager *ESLManager
+
+	if config.Security.Enabled {
+		InitSecurityManager()
+
+		securityManager = GetSecurityManager()
+		eslManager = InitESLManager(securityManager)
+
+		log.Println("Security manager initialized")
+	} else {
+		log.Println("Security system is disabled")
+	}
+
+	return securityManager, eslManager, nil
+}
+
+// gracefulShutdown stops the HTTP and diagnostics servers within a bounded
+// context, then the managers and cache. Nil arguments are skipped.
+func gracefulShutdown(pprofServer *http.Server, eslManager *ESLManager, securityManager *SecurityManager) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Shutdown sequence
 	log.Println("Shutting down HTTP server...")
 
-	err = httpServer.Shutdown(ctx)
+	err := httpServer.Shutdown(ctx)
 	if err != nil {
 		log.Printf("HTTP server forced to shutdown: %v", err)
 	}
 
-	// Shutdown pprof diagnostics if running
 	if pprofServer != nil {
 		err := pprofServer.Shutdown(ctx)
 		if err != nil {
@@ -145,23 +160,18 @@ func run(shutdownChan <-chan os.Signal) error {
 		}
 	}
 
-	// Shutdown ESL manager if initialized
 	if eslManager != nil {
 		log.Println("Shutting down ESL manager...")
 		eslManager.Shutdown()
 	}
 
-	// Shutdown security manager if initialized
 	if securityManager != nil {
 		log.Println("Shutting down security manager...")
 		securityManager.Shutdown()
 	}
 
-	// Close cache
 	log.Println("Closing cache...")
 	CloseCache()
 
 	log.Println("Graceful shutdown complete")
-
-	return nil
 }

@@ -1,144 +1,101 @@
-# IPTables Integration Guide for FreeSWITCH Security
+# Firewall Integration Guide (ipset + iptables)
 
-This comprehensive guide explains how to configure IPTables for optimal security integration with the FreeSWITCH Security application. The system uses advanced IPTables techniques including custom chains, batch operations, and stealth blocking to provide enterprise-grade VoIP protection.
+This guide explains how FreeSWITCH Security blocks malicious IPs at the kernel
+level. As of v1.3.0 the blocking backend is a **kernel ipset** referenced by a
+single `iptables` rule, replacing the previous one-rule-per-IP approach.
 
 ## 🏗️ Architecture Overview
 
-The FreeSWITCH Security application implements a sophisticated IPTables integration strategy:
+- **ipset-backed blocking**: blocked IPs live in a kernel `hash:ip` set; the
+  firewall ruleset stays a constant size no matter how many IPs are banned.
+- **Single match-set rule**: one `iptables` DROP rule matches the whole set,
+  inserted at the top of the configured chain (`INPUT` by default).
+- **In-kernel ban expiry**: each set entry carries a timeout, so bans expire in
+  the kernel automatically — no per-rule cleanup goroutine on the hot path.
+- **Stealth blocking**: the rule uses `DROP`, not `REJECT` (see below).
+- **Startup hygiene**: on boot the app flushes stale set entries and removes any
+  legacy per-IP `Auto-blocked` rules left by pre-v1.3.0 versions, so upgrades
+  need no manual firewall cleanup.
 
-- **Custom Chain Management**: Dedicated `FREESWITCH` chain for security rules
-- **Batch Operations**: Efficient bulk rule modifications to reduce system overhead
-- **Stealth Blocking**: Uses DROP instead of REJECT for security through obscurity
-- **Automatic Cleanup**: Intelligent rule removal when blocks expire
-- **Health Monitoring**: Continuous validation of firewall rule integrity
+```
+Internet traffic → INPUT chain
+                     │
+                     ▼
+        ┌───────────────────────────────┐
+        │ -m set --match-set <set> src   │ ── match ──▶ DROP (silently)
+        │ -j DROP   (one rule)           │
+        └───────────────────────────────┘
+                     │ no match
+                     ▼
+              Accept / continue
+```
+
+The set is `hash:ip` (`family inet`, IPv4) with `hashsize 4096` and
+`maxelem 1000000` — membership tests and updates are O(1).
 
 ## 🛡️ Security Philosophy: DROP vs REJECT
 
-### Why DROP is Superior for VoIP Security
+The match-set rule uses **DROP** rather than **REJECT**:
 
-The application uses the **DROP** target instead of **REJECT** for multiple security advantages:
-
-#### Stealth Operation Benefits
-- **Invisible Blocking**: Attackers receive no indication their traffic is blocked
-- **Reconnaissance Prevention**: Port scanners can't detect firewall presence
-- **Timeout-Based Deterrent**: Connection attempts timeout naturally
-- **Reduced Attack Surface**: No ICMP responses to analyze or exploit
-
-#### Resource Efficiency
-- **Zero Response Overhead**: No CPU cycles wasted on ICMP generation
-- **Bandwidth Conservation**: No outbound traffic for blocked connections
-- **Kernel-Level Efficiency**: Packet dropping occurs at the earliest possible stage
-- **Scalability**: Handles high-volume attacks without performance degradation
-
-#### Operational Security
-- **Log Noise Reduction**: Fewer false positives in network monitoring
-- **Passive Defense**: Doesn't reveal defensive capabilities to attackers
-- **Compliance Friendly**: Aligns with security best practices for critical infrastructure
-
-### DROP Behavior in Practice
-
-When an IP is blocked with DROP:
+- **Stealth**: attackers and port scanners get no response — connections hang
+  and time out rather than being actively refused.
+- **Resource efficiency**: no ICMP/RST generation, no outbound traffic for
+  blocked sources, dropping happens at the earliest kernel stage.
+- **Operational security**: fewer monitoring false positives; defensive posture
+  is not advertised.
 
 ```bash
-# Attacker perspective - connection hangs indefinitely
-telnet your-server.com 5060
-# [hangs until timeout - no immediate rejection]
+# Attacker perspective — connection hangs until timeout, no rejection
+telnet your-server.example 5060
 
-# Legitimate user perspective - normal operation
-# No performance impact or visible changes
+# Legitimate user perspective — no visible change, no performance impact
 ```
 
 ## 🔧 Prerequisites and Requirements
 
-### System Requirements
+### System requirements
 
-- **Linux Distribution**: Ubuntu 18.04+, CentOS 7+, Debian 9+, or compatible
-- **IPTables Version**: 1.6.0 or newer
-- **Kernel Support**: Netfilter framework with stateful connection tracking
-- **Permissions**: Root access or CAP_NET_ADMIN capability
-- **Memory**: Sufficient kernel memory for rule tables (typically 64MB+)
+- **Linux** with the Netfilter framework (Ubuntu 18.04+, Debian 9+, CentOS 7+,
+  or compatible).
+- **ipset** installed and on `PATH` — this is a runtime dependency:
+  ```bash
+  sudo apt-get install ipset      # Debian/Ubuntu
+  sudo dnf install ipset          # Fedora/RHEL/CentOS
+  ```
+  The app fails fast with an actionable error if `ipset` is missing while
+  auto-blocking is enabled.
+- **iptables** 1.6.0+ with the `set` match (`xt_set`, ships with ipset).
+- **Privileges**: root or `CAP_NET_ADMIN` to manage the set and the rule.
 
-### Permission Configuration
+### Permission configuration
 
-#### Option 1: Run as Root (Simple)
+#### Option 1 — run as root (simplest)
 ```bash
-sudo ./freeswitch-security
+sudo ./bin/freeswitch-security
 ```
 
-#### Option 2: Capability-Based (Recommended)
+#### Option 2 — capability-based (recommended)
 ```bash
-# Grant specific network administration capabilities
-sudo setcap cap_net_admin=+ep ./freeswitch-security
-
-# Verify capabilities
-getcap ./freeswitch-security
-# Output: ./freeswitch-security = cap_net_admin+ep
-
-# Run as non-root user
-./freeswitch-security
+sudo setcap cap_net_admin=+ep ./bin/freeswitch-security
+getcap ./bin/freeswitch-security      # → cap_net_admin+ep
+./bin/freeswitch-security
 ```
 
-#### Option 3: Sudo Configuration (Production)
+#### Option 3 — sudo allowlist (production)
 ```bash
-# Add to /etc/sudoers.d/freeswitch-security
-freeswitch-user ALL=(ALL) NOPASSWD: /sbin/iptables
+# /etc/sudoers.d/freeswitch-security
+freeswitch-user ALL=(ALL) NOPASSWD: /sbin/ipset, /sbin/iptables
 ```
 
-## 🏗️ Chain Architecture
-
-### Understanding the Chain Structure
-
-The application creates a dedicated chain that integrates into the standard IPTables flow:
-
-```
-Internet Traffic → INPUT Chain → FREESWITCH Chain → DROP (if blocked)
-                      ↓                ↓
-              Further Processing    Legitimate Traffic
-```
-
-### Chain Creation Process
-
-The application automatically:
-
-1. **Checks Existence**: Verifies if the FREESWITCH chain exists
-2. **Creates Chain**: `iptables -N FREESWITCH` if not present
-3. **Links Chain**: `iptables -A INPUT -j FREESWITCH` to route traffic
-4. **Validates Rules**: Ensures proper integration with existing firewall
-
-### Visual Chain Diagram
-
-```
-┌─────────────────┐
-│ Internet Traffic │
-└─────────┬───────┘
-          │
-          ▼
-┌─────────────────┐     ┌──────────────────┐
-│   INPUT Chain   │────▶│ FREESWITCH Chain │
-└─────────────────┘     └─────────┬────────┘
-          │                       │
-          │                       ▼
-          │              ┌─────────────────┐
-          │              │ Blocked IPs     │
-          │              │ (DROP silently) │
-          │              └─────────────────┘
-          ▼
-┌─────────────────┐
-│ Accept/Continue │
-└─────────────────┘
-```
-
-## ⚙️ Configuration Setup
-
-### Application Configuration
-
-Configure IPTables integration in `config.json`:
+## ⚙️ Configuration
 
 ```json
 {
   "security": {
     "auto_block_enabled": true,
-    "iptables_chain": "FREESWITCH",
+    "iptables_chain": "INPUT",
+    "ipset_name": "freeswitch-security",
+    "dry_run": false,
     "block_duration": "1h",
     "trusted_networks": [
       "127.0.0.1/8",
@@ -150,574 +107,170 @@ Configure IPTables integration in `config.json`:
 }
 ```
 
-### Environment Variable Override
+| Key | Meaning |
+|-----|---------|
+| `auto_block_enabled` | Master switch for firewall management. When off, no set or rule is created. |
+| `iptables_chain` | Chain the match-set DROP rule is inserted into. **Must be a chain the kernel traverses** (`INPUT` by default). |
+| `ipset_name` | Name of the managed set (`freeswitch-security` by default). |
+| `dry_run` | When true, every `ipset`/`iptables` action is logged but not executed — useful for testing without privileges. |
+| `block_duration` | Default ban TTL, applied as the set entry timeout. Permanent bans use a zero (no-expiry) timeout. |
+
+### Environment variable overrides
 
 ```bash
 export SECURITY_AUTO_BLOCK=true
-export SECURITY_IPTABLES_CHAIN=CUSTOM_SECURITY
+export SECURITY_IPTABLES_CHAIN=INPUT
+export SECURITY_IPSET_NAME=freeswitch-security
+export SECURITY_DRY_RUN=false
 export SECURITY_BLOCK_DURATION=2h
 ```
 
-## 🔥 Basic Firewall Configuration
+> **Upgrading from < v1.3.0:** the default chain changed from a custom
+> `FREESWITCH` chain to `INPUT`. On first start the app removes legacy per-IP
+> `Auto-blocked` rules automatically; you can drop the old empty `FREESWITCH`
+> chain manually with `iptables -X FREESWITCH` once it is unreferenced.
 
-### Minimal Security Setup
+## 🔥 Host firewall baseline
 
-⚠️ **Warning**: These examples are for instructional purposes only. Do not use in production without proper security review.
+`auto_block_enabled` only manages the block set — you still need a sane base
+policy. Example (instructional; review before production use):
 
 ```bash
-# Set secure default policies
 sudo iptables -P INPUT DROP
 sudo iptables -P FORWARD DROP
 sudo iptables -P OUTPUT ACCEPT
 
-# Allow loopback (essential for system operation)
 sudo iptables -A INPUT -i lo -j ACCEPT
-sudo iptables -A OUTPUT -o lo -j ACCEPT
-
-# Allow established and related connections
 sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT          # SSH
 
-# Allow SSH (adjust port as needed)
-sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-```
-
-### FreeSWITCH-Specific Rules
-
-```bash
-# SIP signaling ports
-sudo iptables -A INPUT -p udp --dport 5060 -j ACCEPT
+# FreeSWITCH services
+sudo iptables -A INPUT -p udp --dport 5060 -j ACCEPT        # SIP
 sudo iptables -A INPUT -p tcp --dport 5060 -j ACCEPT
-sudo iptables -A INPUT -p udp --dport 5080 -j ACCEPT  # Alternative SIP port
+sudo iptables -A INPUT -p udp --dport 16384:32768 -j ACCEPT # RTP
 
-# RTP media port range (adjust to match FreeSWITCH configuration)
-sudo iptables -A INPUT -p udp --dport 16384:32768 -j ACCEPT
-
-# WebRTC/WSS (if using)
-sudo iptables -A INPUT -p tcp --dport 8081:8082 -j ACCEPT
-
-# FreeSWITCH Security API (restrict to management network)
-sudo iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
-```
-
-### Custom Chain Integration
-
-```bash
-# Create the FREESWITCH chain
-sudo iptables -N FREESWITCH
-
-# Insert jump to FREESWITCH chain early in INPUT processing
-sudo iptables -I INPUT 1 -j FREESWITCH
-
-# Verify chain integration
-sudo iptables -L INPUT --line-numbers
-```
-
-## 🧪 Testing and Validation
-
-### Manual Testing Procedures
-
-#### 1. Verify Chain Creation
-```bash
-# List the FREESWITCH chain
-sudo iptables -L FREESWITCH -v -n
-
-# Expected output for empty chain:
-# Chain FREESWITCH (1 references)
-#  pkts bytes target     prot opt in     out     source               destination
-```
-
-#### 2. Test Rule Addition
-```bash
-# Add a test rule manually
-sudo iptables -A FREESWITCH -s 192.0.2.1 -j DROP
-
-# Verify rule was added
-sudo iptables -L FREESWITCH -v -n
-```
-
-#### 3. Test Application Integration
-```bash
-# Add IP via API
-curl -X POST http://127.0.0.1:8080/security/blacklist \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ip": "192.0.2.100",
-    "reason": "Testing IPTables integration",
-    "permanent": false
-  }'
-
-# Verify rule creation
-sudo iptables -L FREESWITCH -v -n | grep 192.0.2.100
-
-# Test blocking (from another machine)
-telnet 192.0.2.100 5060
-# Should hang indefinitely (no response due to DROP)
-
-# Remove via API
-curl -X DELETE http://127.0.0.1:8080/security/blacklist/192.0.2.100
-
-# Verify rule removal
-sudo iptables -L FREESWITCH -v -n | grep 192.0.2.100
-# Should return no results
-```
-
-#### 4. Batch Operation Testing
-```bash
-# Test batch blacklisting
-curl -X POST http://127.0.0.1:8080/security/blacklist/batch \
-  -H "Content-Type: application/json" \
-  -d '[
-    {"ip": "192.0.2.10", "reason": "Batch test 1"},
-    {"ip": "192.0.2.11", "reason": "Batch test 2"},
-    {"ip": "192.0.2.12", "reason": "Batch test 3"}
-  ]'
-
-# Verify all rules were added efficiently
-sudo iptables -L FREESWITCH -v -n | grep -E "192\.0\.2\.(10|11|12)"
-```
-
-## 🚀 Advanced Configuration
-
-### Custom Chain Names
-
-For environments with existing security tools:
-
-```json
-{
-  "security": {
-    "iptables_chain": "VOIP_SECURITY"
-  }
-}
-```
-
-### Integration with Existing Firewalls
-
-#### UFW Integration
-```bash
-# Create custom UFW rule for FreeSWITCH chain
-sudo ufw route insert 1 allow in on any to any jump FREESWITCH
-```
-
-#### FirewallD Integration
-```bash
-# Add custom chain to firewalld
-sudo firewall-cmd --permanent --direct --add-chain ipv4 filter FREESWITCH
-sudo firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -j FREESWITCH
-sudo firewall-cmd --reload
-```
-
-### High-Availability Configurations
-
-#### Master-Slave Setup
-```bash
-# On master node - sync rules to slave
-iptables-save | ssh slave-node 'iptables-restore'
-
-# Automated sync script
-#!/bin/bash
-SLAVE_NODES="slave1.example.com slave2.example.com"
-for node in $SLAVE_NODES; do
-    iptables-save | ssh $node 'iptables-restore'
-done
-```
-
-#### Load Balancer Integration
-```bash
-# Allow health check traffic
-sudo iptables -I FREESWITCH 1 -s 192.168.1.10 -p tcp --dport 8080 -j ACCEPT
-
-# Rate limit health checks
-sudo iptables -A FREESWITCH -p tcp --dport 8080 -m limit --limit 10/min -j ACCEPT
-```
-
-## 📊 Monitoring and Maintenance
-
-### Rule Monitoring
-
-#### View Current Blocks
-```bash
-# List all blocked IPs with packet counts
-sudo iptables -L FREESWITCH -v -n
-
-# API method
-curl -s http://127.0.0.1:8080/security/iptables | jq '.'
-```
-
-#### Monitor Block Effectiveness
-```bash
-# Count blocked packets
-sudo iptables -L FREESWITCH -v -n | awk 'NR>2 {sum+=$1} END {print "Total blocked packets:", sum}'
-
-# Real-time monitoring
-watch -n 5 'sudo iptables -L FREESWITCH -v -n'
-```
-
-### Performance Monitoring
-
-#### Rule Count Optimization
-```bash
-# Monitor rule count (should be reasonable)
-RULE_COUNT=$(sudo iptables -L FREESWITCH --line-numbers | tail -n +3 | wc -l)
-echo "Current FREESWITCH rules: $RULE_COUNT"
-
-# Alert if too many rules (>1000 may impact performance)
-if [ $RULE_COUNT -gt 1000 ]; then
-    echo "WARNING: High rule count may impact performance"
-fi
-```
-
-#### Memory Usage
-```bash
-# Check IPTables memory usage
-cat /proc/net/ip_tables_matches
-cat /proc/net/ip_tables_targets
-
-# System memory impact
-free -h | grep Mem
-```
-
-### Automated Maintenance
-
-#### Daily Cleanup Script
-```bash
-#!/bin/bash
-# /etc/cron.daily/freeswitch-security-cleanup
-
-# Remove zero-packet rules (may be expired)
-sudo iptables -L FREESWITCH -v -n --line-numbers | \
-  awk '$3==0 && NR>2 {print $1}' | \
-  tac | \
-  while read line; do
-    sudo iptables -D FREESWITCH $line
-  done
-
-# Log rule count
-RULE_COUNT=$(sudo iptables -L FREESWITCH --line-numbers | tail -n +3 | wc -l)
-logger "FreeSWITCH Security: $RULE_COUNT active IPTables rules"
-```
-
-#### Rule Backup and Restore
-```bash
-# Backup current rules
-sudo iptables-save > /backup/iptables-$(date +%Y%m%d).rules
-
-# Restore from backup
-sudo iptables-restore < /backup/iptables-20240115.rules
-```
-
-## 🔍 Troubleshooting Guide
-
-### Common Issues and Solutions
-
-#### 1. Chain Not Created
-
-**Symptoms:**
-```log
-[ESL ERROR] Failed to set up iptables chain: command not found
-```
-
-**Diagnosis:**
-```bash
-# Check if iptables is installed
-which iptables
-# Should return: /sbin/iptables or /usr/sbin/iptables
-
-# Check if user has permissions
-sudo iptables -L >/dev/null 2>&1 && echo "OK" || echo "Permission denied"
-```
-
-**Solutions:**
-```bash
-# Install iptables (Ubuntu/Debian)
-sudo apt-get update && sudo apt-get install iptables
-
-# Install iptables (CentOS/RHEL)
-sudo yum install iptables-services
-
-# Fix permissions
-sudo setcap cap_net_admin=+ep ./freeswitch-security
-```
-
-#### 2. Rules Not Working
-
-**Symptoms:**
-- Blocked IPs can still connect
-- API shows rules but no blocking occurs
-
-**Diagnosis:**
-```bash
-# Check chain ordering
-sudo iptables -L INPUT --line-numbers | grep -A5 -B5 FREESWITCH
-
-# Verify rule placement
-sudo iptables -L FREESWITCH -v -n --line-numbers
-```
-
-**Solutions:**
-```bash
-# Move FREESWITCH chain higher in INPUT
-sudo iptables -D INPUT -j FREESWITCH
-sudo iptables -I INPUT 1 -j FREESWITCH
-
-# Check for conflicting ACCEPT rules above FREESWITCH
-sudo iptables -L INPUT --line-numbers
-```
-
-#### 3. Performance Issues
-
-**Symptoms:**
-```log
-[ESL ERROR] IPTables command timeout
-[ESL DEBUG] Batch iptables error: exit status 4
-```
-
-**Diagnosis:**
-```bash
-# Check rule count
-sudo iptables -L FREESWITCH --line-numbers | wc -l
-
-# Monitor system load during rule operations
-top -p $(pgrep freeswitch-security)
-```
-
-**Solutions:**
-```bash
-# Increase batch operation timeout in code
-# Implement rule optimization strategies
-# Consider using ipset for large IP lists
-
-# Example ipset integration:
-sudo ipset create freeswitch-blocked hash:ip
-sudo iptables -A FREESWITCH -m set --match-set freeswitch-blocked src -j DROP
-```
-
-#### 4. Memory Exhaustion
-
-**Symptoms:**
-```bash
-iptables: Memory allocation problem
-```
-
-**Solutions:**
-```bash
-# Increase kernel memory limits
-echo 'net.netfilter.nf_conntrack_max = 131072' >> /etc/sysctl.conf
-echo 'net.netfilter.nf_conntrack_buckets = 32768' >> /etc/sysctl.conf
-sysctl -p
-
-# Monitor memory usage
-cat /proc/sys/net/netfilter/nf_conntrack_count
-cat /proc/sys/net/netfilter/nf_conntrack_max
-```
-
-### Debugging Commands
-
-#### Trace Rule Processing
-```bash
-# Enable IPTables logging for debugging
-sudo iptables -I FREESWITCH 1 -j LOG --log-prefix "FREESWITCH-DEBUG: "
-
-# Monitor logs
-sudo tail -f /var/log/kern.log | grep FREESWITCH-DEBUG
-
-# Remove debug rule when done
-sudo iptables -D FREESWITCH -j LOG --log-prefix "FREESWITCH-DEBUG: "
-```
-
-#### Test Specific Rules
-```bash
-# Test if a specific IP is blocked
-sudo iptables -C FREESWITCH -s 192.0.2.1 -j DROP
-echo $?  # 0 = rule exists, 1 = rule does not exist
-
-# List rules in creation order
-sudo iptables -S FREESWITCH
-```
-
-## 🔒 Security Best Practices
-
-### Rule Management
-
-1. **Minimize Rule Count**: Use CIDR blocks instead of individual IPs when possible
-2. **Regular Cleanup**: Implement automated removal of expired rules
-3. **Monitoring**: Set up alerts for unusual rule count increases
-4. **Backup Strategy**: Regular rule backups before major changes
-
-### Access Control
-
-1. **Principle of Least Privilege**: Only grant necessary IPTables permissions
-2. **API Security**: Restrict API access to management networks
-3. **Audit Logging**: Enable comprehensive logging of rule changes
-4. **Change Management**: Document all manual IPTables modifications
-
-### Network Security
-
-```bash
-# Restrict management access
+# Security API — restrict to the management network
 sudo iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 8080 -j DROP
-
-# Rate limit API requests
-sudo iptables -A INPUT -p tcp --dport 8080 -m limit --limit 30/min -j ACCEPT
-
-# Log suspicious activity
-sudo iptables -A INPUT -p tcp --dport 5060 -m limit --limit 1/sec --limit-burst 5 \
-  -j LOG --log-prefix "SIP-FLOOD: "
 ```
 
-## 📈 Performance Optimization
+The application installs its own match-set DROP rule at position 1 of the
+configured chain, so blocked IPs are dropped before any ACCEPT rule below it.
 
-### Batch Operation Tuning
+## 🧪 Testing and validation
 
-The application uses batch operations to minimize system call overhead:
-
-```go
-// Example of batch processing in the application
-func (sm *SecurityManager) batchBlockIPs(ips []string) {
-    // Group multiple iptables commands into single shell execution
-    var commands []string
-    for _, ip := range ips {
-        cmd := fmt.Sprintf("iptables -A %s -s %s -j DROP",
-                          sm.securityConfig.IPTablesChain, ip)
-        commands = append(commands, cmd)
-    }
-
-    // Execute all commands in one shell invocation
-    script := strings.Join(commands, " && ")
-    exec.Command("sh", "-c", script).Run()
-}
-```
-
-### IPSet Integration for Scale
-
-For environments with thousands of blocked IPs:
+The app creates the set and rule on startup (when `auto_block_enabled`). To
+verify by hand:
 
 ```bash
-# Create ipset for blocked IPs
-sudo ipset create freeswitch-blocked hash:ip maxelem 100000
+# 1. The set exists
+sudo ipset list freeswitch-security | head
 
-# Use single iptables rule with ipset
-sudo iptables -A FREESWITCH -m set --match-set freeswitch-blocked src -j DROP
-
-# Add IPs to set (much faster than individual rules)
-sudo ipset add freeswitch-blocked 192.0.2.1
-sudo ipset add freeswitch-blocked 192.0.2.2
+# 2. The single match-set rule is present in the chain
+sudo iptables -S INPUT | grep -- '--match-set freeswitch-security'
+# -A INPUT -m set --match-set freeswitch-security src -j DROP   (at position 1)
 ```
 
-### Rule Optimization Strategies
-
-1. **Most Specific First**: Place most common blocks at top of chain
-2. **CIDR Consolidation**: Combine individual IPs into CIDR blocks
-3. **Time-Based Cleanup**: Remove stale rules proactively
-4. **Memory Monitoring**: Track kernel memory usage
-
-## 🎯 Production Deployment Checklist
-
-### Pre-Deployment
-
-- [ ] Test IPTables functionality in staging environment
-- [ ] Verify application has appropriate permissions
-- [ ] Configure firewall rules for FreeSWITCH services
-- [ ] Set up monitoring and alerting
-- [ ] Create rule backup and restore procedures
-
-### Post-Deployment
-
-- [ ] Verify chain creation and integration
-- [ ] Test blocking functionality with known bad IPs
-- [ ] Monitor system performance impact
-- [ ] Set up automated maintenance tasks
-- [ ] Document emergency procedures
-
-### Monitoring Setup
+End-to-end via the API:
 
 ```bash
-# Create monitoring script
-#!/bin/bash
-# /usr/local/bin/monitor-freeswitch-security
+# Block
+curl -X POST http://127.0.0.1:8080/security/blacklist \
+  -H 'Content-Type: application/json' \
+  -d '{"ip":"192.0.2.100","reason":"test","permanent":false}'
 
-# Check chain exists
-if ! iptables -L FREESWITCH >/dev/null 2>&1; then
-    echo "CRITICAL: FREESWITCH chain missing"
-    exit 2
-fi
+# The IP is now a set member (with a countdown timeout)
+sudo ipset test freeswitch-security 192.0.2.100   # → "... is in set ..."
 
-# Check rule count
-RULE_COUNT=$(iptables -L FREESWITCH --line-numbers | tail -n +3 | wc -l)
-if [ $RULE_COUNT -gt 5000 ]; then
-    echo "WARNING: High rule count: $RULE_COUNT"
-    exit 1
-fi
-
-echo "OK: $RULE_COUNT rules active"
-exit 0
+# Unblock
+curl -X DELETE http://127.0.0.1:8080/security/blacklist/192.0.2.100
+sudo ipset test freeswitch-security 192.0.2.100   # → "... is NOT in set ..."
 ```
 
-## 🔗 Integration Examples
-
-### Nagios/Icinga Monitoring
+The `/security/iptables` endpoint reports set state directly:
 
 ```bash
-# /etc/nagios/commands.cfg
-define command{
-    command_name    check_freeswitch_iptables
-    command_line    /usr/local/bin/monitor-freeswitch-security
-}
-
-# Service definition
-define service{
-    service_description     FreeSWITCH IPTables
-    host_name               voip-server
-    check_command           check_freeswitch_iptables
-    check_interval          5
-}
+curl -s http://127.0.0.1:8080/security/iptables | jq '.'
+# { "chain": "INPUT", "ipset": "freeswitch-security",
+#   "blocked_ips": ["192.0.2.100"], "count": 1 }
 ```
 
-### Prometheus Metrics
+## 📊 Monitoring and maintenance
 
 ```bash
-# Custom exporter for IPTables metrics
-#!/bin/bash
-echo "# HELP freeswitch_iptables_rules_total Total IPTables rules"
-echo "# TYPE freeswitch_iptables_rules_total gauge"
-RULE_COUNT=$(iptables -L FREESWITCH --line-numbers | tail -n +3 | wc -l)
-echo "freeswitch_iptables_rules_total $RULE_COUNT"
+# Current bans (with per-entry remaining timeout)
+sudo ipset list freeswitch-security
+
+# Member count
+sudo ipset list freeswitch-security | sed -n 's/^Number of entries: //p'
+
+# Packets dropped by the match-set rule
+sudo iptables -L INPUT -v -n | grep -- 'match-set freeswitch-security'
 ```
 
-## 📚 Additional Resources
+There is **no per-rule cleanup to run**: entries expire in the kernel via their
+timeout, and the application also removes them from the set when a ban is
+lifted or a whitelist entry supersedes it.
 
-### Documentation References
+### Backup / restore the set
 
-- [Netfilter Documentation](https://www.netfilter.org/documentation/)
-- [IPTables Manual](https://linux.die.net/man/8/iptables)
-- [FreeSWITCH Security Best Practices](https://freeswitch.org/confluence/display/FREESWITCH/Security)
+```bash
+sudo ipset save freeswitch-security > /backup/fs-ipset-$(date +%Y%m%d).save
+sudo ipset restore < /backup/fs-ipset-20260604.save
+```
 
-### Related Tools
+## 🔍 Troubleshooting
 
-- **ipset**: High-performance IP sets for large-scale blocking
-- **fail2ban**: Complementary intrusion prevention system
-- **ufw**: Simplified firewall management
-- **firewalld**: Dynamic firewall management
+#### `ipset is not installed or not on PATH`
+The binary is missing or `ipset` isn't installed. Install it (see
+Prerequisites) or run with `dry_run: true` to start without firewall changes.
+
+#### Blocked IPs can still connect
+Confirm the match-set rule is actually reached:
+```bash
+sudo iptables -S INPUT | grep -n -- '--match-set freeswitch-security'
+```
+It must sit above any broad ACCEPT rule. The app inserts at position 1; if a
+later manual edit moved it, re-insert it or restart with `auto_block_enabled`.
+
+#### Verify a specific IP / inspect the set
+```bash
+sudo ipset test freeswitch-security 192.0.2.1   # membership
+sudo ipset list freeswitch-security              # all members + timeouts
+```
+
+#### Permission denied
+```bash
+sudo iptables -L >/dev/null 2>&1 && echo OK || echo "need CAP_NET_ADMIN/root"
+sudo setcap cap_net_admin=+ep ./bin/freeswitch-security
+```
+
+#### Dry-run for safe diagnosis
+Set `dry_run: true` (or `SECURITY_DRY_RUN=true`): the app logs every `ipset`
+and `iptables` command it *would* run without touching kernel state.
+
+## 🔒 Security best practices
+
+- **Least privilege**: prefer `CAP_NET_ADMIN` over running as root; scope sudo
+  to `ipset`/`iptables` only.
+- **Restrict the API**: bind to a management interface and firewall port 8080 to
+  trusted sources; keep the pprof endpoint loopback-only (the default).
+- **Trusted networks**: list management/internal CIDRs in `trusted_networks` so
+  the app never blocks them.
+- **Complementary tooling**: ipset pairs cleanly with fail2ban (point its action
+  at the same set) and host firewall managers (ufw/firewalld) for base policy.
+
+## 📚 References
+
+- [ipset manual](https://ipset.netfilter.org/ipset.man.html)
+- [Netfilter documentation](https://www.netfilter.org/documentation/)
+- The blocking backend is implemented in `ipset.go` (`IPSetManager`), ported
+  from the sibling `opensips-journal-blocker` project to keep the two services'
+  firewall behaviour identical.
 
 ---
 
-## 🔚 Conclusion
-
-The IPTables integration in FreeSWITCH Security provides enterprise-grade protection through:
-
-- **Stealth Blocking**: Silent packet dropping prevents reconnaissance
-- **Batch Operations**: Efficient rule management reduces system overhead
-- **Automatic Management**: Dynamic rule creation and cleanup
-- **Performance Optimization**: Minimal impact on system resources
-- **Comprehensive Monitoring**: Full visibility into blocking effectiveness
-
-By following this guide, you can implement a robust, scalable IPTables-based security solution that protects your FreeSWITCH infrastructure while maintaining optimal performance.
-
-For additional support or advanced configuration scenarios, please refer to the main [README.md](README.md) or consult the project's issue tracker.
-
----
-
-**Related Documentation:**
-- [Main README](README.md) - Complete application overview
-- [Logging Guide](logging.md) - Comprehensive logging configuration
-- [ESL Command API](esl.md) - FreeSWITCH command interface
+**Related documentation:**
+- [Main README](README.md) — application overview
+- [Logging Guide](logging.md) — logging configuration
+- [ESL Command API](esl.md) — FreeSWITCH command interface

@@ -260,7 +260,7 @@ curl -X POST http://localhost:8080/security/esl/log_level \
 ```
 
 **Optimization:**
-- Monitor queue depths: `GET /security/channels`
+- Monitor ESL queue/worker stats: `GET /security/esl`
 - Adjust worker count based on CPU cores
 - Increase initial queue sizes in configuration
 - Consider hardware upgrades for sustained high load
@@ -486,7 +486,7 @@ curl -s http://localhost:8080/security/esl | jq '.connected'
 grep "ESL log level set" /var/log/freeswitch-security.log | tail -5
 
 # Performance baseline
-curl -s http://localhost:8080/security/channels | jq '.channel_stats'
+curl -s http://localhost:8080/security/esl | jq '{queue_length, queue_capacity, worker_count, events_dropped}'
 ```
 
 ## 🔧 Advanced Features

@@ -253,15 +253,7 @@ func registerRoutes(router *gin.Engine) {
 
 	// Cache control endpoints
 	router.POST("/cache/security/clear", func(c *gin.Context) {
-		cache := GetCacheManager()
-
-		err := cache.ClearSecurityCache()
-		if err != nil {
-			c.JSON(500, gin.H{respKeyError: err.Error()})
-
-			return
-		}
-
+		GetCacheManager().ClearSecurityCache()
 		c.JSON(200, gin.H{respKeyStatus: "security cache cleared"})
 	})
 

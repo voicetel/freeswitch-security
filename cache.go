@@ -2,41 +2,45 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/allegro/bigcache/v3"
 )
 
-// CacheManager wraps a bigcache.BigCache instance.
-//
-// bigcache is already thread-safe with sharded internal locks, so this type
-// adds nothing beyond a no-op when caching is disabled and a small statistics
-// surface for observability.
+// CacheManager is a small TTL cache for HTTP response bodies — currently just
+// the /security/stats JSON. The authoritative security state (whitelist,
+// blacklist, counters) lives in SecurityManager's maps; this is a best-effort
+// response cache, so it is a plain mutex-guarded map with per-entry expiry
+// rather than an external cache library.
 type CacheManager struct {
-	cache       *bigcache.BigCache
 	enabled     bool
 	securityTTL time.Duration
 
-	// closed makes Shutdown idempotent: bigcache panics on a second Close.
-	closed atomic.Bool
+	mu    sync.RWMutex
+	items map[string]cacheItem
 
-	// Statistics. All fields are accessed via atomic operations.
+	// Lifecycle for the background expiry janitor.
+	cancel context.CancelFunc
+	closed atomic.Bool
+	wg     sync.WaitGroup
+
 	stats CacheStats
 }
 
-// CacheStats tracks cache statistics.
+// cacheItem is a stored value with an optional expiry. A zero expires means the
+// entry never expires.
+type cacheItem struct {
+	data    []byte
+	expires time.Time
+}
+
+// CacheStats tracks cache statistics via atomic counters.
 type CacheStats struct {
-	Writes       atomic.Int64
-	Reads        atomic.Int64
-	Deletes      atomic.Int64
-	WriteErrors  atomic.Int64
-	ReadErrors   atomic.Int64
-	DeleteErrors atomic.Int64
+	Writes  atomic.Int64
+	Reads   atomic.Int64
+	Misses  atomic.Int64
+	Deletes atomic.Int64
 }
 
 var (
@@ -44,137 +48,134 @@ var (
 	cacheManagerOnce sync.Once
 )
 
+// defaultCacheTTL is the fallback for the security TTL and cleanup interval
+// when the configured values cannot be parsed.
+const defaultCacheTTL = 5 * time.Minute
+
 // newCacheManagerFromConfig builds a CacheManager from the given app config.
-// Unparsable durations fall back to 5 minutes; a disabled config yields a
-// no-op manager and no error.
-func newCacheManagerFromConfig(cfg *AppConfig) (*CacheManager, error) {
+// Unparsable durations fall back to defaultCacheTTL; a disabled config yields a
+// no-op manager.
+func newCacheManagerFromConfig(cfg *AppConfig) *CacheManager {
 	if !cfg.Cache.Enabled {
 		log.Println("Cache is disabled in configuration")
 
-		return &CacheManager{enabled: false}, nil
+		return &CacheManager{enabled: false}
 	}
 
 	securityTTL, err := time.ParseDuration(cfg.Cache.SecurityTTL)
 	if err != nil {
-		log.Printf("Error parsing security TTL, using default 5m: %v", err)
+		log.Printf("Error parsing security TTL, using default %s: %v", defaultCacheTTL, err)
 
-		securityTTL = 5 * time.Minute
+		securityTTL = defaultCacheTTL
 	}
 
 	cleanupInterval, err := time.ParseDuration(cfg.Cache.CleanupInterval)
 	if err != nil {
-		log.Printf("Error parsing cleanup interval, using default 5m: %v", err)
+		log.Printf("Error parsing cleanup interval, using default %s: %v", defaultCacheTTL, err)
 
-		cleanupInterval = 5 * time.Minute
+		cleanupInterval = defaultCacheTTL
 	}
 
-	bcCfg := bigcache.DefaultConfig(securityTTL)
-	bcCfg.CleanWindow = cleanupInterval
-	bcCfg.MaxEntriesInWindow = cfg.Cache.MaxEntriesInWindow
-	bcCfg.MaxEntrySize = cfg.Cache.MaxEntrySize
-	bcCfg.Shards = cfg.Cache.ShardCount
-	bcCfg.Verbose = cfg.Server.LogRequests
-
-	bc, err := bigcache.New(context.Background(), bcCfg)
-	if err != nil {
-		log.Printf("Error initializing security cache: %v", err)
-
-		return nil, fmt.Errorf("initializing bigcache: %w", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cm := &CacheManager{
+		enabled:     true,
+		securityTTL: securityTTL,
+		items:       make(map[string]cacheItem),
+		cancel:      cancel,
 	}
+
+	cm.wg.Add(1)
+	go cm.janitor(ctx, cleanupInterval)
 
 	log.Printf("Cache initialized - security TTL: %s", securityTTL)
 
-	return &CacheManager{
-		cache:       bc,
-		enabled:     true,
-		securityTTL: securityTTL,
-	}, nil
+	return cm
 }
 
 // InitCache initializes the cache manager.
 func InitCache() error {
-	var initErr error
-
 	cacheManagerOnce.Do(func() {
-		cacheManager, initErr = newCacheManagerFromConfig(GetConfig())
+		cacheManager = newCacheManagerFromConfig(GetConfig())
 	})
 
-	if cacheManager != nil && cacheManager.enabled && cacheManager.cache == nil {
+	if cacheManager != nil && cacheManager.enabled && cacheManager.items == nil {
 		return ErrCacheInit
 	}
 
-	return initErr
+	return nil
 }
 
-// CacheSecurityItem caches a security item. It is safe to call concurrently.
-// Errors are logged but not returned because the cache is best-effort.
+// CacheSecurityItem caches a value under key. It is safe to call concurrently.
+// The data is copied, so the caller may reuse its buffer.
 func (cm *CacheManager) CacheSecurityItem(key string, data []byte) {
-	if cm == nil || !cm.enabled || cm.cache == nil {
+	if cm == nil || !cm.enabled || cm.items == nil {
 		return
 	}
 
-	err := cm.cache.Set(key, data)
-	if err != nil {
-		cm.stats.WriteErrors.Add(1)
-		GetLogger().Error("cache set %q: %v", key, err)
+	buf := make([]byte, len(data))
+	copy(buf, data)
 
-		return
+	var expires time.Time
+	if cm.securityTTL > 0 {
+		expires = time.Now().Add(cm.securityTTL)
 	}
+
+	cm.mu.Lock()
+	cm.items[key] = cacheItem{data: buf, expires: expires}
+	cm.mu.Unlock()
 
 	cm.stats.Writes.Add(1)
 }
 
-// GetSecurityItem retrieves a security item by key.
+// GetSecurityItem retrieves a value by key. Expired entries read as a miss.
 func (cm *CacheManager) GetSecurityItem(key string) ([]byte, bool) {
-	if cm == nil || !cm.enabled || cm.cache == nil {
+	if cm == nil || !cm.enabled || cm.items == nil {
 		return nil, false
 	}
 
-	data, err := cm.cache.Get(key)
-	if err != nil {
-		// bigcache returns ErrEntryNotFound on miss; that's not an error.
-		if !errors.Is(err, bigcache.ErrEntryNotFound) {
-			cm.stats.ReadErrors.Add(1)
-		}
+	cm.mu.RLock()
+	item, ok := cm.items[key]
+	cm.mu.RUnlock()
+
+	if !ok || (!item.expires.IsZero() && item.expires.Before(time.Now())) {
+		cm.stats.Misses.Add(1)
 
 		return nil, false
 	}
 
 	cm.stats.Reads.Add(1)
 
-	return data, true
+	out := make([]byte, len(item.data))
+	copy(out, item.data)
+
+	return out, true
 }
 
-// DeleteSecurityItem deletes a security item.
+// DeleteSecurityItem removes a key. It is a no-op (and not counted) if absent.
 func (cm *CacheManager) DeleteSecurityItem(key string) {
-	if cm == nil || !cm.enabled || cm.cache == nil {
+	if cm == nil || !cm.enabled || cm.items == nil {
 		return
 	}
 
-	err := cm.cache.Delete(key)
-	if err != nil {
-		if !errors.Is(err, bigcache.ErrEntryNotFound) {
-			cm.stats.DeleteErrors.Add(1)
-		}
+	cm.mu.Lock()
+	_, ok := cm.items[key]
+	delete(cm.items, key)
+	cm.mu.Unlock()
 
-		return
+	if ok {
+		cm.stats.Deletes.Add(1)
 	}
-
-	cm.stats.Deletes.Add(1)
 }
 
-// ClearSecurityCache clears the security cache.
-func (cm *CacheManager) ClearSecurityCache() error {
-	if cm == nil || !cm.enabled || cm.cache == nil {
-		return nil
+// ClearSecurityCache drops every cached entry.
+func (cm *CacheManager) ClearSecurityCache() {
+	if cm == nil || !cm.enabled || cm.items == nil {
+		return
 	}
 
-	err := cm.cache.Reset()
-	if err != nil {
-		return fmt.Errorf("bigcache reset: %w", err)
-	}
-
-	return nil
+	cm.mu.Lock()
+	cm.items = make(map[string]cacheItem)
+	cm.mu.Unlock()
 }
 
 // GetCacheStats returns cache statistics.
@@ -184,33 +185,30 @@ func (cm *CacheManager) GetCacheStats() map[string]any {
 		return stats
 	}
 
-	if cm.cache != nil {
-		bc := cm.cache.Stats()
-		stats["security"] = map[string]any{
-			"hits":       bc.Hits,
-			"misses":     bc.Misses,
-			"collisions": bc.Collisions,
-			"del_hits":   bc.DelHits,
-			"del_misses": bc.DelMisses,
-			"ttl":        cm.securityTTL.String(),
-		}
+	cm.mu.RLock()
+	entries := len(cm.items)
+	cm.mu.RUnlock()
+
+	stats["security"] = map[string]any{
+		"hits":    cm.stats.Reads.Load(),
+		"misses":  cm.stats.Misses.Load(),
+		"entries": entries,
+		"ttl":     cm.securityTTL.String(),
 	}
 
 	stats["operations"] = map[string]any{
-		"writes":        cm.stats.Writes.Load(),
-		"reads":         cm.stats.Reads.Load(),
-		"deletes":       cm.stats.Deletes.Load(),
-		"write_errors":  cm.stats.WriteErrors.Load(),
-		"read_errors":   cm.stats.ReadErrors.Load(),
-		"delete_errors": cm.stats.DeleteErrors.Load(),
+		"writes":  cm.stats.Writes.Load(),
+		"reads":   cm.stats.Reads.Load(),
+		"misses":  cm.stats.Misses.Load(),
+		"deletes": cm.stats.Deletes.Load(),
 	}
 
 	return stats
 }
 
-// Shutdown closes the underlying cache. It is safe to call multiple times.
+// Shutdown stops the janitor. It is safe to call multiple times.
 func (cm *CacheManager) Shutdown() {
-	if cm == nil || !cm.enabled || cm.cache == nil {
+	if cm == nil || !cm.enabled {
 		return
 	}
 
@@ -218,10 +216,45 @@ func (cm *CacheManager) Shutdown() {
 		return
 	}
 
-	err := cm.cache.Close()
-	if err != nil {
-		log.Printf("Error closing cache: %v", err)
+	if cm.cancel != nil {
+		cm.cancel()
 	}
+
+	cm.wg.Wait()
+}
+
+// janitor periodically purges expired entries until the context is canceled.
+func (cm *CacheManager) janitor(ctx context.Context, interval time.Duration) {
+	defer cm.wg.Done()
+
+	if interval <= 0 {
+		interval = defaultCacheTTL
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cm.purgeExpired()
+		}
+	}
+}
+
+// purgeExpired removes entries whose expiry has passed.
+func (cm *CacheManager) purgeExpired() {
+	now := time.Now()
+
+	cm.mu.Lock()
+	for key, item := range cm.items {
+		if !item.expires.IsZero() && item.expires.Before(now) {
+			delete(cm.items, key)
+		}
+	}
+	cm.mu.Unlock()
 }
 
 // GetCacheManager returns the cache manager instance, initializing it on first call.

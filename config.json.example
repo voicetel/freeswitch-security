@@ -13,10 +13,7 @@
   "cache": {
     "enabled": true,
     "security_ttl": "5m",
-    "cleanup_interval": "5m",
-    "max_entries_in_window": 10000,
-    "max_entry_size": 500,
-    "shard_count": 1024
+    "cleanup_interval": "5m"
   },
   "security": {
     "enabled": true,

@@ -3,7 +3,6 @@ module github.com/voicetel/freeswitch-security
 go 1.24.2
 
 require (
-	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/fiorix/go-eventsocket v0.0.0-20240904143901-40effc2c18a7
 	github.com/gin-gonic/gin v1.10.0
 )

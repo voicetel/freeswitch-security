@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/allegro/bigcache/v3"
 	"github.com/gin-gonic/gin"
 )
 
@@ -40,19 +39,24 @@ func TestSingleton_Cache(t *testing.T) {
 	}
 
 	// CloseCache must shut down whatever the global currently points at.
-	// Swap in a throwaway instance (built inline: newTestCacheManager would
-	// register a second Shutdown cleanup and double-close the bigcache) so
-	// the shared cache stays usable for the remaining tests.
+	// Swap in a throwaway instance so the shared cache stays usable for the
+	// remaining tests, and restore it afterwards.
 	saved := cacheManager
 
 	defer func() { cacheManager = saved }()
 
-	bc, err := bigcache.New(context.Background(), bigcache.DefaultConfig(time.Minute))
-	if err != nil {
-		t.Fatalf("bigcache.New: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	throwaway := &CacheManager{
+		enabled:     true,
+		securityTTL: time.Minute,
+		items:       make(map[string]cacheItem),
+		cancel:      cancel,
 	}
+	throwaway.wg.Add(1)
 
-	cacheManager = &CacheManager{cache: bc, enabled: true, securityTTL: time.Minute}
+	go throwaway.janitor(ctx, time.Minute)
+
+	cacheManager = throwaway
 
 	CloseCache()
 
@@ -66,7 +70,7 @@ func TestSingleton_Cache(t *testing.T) {
 		t.Errorf("GetCacheManager after exhausted once = %v, want nil", got)
 	}
 
-	// An enabled manager with no live cache makes InitCache report ErrCacheInit.
+	// An enabled manager with no live store makes InitCache report ErrCacheInit.
 	cacheManager = &CacheManager{enabled: true}
 
 	initErr := InitCache()

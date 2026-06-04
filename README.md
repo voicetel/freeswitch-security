@@ -40,7 +40,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 - **Real-time Monitoring**: Live rate tracking with detailed statistics
 
 ### Enterprise-Grade Caching
-- **High-Performance In-Memory Cache**: BigCache-powered with configurable sharding
+- **In-Memory Response Cache**: lightweight TTL cache for HTTP responses (stdlib, no external dependency)
 - **Channel-Based Write Operations**: Batched writes for optimal performance
 - **Configurable TTLs**: Granular expiration control for different data types
 - **Automatic Eviction**: Intelligent cleanup to prevent memory bloat
@@ -51,7 +51,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 ```
 ├── main.go              # Application entry point and graceful shutdown
 ├── config.go            # Configuration management with environment variable support
-├── cache.go             # High-performance caching backed by BigCache
+├── cache.go             # In-memory TTL response cache (stdlib)
 ├── security.go          # Core security engine: lists, batching, iptables
 ├── esl.go               # Event Socket Layer integration with worker pools
 ├── rate.go              # Sharded per-IP rate limiting with automatic cleanup
@@ -137,10 +137,7 @@ with `benchstat`); figures from a 12th-gen mobile CPU:
   "cache": {
     "enabled": true,
     "security_ttl": "5m",
-    "cleanup_interval": "5m",
-    "max_entries_in_window": 10000,
-    "max_entry_size": 500,
-    "shard_count": 1024
+    "cleanup_interval": "5m"
   },
   "security": {
     "enabled": true,

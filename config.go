@@ -24,12 +24,9 @@ type AppConfig struct {
 		DefaultDomain string `json:"default_domain"`
 	} `json:"freeswitch"`
 	Cache struct {
-		Enabled            bool   `json:"enabled"`
-		SecurityTTL        string `json:"security_ttl"`
-		CleanupInterval    string `json:"cleanup_interval"`
-		MaxEntriesInWindow int    `json:"max_entries_in_window"`
-		MaxEntrySize       int    `json:"max_entry_size"`
-		ShardCount         int    `json:"shard_count"`
+		Enabled         bool   `json:"enabled"`
+		SecurityTTL     string `json:"security_ttl"`
+		CleanupInterval string `json:"cleanup_interval"`
 	} `json:"cache"`
 	Security struct {
 		Enabled                bool     `json:"enabled"`
@@ -98,11 +95,8 @@ func defaultConfig() *AppConfig {
 
 	// Cache defaults
 	cfg.Cache.Enabled = true
-	cfg.Cache.SecurityTTL = "5m"         // 5 minutes for security cache
-	cfg.Cache.CleanupInterval = "5m"     // 5 minutes cleanup
-	cfg.Cache.MaxEntriesInWindow = 10000 // Maximum items in cache window
-	cfg.Cache.MaxEntrySize = 500         // Maximum entry size in KB
-	cfg.Cache.ShardCount = 1024          // Number of shards in BigCache
+	cfg.Cache.SecurityTTL = "5m"     // TTL for cached HTTP responses
+	cfg.Cache.CleanupInterval = "5m" // expiry janitor interval
 
 	// Security defaults
 	cfg.Security.Enabled = true
@@ -297,9 +291,6 @@ func loadEnvironmentVariables(config *AppConfig) {
 	envBool("CACHE_ENABLED", &config.Cache.Enabled)
 	envString("CACHE_SECURITY_TTL", &config.Cache.SecurityTTL)
 	envString("CACHE_CLEANUP_INTERVAL", &config.Cache.CleanupInterval)
-	envInt("CACHE_MAX_ENTRIES", &config.Cache.MaxEntriesInWindow)
-	envInt("CACHE_MAX_ENTRY_SIZE", &config.Cache.MaxEntrySize)
-	envInt("CACHE_SHARD_COUNT", &config.Cache.ShardCount)
 
 	// Security
 	envBool("SECURITY_ENABLED", &config.Security.Enabled)

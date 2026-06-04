@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Opt into Node.js 24 for JavaScript actions ahead of the June 2026 default
+# switch (Node 20 is deprecated on GitHub runners).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   quality:
     name: Quality

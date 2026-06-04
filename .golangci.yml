@@ -109,10 +109,34 @@ linters:
         path: logging\.go
       - linters:
           - gochecknoglobals
-        text: (securityManager|cacheManager|eslManager|globalLogger|requestProcessor|httpServer|backoffMultipliers|config|secManagerOnce|cacheManagerOnce|eslManagerOnce|globalLoggerOnce|processorOnce|configOnce|execCommand|sinkBool|sinkString|sinkStrings|sinkDuration|fakeExecMu|fakeExecBehaviors) is a global variable
+        text: (securityManager|cacheManager|eslManager|globalLogger|requestProcessor|httpServer|backoffMultipliers|config|secManagerOnce|cacheManagerOnce|eslManagerOnce|globalLoggerOnce|processorOnce|configOnce|sinkBool|sinkString|sinkStrings|sinkDuration) is a global variable
       - linters:
           - containedctx
         text: found a struct that contains a context\.Context field
+      # ipset.go (and its tests) are ported verbatim from the sibling
+      # opensips-journal-blocker project to keep the two firewall backends
+      # behaviourally identical. They are intentionally linted under that
+      # project's (looser) style ruleset rather than this repo's stricter one,
+      # so the port stays byte-for-byte faithful. Logic linters (govet,
+      # staticcheck, gosec, ineffassign, etc.) still apply.
+      - linters:
+          - err113
+          - errorlint
+          - funcorder
+          - gochecknoglobals
+          - goconst
+          - lll
+          - modernize
+          - nlreturn
+          - noctx
+          - noinlineerr
+          - paralleltest
+          - perfsprint
+          - varnamelen
+          - wrapcheck
+          - wsl
+          - wsl_v5
+        path: ipset(_test|_fake_test)?\.go$
     paths:
       - third_party$
       - builtin$

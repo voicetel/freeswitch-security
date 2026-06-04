@@ -18,15 +18,12 @@ import (
 )
 
 // TestMain installs gin's TestMode globally before any test runs, suppressing
-// gin's debug banner, and replaces the iptables exec seam with the in-process
-// fake (see exec_fake_test.go) so tests never touch host firewall state.
-// Using TestMain rather than init() keeps test setup localized to the testing
-// package's lifecycle.
+// gin's debug banner. SecurityManager test instances are wired to a no-op
+// ipset runner (see ipset_fake_test.go), so tests never touch host firewall
+// state. Using TestMain rather than init() keeps test setup localized to the
+// testing package's lifecycle.
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
-
-	execCommand = fakeExecCommand
-
 	os.Exit(m.Run())
 }
 
@@ -644,14 +641,12 @@ func TestRoute_SecurityStatsHandler(t *testing.T) {
 func TestRoute_IptablesHandler(t *testing.T) {
 	t.Parallel()
 
-	const chain = "TEST_HTTP_IPTABLES"
-
-	registerIptablesBehavior(t, chain, func(_ []string) (string, int) {
-		return "-N " + chain + "\n", 0
-	})
-
 	sm := newTestSecurityManager(t)
-	sm.cfg.IPTablesChain = chain
+
+	// Success path: ipset list returns one member.
+	sm.ipset.run = func(_ string, _ ...string) ([]byte, error) {
+		return []byte("Name: fs-test\nMembers:\n203.0.113.5 timeout 120\n"), nil
+	}
 
 	router := gin.New()
 	router.GET("/security/iptables", iptablesHandler(sm))
@@ -661,12 +656,25 @@ func TestRoute_IptablesHandler(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
 
-	// Error path: a chain with no registered behavior fails to list.
-	sm.cfg.IPTablesChain = "TEST_HTTP_IPTABLES_MISSING"
+	var resp map[string]any
+
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp["count"] != float64(1) {
+		t.Errorf("count = %v, want 1", resp["count"])
+	}
+
+	// Error path: ipset list fails.
+	sm.ipset.run = func(_ string, _ ...string) ([]byte, error) {
+		return []byte("set not found"), errFakeIPSet
+	}
 
 	rec = doJSON(t, router, "GET", "/security/iptables", "")
 	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 for failing chain, got %d", rec.Code)
+		t.Errorf("expected 500 for failing list, got %d", rec.Code)
 	}
 }
 

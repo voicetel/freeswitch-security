@@ -46,6 +46,8 @@ type AppConfig struct {
 		TrustedNetworks        []string `json:"trusted_networks"`
 		UntrustedNetworks      []string `json:"untrusted_networks"`
 		IPTablesChain          string   `json:"iptables_chain"`
+		IPSetName              string   `json:"ipset_name"`
+		DryRun                 bool     `json:"dry_run"`
 		AutoWhitelistOnSuccess bool     `json:"auto_whitelist_on_success"`
 		ESLLogLevel            string   `json:"esl_log_level"`
 		ReconnectBackoff       string   `json:"reconnect_backoff"`
@@ -69,6 +71,10 @@ type AppConfig struct {
 // configuration value is provided. example.com is the IANA-reserved domain
 // for documentation and examples (RFC 2606).
 const defaultFreeSWITCHDomain = "example.com"
+
+// defaultIPTablesChain is the chain the single ipset match-set DROP rule is
+// inserted into; it must be a chain the kernel actually traverses.
+const defaultIPTablesChain = "INPUT"
 
 var (
 	config     *AppConfig
@@ -122,7 +128,9 @@ func defaultConfig() *AppConfig {
 		"192.168.0.0/16",
 	}
 	cfg.Security.UntrustedNetworks = []string{}
-	cfg.Security.IPTablesChain = "FREESWITCH"
+	cfg.Security.IPTablesChain = defaultIPTablesChain
+	cfg.Security.IPSetName = "freeswitch-security"
+	cfg.Security.DryRun = false
 	cfg.Security.AutoWhitelistOnSuccess = true
 	cfg.Security.ESLLogLevel = logLevelInfoStr
 	cfg.Security.ReconnectBackoff = "5s"
@@ -306,6 +314,8 @@ func loadEnvironmentVariables(config *AppConfig) {
 	envBool("SECURITY_WHITELIST_ENABLED", &config.Security.WhitelistEnabled)
 	envString("SECURITY_WHITELIST_TTL", &config.Security.WhitelistTTL)
 	envString("SECURITY_IPTABLES_CHAIN", &config.Security.IPTablesChain)
+	envString("SECURITY_IPSET_NAME", &config.Security.IPSetName)
+	envBool("SECURITY_DRY_RUN", &config.Security.DryRun)
 	envBool("SECURITY_AUTO_WHITELIST_ON_SUCCESS", &config.Security.AutoWhitelistOnSuccess)
 	envString("SECURITY_ESL_LOG_LEVEL", &config.Security.ESLLogLevel)
 	envString("SECURITY_RECONNECT_BACKOFF", &config.Security.ReconnectBackoff)

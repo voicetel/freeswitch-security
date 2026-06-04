@@ -77,30 +77,35 @@ func TestSingleton_Cache(t *testing.T) {
 
 //nolint:paralleltest // ordered singleton initialization
 func TestSingleton_SecurityManager(t *testing.T) {
-	// config.json has auto_block_enabled=true, so init runs
-	// ensureIPTablesChain("FREESWITCH"); give it a succeeding fake so the
-	// happy-path branch executes. Add one bad CIDR (parse-error branch) and
-	// one untrusted pattern (patterns-loaded branch) before the once fires.
-	registerIptablesBehavior(t, "FREESWITCH", func(_ []string) (string, int) {
-		return "", 0
-	})
-
+	// config.json has auto_block_enabled=true, so init runs the ipset
+	// EnsureSetup + CleanupAutoBlocked path. Force dry-run so it touches no
+	// host firewall state. Add one bad CIDR (parse-error branch) and one
+	// untrusted pattern (patterns-loaded branch) before the once fires.
 	cfg0 := GetConfig()
 	savedTrusted := cfg0.Security.TrustedNetworks
 	savedUntrusted := cfg0.Security.UntrustedNetworks
+	savedDryRun := cfg0.Security.DryRun
 
 	cfg0.Security.TrustedNetworks = append(append([]string{}, savedTrusted...), "not-a-cidr")
 	cfg0.Security.UntrustedNetworks = []string{"evil.example"}
+	cfg0.Security.DryRun = true
 
 	defer func() {
 		cfg0.Security.TrustedNetworks = savedTrusted
 		cfg0.Security.UntrustedNetworks = savedUntrusted
+		cfg0.Security.DryRun = savedDryRun
 	}()
 
 	// First access goes through GetSecurityManager's nil branch.
 	sm := GetSecurityManager()
 	if sm == nil {
 		t.Fatal("GetSecurityManager returned nil")
+	}
+
+	// Belt-and-suspenders: ensure later reads (e.g. /security/iptables via the
+	// shared singleton) never shell out to a real ipset list.
+	sm.ipset.run = func(_ string, _ ...string) ([]byte, error) {
+		return []byte("Name: fs\nMembers:\n"), nil
 	}
 
 	if !sm.IsUntrustedDomain("evil.example") {
@@ -255,17 +260,14 @@ func TestRegisterSecurityRoutes(t *testing.T) {
 		"/security/esl",
 		"/security/rate-limit",
 		"/security/untrusted-networks",
+		// The singleton's ipset runner was stubbed to a successful list in
+		// TestSingleton_SecurityManager, so the firewall endpoint returns 200.
+		"/security/iptables",
 	} {
 		rec := doJSON(t, router, "GET", url, "")
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s: status=%d body=%s", url, rec.Code, rec.Body)
 		}
-	}
-
-	// iptables endpoint: the FREESWITCH chain has no fake behavior → 500.
-	rec := doJSON(t, router, "GET", "/security/iptables", "")
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("GET /security/iptables: expected 500 with no fake rules, got %d", rec.Code)
 	}
 }
 

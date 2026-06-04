@@ -11,7 +11,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 
 ### Advanced Security Management
 - **Intelligent IP Whitelisting/Blacklisting**: Dynamic management with TTL support and automatic cleanup
-- **Auto-blocking with IPTables**: Silent packet dropping using DROP action for stealth security
+- **Auto-blocking with ipset**: O(1) kernel hash set behind one iptables DROP rule, with in-kernel ban expiry
 - **Failed Registration Tracking**: Multi-layered detection of authentication attacks
 - **Wrong Call State Detection**: Identify toll fraud and system abuse attempts
 - **Untrusted Network Filtering**: Pattern-based blocking of known malicious domains
@@ -88,7 +88,7 @@ with `benchstat`); figures from a 12th-gen mobile CPU:
 
 - **Go 1.18+** - Modern Go version with generics support
 - **FreeSWITCH** with Event Socket Layer (ESL) enabled
-- **IPTables** - For automatic IP blocking (Linux systems)
+- **IPTables + ipset** - For automatic IP blocking (Linux systems; `apt install ipset` or `dnf install ipset`)
 - **Root/Sudo Access** - Required for IPTables rule management
 
 ### Quick Start
@@ -205,6 +205,9 @@ Override any configuration value using environment variables:
 | `SECURITY_MAX_FAILED_ATTEMPTS` | Failed attempts threshold | `10` |
 | `SECURITY_AUTO_BLOCK` | Enable auto-blocking | `true` |
 | `SECURITY_TRUSTED_NETWORKS` | Trusted networks (JSON array) | `["10.0.0.0/8"]` |
+| `SECURITY_IPTABLES_CHAIN` | Chain holding the ipset match-set DROP rule | `INPUT` |
+| `SECURITY_IPSET_NAME` | Name of the managed ipset | `freeswitch-security` |
+| `SECURITY_DRY_RUN` | Log firewall actions without executing them | `true` |
 | `SERVER_PPROF_ENABLED` | Enable pprof diagnostics server | `true` |
 | `SERVER_PPROF_ADDR` | pprof bind address (keep loopback) | `127.0.0.1:6060` |
 

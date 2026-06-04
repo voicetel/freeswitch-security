@@ -180,8 +180,12 @@ func TestBuildConfig_CreatesDefaultFile(t *testing.T) {
 		t.Fatalf("written default config is not valid JSON: %v", err)
 	}
 
-	if roundTrip.Security.IPTablesChain != "FREESWITCH" {
+	if roundTrip.Security.IPTablesChain != defaultIPTablesChain {
 		t.Errorf("written config chain = %q", roundTrip.Security.IPTablesChain)
+	}
+
+	if roundTrip.Security.IPSetName != "freeswitch-security" {
+		t.Errorf("written config ipset name = %q", roundTrip.Security.IPSetName)
 	}
 }
 

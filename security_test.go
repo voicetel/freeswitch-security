@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,12 +46,15 @@ func newTestSecurityManager(tb testing.TB) *SecurityManager {
 		untrustedPatterns: map[string]struct{}{
 			"evil.example": {},
 		},
+		ipset: newTestIPSet(),
 		cfg: effectiveSecurityConfig{
 			Enabled:                true,
 			AutoBlockEnabled:       false,
 			WhitelistEnabled:       true,
 			AutoWhitelistOnSuccess: false,
 			IPTablesChain:          "TEST",
+			IPSetName:              testIPSetName,
+			DryRun:                 false,
 			MaxFailedAttempts:      3,
 			FailedWindow:           10 * time.Minute,
 			BlockDuration:          time.Hour,
@@ -123,6 +128,20 @@ func TestAppendUnique(t *testing.T) {
 			}
 		})
 	}
+}
+
+func containsCall(calls []string, substr string) bool {
+	for _, c := range calls {
+		if strings.Contains(c, substr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func argsContain(args []string, want string) bool {
+	return slices.Contains(args, want)
 }
 
 func sliceEqual(got, want []string) bool {
@@ -1000,12 +1019,15 @@ func newDrainedSecurityManager(tb testing.TB) *SecurityManager {
 		failedAttempts:    make(map[string]FailedAttempt),
 		wrongStates:       make(map[string]WrongCallStateEntry),
 		untrustedPatterns: map[string]struct{}{},
+		ipset:             newTestIPSet(),
 		cfg: effectiveSecurityConfig{
 			Enabled:                true,
 			AutoBlockEnabled:       false,
 			WhitelistEnabled:       true,
 			AutoWhitelistOnSuccess: false,
 			IPTablesChain:          "TEST",
+			IPSetName:              testIPSetName,
+			DryRun:                 false,
 			MaxFailedAttempts:      3,
 			FailedWindow:           10 * time.Minute,
 			BlockDuration:          time.Hour,
@@ -1296,31 +1318,27 @@ func TestGetWhitelistEntry_Expired(t *testing.T) {
 
 // TestWhitelistUnblocksBlacklistedIP covers the blacklist-eviction path of
 // processBatchWhitelist: whitelisting a blacklisted IP removes the blacklist
-// entry and unblocks it via iptables when auto-block is on.
+// entry and unblocks it from the ipset when auto-block is on.
 func TestWhitelistUnblocksBlacklistedIP(t *testing.T) {
 	t.Parallel()
 
-	const chain = "TEST_WL_UNBLOCK"
-
 	var (
-		mu      sync.Mutex
-		deleted bool
+		mu    sync.Mutex
+		calls []string
 	)
-
-	registerIptablesBehavior(t, chain, func(args []string) (string, int) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if argsHaveFlag(args, "-D") {
-			deleted = true
-		}
-
-		return "", 0 // -C says exists, -A/-D succeed
-	})
 
 	sm := newTestSecurityManager(t)
 	sm.cfg.AutoBlockEnabled = true
-	sm.cfg.IPTablesChain = chain
+	// A single fully guarded runner: recordingRunner is not safe for the
+	// concurrent batch workers (it appends to its slice without a lock).
+	sm.ipset.run = func(name string, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		calls = append(calls, name+" "+strings.Join(args, " "))
+
+		return nil, nil
+	}
 
 	const ip = "203.0.113.117"
 
@@ -1338,40 +1356,33 @@ func TestWhitelistUnblocksBlacklistedIP(t *testing.T) {
 		t.Error("whitelisting must evict the blacklist entry")
 	}
 
-	// The iptables unblock runs after the whitelist response is delivered;
+	// The ipset unblock runs after the whitelist response is delivered;
 	// poll instead of asserting immediately.
 	if !waitFor(func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 
-		return deleted
+		return containsCall(calls, "ipset del "+testIPSetName+" "+ip)
 	}) {
-		t.Error("expected iptables -D for the evicted blacklist entry")
+		t.Error("expected ipset del for the evicted blacklist entry")
 	}
 }
 
-func TestRemoveFromBlacklist_UnblocksViaIptables(t *testing.T) {
+func TestRemoveFromBlacklist_UnblocksViaIPSet(t *testing.T) {
 	t.Parallel()
-
-	const okChain = "TEST_RMBL_OK"
-
-	registerIptablesBehavior(t, okChain, func(_ []string) (string, int) {
-		return "", 0
-	})
-
-	const failChain = "TEST_RMBL_FAIL"
-
-	registerIptablesBehavior(t, failChain, func(args []string) (string, int) {
-		if argsHaveFlag(args, "-C") {
-			return "", 0 // rule exists...
-		}
-
-		return fakeOutResourceBusy, 1 // ...but -D fails
-	})
 
 	sm := newTestSecurityManager(t)
 	sm.cfg.AutoBlockEnabled = true
-	sm.cfg.IPTablesChain = okChain
+	// One runner, installed before any queue op (so the channel send/recv
+	// synchronizes it with the workers): the del for .119 fails, everything
+	// else succeeds. Reassigning run mid-test would race the batch workers.
+	sm.ipset.run = func(_ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "del" && argsContain(args, "203.0.113.119") {
+			return []byte(fakeOutResourceBusy), errFakeIPSet
+		}
+
+		return nil, nil
+	}
 
 	err := sm.AddToBlacklist("203.0.113.118", "t", false)
 	if err != nil {
@@ -1384,9 +1395,7 @@ func TestRemoveFromBlacklist_UnblocksViaIptables(t *testing.T) {
 		t.Error("IP must be removed from blacklist")
 	}
 
-	// Error branch: -D fails for a real reason; removal still proceeds.
-	sm.cfg.IPTablesChain = failChain
-
+	// Error branch: the ipset del fails for a real reason; removal still proceeds.
 	err = sm.AddToBlacklist("203.0.113.119", "t", false)
 	if err != nil {
 		t.Fatalf("AddToBlacklist: %v", err)
@@ -1457,19 +1466,12 @@ func TestBatchSizeFlush(t *testing.T) {
 func TestWhitelistUnblockError(t *testing.T) {
 	t.Parallel()
 
-	const chain = "TEST_WL_UNBLOCK_FAIL"
-
-	registerIptablesBehavior(t, chain, func(args []string) (string, int) {
-		if argsHaveFlag(args, "-C") {
-			return "", 0 // claims blocked...
-		}
-
-		return fakeOutResourceBusy, 1 // ...but -D fails
-	})
-
 	sm := newTestSecurityManager(t)
 	sm.cfg.AutoBlockEnabled = true
-	sm.cfg.IPTablesChain = chain
+	// Every ipset command fails; eviction must still proceed (error logged).
+	sm.ipset.run = func(_ string, _ ...string) ([]byte, error) {
+		return []byte(fakeOutResourceBusy), errFakeIPSet
+	}
 
 	const ip = "203.0.113.230"
 
@@ -1483,7 +1485,7 @@ func TestWhitelistUnblockError(t *testing.T) {
 		t.Fatalf("AddToWhitelist: %v", err)
 	}
 
-	// Eviction succeeds even when the iptables unblock fails (logged).
+	// Eviction succeeds even when the ipset unblock fails (logged).
 	if sm.IsIPBlacklisted(ip) {
 		t.Error("blacklist entry must be evicted despite unblock failure")
 	}
@@ -1574,19 +1576,12 @@ func TestIsIPWhitelisted_ExpiredAndNoTrustedNets(t *testing.T) {
 func TestCleanupUnblocksExpiredBlacklist(t *testing.T) {
 	t.Parallel()
 
-	const chain = "TEST_CLEANUP_UNBLOCK"
-
-	registerIptablesBehavior(t, chain, func(args []string) (string, int) {
-		if argsHaveFlag(args, "-C") {
-			return "", 0
-		}
-
-		return fakeOutResourceBusy, 1 // -D error branch too
-	})
-
 	sm := newTestSecurityManager(t)
 	sm.cfg.AutoBlockEnabled = true
-	sm.cfg.IPTablesChain = chain
+	// The ipset del fails; cleanup must log and proceed (covers the error arm).
+	sm.ipset.run = func(_ string, _ ...string) ([]byte, error) {
+		return []byte(fakeOutResourceBusy), errFakeIPSet
+	}
 
 	sm.mu.Lock()
 	sm.blacklist["203.0.113.235"] = BlacklistEntry{
@@ -1710,5 +1705,60 @@ func TestRefreshWhitelistEntry(t *testing.T) {
 
 	if !permanent.LastSeen.After(stale) {
 		t.Error("permanent LastSeen not stamped")
+	}
+}
+
+// TestBatchBlockIPs_PermanentAndError covers the ipset block path used by
+// auto-blocking: a permanent ban is added with a zero (no-expiry) timeout, and
+// a failing ipset add is logged without stopping the batch.
+func TestBatchBlockIPs_PermanentAndError(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+
+	sm := newTestSecurityManager(t)
+	sm.cfg.AutoBlockEnabled = true
+	// A single fully guarded runner installed before any queue op: the add for
+	// .251 fails, everything else succeeds. recordingRunner is not safe under
+	// the concurrent batch workers.
+	sm.ipset.run = func(name string, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		calls = append(calls, name+" "+strings.Join(args, " "))
+
+		if len(args) > 0 && args[0] == "add" && argsContain(args, "203.0.113.251") {
+			return []byte(fakeOutPermissionDenied), errFakeIPSet
+		}
+
+		return nil, nil
+	}
+
+	// Permanent ban → ipset add with "timeout 0".
+	permErr := sm.AddToBlacklist("203.0.113.250", "perma", true)
+	if permErr != nil {
+		t.Fatalf("AddToBlacklist permanent: %v", permErr)
+	}
+
+	if !waitFor(func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return containsCall(calls, "ipset add "+testIPSetName+" 203.0.113.250 timeout 0")
+	}) {
+		t.Error("expected permanent ban to add with timeout 0")
+	}
+
+	// Failing ipset add must be logged, not fatal: the batch keeps going.
+	finErr := sm.AddToBlacklist("203.0.113.251", "boom", false)
+	if finErr != nil {
+		t.Fatalf("AddToBlacklist finite: %v", finErr)
+	}
+
+	if !waitFor(func() bool { return sm.IsIPBlacklisted("203.0.113.251") }) {
+		t.Error("blacklist bookkeeping must succeed even when the ipset add fails")
 	}
 }

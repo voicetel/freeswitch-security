@@ -41,7 +41,9 @@
       "192.168.0.0/16"
     ],
     "untrusted_networks": ["1.1.1.1","ec2-1-1-1-1.IP.PTR.compute.amazonaws.com"],
-    "iptables_chain": "FREESWITCH",
+    "iptables_chain": "INPUT",
+    "ipset_name": "freeswitch-security",
+    "dry_run": false,
     "auto_whitelist_on_success": true,
     "esl_log_level": "info",
     "reconnect_backoff": "5s",

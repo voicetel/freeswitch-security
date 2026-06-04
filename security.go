@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
-	"os/exec"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +52,11 @@ type SecurityManager struct {
 
 	cfg effectiveSecurityConfig
 
+	// ipset is the firewall backend: a kernel ipset referenced by one
+	// iptables match-set DROP rule. Membership changes are O(1) and per-IP
+	// bans expire in-kernel via the entry timeout.
+	ipset *IPSetManager
+
 	// Async work queues. Each has a single dedicated drainer goroutine.
 	blacklistQueue  chan BlacklistRequest
 	whitelistQueue  chan WhitelistRequest
@@ -88,6 +91,8 @@ type SecurityConfig struct {
 	WhitelistEnabled       bool     `json:"whitelist_enabled"`
 	WhitelistTTL           string   `json:"whitelist_ttl"`
 	IPTablesChain          string   `json:"iptables_chain"`
+	IPSetName              string   `json:"ipset_name"`
+	DryRun                 bool     `json:"dry_run"`
 	AutoWhitelistOnSuccess bool     `json:"auto_whitelist_on_success"`
 	MaxWrongCallStates     int      `json:"max_wrong_call_states"`
 	WrongCallStateWindow   string   `json:"wrong_call_state_window"`
@@ -101,6 +106,8 @@ type effectiveSecurityConfig struct {
 	AutoWhitelistOnSuccess bool
 
 	IPTablesChain string
+	IPSetName     string
+	DryRun        bool
 
 	MaxFailedAttempts  int
 	FailedWindow       time.Duration
@@ -253,6 +260,8 @@ func InitSecurityManager() {
 			WhitelistEnabled:       cfg.Security.WhitelistEnabled,
 			AutoWhitelistOnSuccess: cfg.Security.AutoWhitelistOnSuccess,
 			IPTablesChain:          cfg.Security.IPTablesChain,
+			IPSetName:              cfg.Security.IPSetName,
+			DryRun:                 cfg.Security.DryRun,
 			MaxFailedAttempts:      cfg.Security.MaxFailedAttempts,
 			MaxWrongCallStates:     cfg.Security.MaxWrongCallStates,
 			FailedWindow:           parseDurationOr(cfg.Security.FailedAttemptsWindow, 10*time.Minute),
@@ -290,6 +299,7 @@ func InitSecurityManager() {
 			trustedNetworks:   trusted,
 			untrustedPatterns: untrusted,
 			cfg:               eff,
+			ipset:             NewIPSetManager(eff.IPTablesChain, eff.IPSetName, eff.BlockDuration, eff.DryRun, logger),
 			blacklistQueue:    make(chan BlacklistRequest, blacklistQueueSize),
 			whitelistQueue:    make(chan WhitelistRequest, whitelistQueueSize),
 			failedQueue:       make(chan FailedAttemptRequest, failedQueueSize),
@@ -309,11 +319,20 @@ func InitSecurityManager() {
 		}
 
 		if eff.AutoBlockEnabled {
-			err := ensureIPTablesChain(eff.IPTablesChain)
+			err := securityManager.ipset.EnsureSetup()
 			if err != nil {
-				logger.Error("Warning: failed to set up iptables chain: %v", err)
+				logger.Error("Warning: failed to set up ipset firewall: %v", err)
 			} else {
-				logger.Info("Configured iptables chain: %s", eff.IPTablesChain)
+				logger.Info("Configured ipset %q in chain %s", eff.IPSetName, eff.IPTablesChain)
+
+				// Flush bans from a previous run and remove any legacy per-IP
+				// "Auto-blocked" iptables rules left by pre-ipset versions.
+				removed, cerr := securityManager.ipset.CleanupAutoBlocked()
+				if cerr != nil {
+					logger.Error("Warning: ipset cleanup failed: %v", cerr)
+				} else if removed > 0 {
+					logger.Info("Cleared %d stale ban entr(ies) on startup", removed)
+				}
 			}
 		}
 
@@ -496,7 +515,6 @@ func (sm *SecurityManager) RemoveFromBlacklist(ip string) {
 	delete(sm.blacklist, ip)
 	count := len(sm.blacklist)
 	autoBlock := sm.cfg.AutoBlockEnabled
-	chain := sm.cfg.IPTablesChain
 	sm.mu.Unlock()
 
 	sm.statsMu.Lock()
@@ -504,11 +522,11 @@ func (sm *SecurityManager) RemoveFromBlacklist(ip string) {
 	sm.statsMu.Unlock()
 
 	if existed && autoBlock {
-		err := unblockIPWithIptables(ip, chain)
+		err := sm.ipset.UnblockIP(ip)
 		if err != nil {
-			logger.Error("Failed to unblock IP %s with iptables: %v", ip, err)
+			logger.Error("Failed to unblock IP %s: %v", ip, err)
 		} else {
-			logger.Info("Unblocked IP %s with iptables in chain %s", ip, chain)
+			logger.Info("Unblocked IP %s from ipset", ip)
 		}
 	}
 
@@ -812,16 +830,19 @@ func (sm *SecurityManager) AddToBlacklistBatch(reqs []BatchBlacklistRequest) []B
 	return results
 }
 
-// GetIPTablesInfo returns IPTables chain information.
+// GetIPTablesInfo returns the firewall (ipset) state: the IPs currently
+// banned in the set and the chain holding the match-set DROP rule.
 func (sm *SecurityManager) GetIPTablesInfo() (map[string]any, error) {
-	rules, err := getIPTablesRules(sm.cfg.IPTablesChain)
+	blocked, err := sm.ipset.ListBlockedIPs()
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]any{
-		"chain": sm.cfg.IPTablesChain,
-		"rules": rules,
+		"chain":       sm.cfg.IPTablesChain,
+		"ipset":       sm.cfg.IPSetName,
+		"blocked_ips": blocked,
+		"count":       len(blocked),
 	}, nil
 }
 
@@ -875,9 +896,9 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 	now := time.Now()
 	blockDuration := sm.cfg.BlockDuration
 
-	// IPs we successfully accepted into the blacklist; iptables work happens
+	// IPs we successfully accepted into the blacklist; firewall work happens
 	// outside the lock to avoid blocking other security operations on fork+exec.
-	toBlock := make([]string, 0, len(batch))
+	toBlock := make([]blockTarget, 0, len(batch))
 
 	sm.mu.Lock()
 	for _, req := range batch {
@@ -917,7 +938,7 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 		delete(sm.failedAttempts, req.IP)
 
 		if sm.cfg.AutoBlockEnabled {
-			toBlock = append(toBlock, req.IP)
+			toBlock = append(toBlock, blockTarget{ip: req.IP, reason: req.Reason, permanent: req.Permanent})
 		}
 
 		logger.Info("Added IP %s to blacklist: %s", req.IP, req.Reason)
@@ -1042,9 +1063,8 @@ func (sm *SecurityManager) processBatchWhitelist(batch []WhitelistRequest) {
 	sm.stats.ActiveWhitelistEntries = whitelistCount
 	sm.statsMu.Unlock()
 
-	chain := sm.cfg.IPTablesChain
 	for _, ip := range toUnblock {
-		err := unblockIPWithIptables(ip, chain)
+		err := sm.ipset.UnblockIP(ip)
 		if err != nil {
 			logger.Error("Failed to unblock IP %s: %v", ip, err)
 		}
@@ -1333,7 +1353,6 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	failedWindow := sm.cfg.FailedWindow
 	wrongWindow := sm.cfg.WrongStateWindow
 	autoBlock := sm.cfg.AutoBlockEnabled
-	chain := sm.cfg.IPTablesChain
 
 	var (
 		whitelistRemoved []string
@@ -1382,10 +1401,12 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 	sm.stats.ActiveBlacklistEntries = blacklistCount
 	sm.statsMu.Unlock()
 
-	// Unblock removed blacklist entries from iptables (outside lock).
+	// Remove expired blacklist entries from the ipset (outside lock). The
+	// kernel also expires entries on its own via their timeout; this is a
+	// belt-and-suspenders cleanup for entries the in-memory map dropped.
 	if autoBlock {
 		for _, ip := range blacklistRemoved {
-			err := unblockIPWithIptables(ip, chain)
+			err := sm.ipset.UnblockIP(ip)
 			if err != nil {
 				logger.Error("Failed to unblock expired IP %s: %v", ip, err)
 			}
@@ -1397,153 +1418,35 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 }
 
 // ----------------------------------------------------------------------
-// iptables helpers
+// firewall (ipset) helpers
 // ----------------------------------------------------------------------
 
-// execCommand is the process-spawning seam for the iptables helpers. Tests
-// replace it so unit tests never invoke the real iptables binary (which would
-// mutate host firewall state or fail unpredictably without privileges).
-var execCommand = exec.Command
-
-// runIptablesWithRetry executes the given iptables argv with retry on
-// xtables-lock contention. It returns the combined output and the final error.
-func runIptablesWithRetry(args ...string) ([]byte, error) {
-	const maxRetries = 3
-
-	var lastOut []byte
-
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cmd := execCommand("iptables", args...)
-
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			return out, nil
-		}
-
-		lastOut, lastErr = out, err
-
-		if strings.Contains(string(out), "xtables lock") && attempt < maxRetries {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-
-			continue
-		}
-
-		break
-	}
-
-	return lastOut, lastErr
+// blockTarget is one accepted blacklist entry awaiting a kernel ipset add.
+type blockTarget struct {
+	ip        string
+	reason    string
+	permanent bool
 }
 
-// ensureIPTablesChain ensures that the iptables chain exists.
-func ensureIPTablesChain(chain string) error {
-	logger := GetLogger()
-
-	if execCommand("iptables", "-L", chain).Run() == nil {
-		logger.Info("Iptables chain %s already exists", chain)
-
-		return nil
-	}
-
-	logger.Info("Creating iptables chain %s", chain)
-
-	out, err := runIptablesWithRetry("-N", chain)
-	if err != nil && !strings.Contains(string(out), "Chain already exists") {
-		return fmt.Errorf("creating iptables chain %s: %w: %s", chain, err, out)
-	}
-
-	logger.Info("Adding jump from INPUT to chain %s", chain)
-
-	out, err = runIptablesWithRetry("-A", "INPUT", "-j", chain)
-	if err != nil {
-		return fmt.Errorf("linking iptables chain %s: %w: %s", chain, err, out)
-	}
-
-	return nil
-}
-
-// blockIPWithIptables installs a DROP rule for the given IP in the chain.
-func blockIPWithIptables(ip, chain string) error {
-	logger := GetLogger()
-	if execCommand("iptables", "-C", chain, "-s", ip, "-j", "DROP").Run() == nil {
-		logger.Info("IP %s is already blocked in chain %s", ip, chain)
-
-		return nil
-	}
-
-	out, err := runIptablesWithRetry("-A", chain, "-s", ip, "-j", "DROP")
-	if err != nil {
-		return fmt.Errorf("iptables block %s: %w: %s", ip, err, out)
-	}
-
-	logger.Info("Blocked IP %s in chain %s", ip, chain)
-
-	return nil
-}
-
-// unblockIPWithIptables removes a DROP rule for the given IP.
-func unblockIPWithIptables(ip, chain string) error {
-	logger := GetLogger()
-	// iptables -C exits non-zero when the rule does not exist. That's not
-	// an error for us — there's nothing to unblock.
-	ruleExists := execCommand("iptables", "-C", chain, "-s", ip, "-j", "DROP").Run() == nil
-	if !ruleExists {
-		logger.Debug("IP %s is not blocked in chain %s", ip, chain)
-
-		return nil
-	}
-
-	out, err := runIptablesWithRetry("-D", chain, "-s", ip, "-j", "DROP")
-	if err != nil {
-		// "Bad rule" / "does a matching rule exist" → already gone, treat as success.
-		os := string(out)
-		if strings.Contains(os, "Bad rule") || strings.Contains(os, "does a matching rule exist") {
-			return nil
-		}
-
-		return fmt.Errorf("iptables unblock %s: %w: %s", ip, err, out)
-	}
-
-	logger.Info("Unblocked IP %s in chain %s", ip, chain)
-
-	return nil
-}
-
-// batchBlockIPs installs DROP rules for many IPs. Each IP is blocked via a
-// direct exec of iptables; the original "batch via sh -c" implementation was
-// removed because it required shell quoting (gosec G204) for marginal savings.
-func (sm *SecurityManager) batchBlockIPs(ips []string) {
-	if len(ips) == 0 {
+// batchBlockIPs adds many IPs to the ipset. Permanent bans use a zero timeout
+// (no in-kernel expiry); the rest use the configured block duration. Failures
+// are logged and do not stop the batch.
+func (sm *SecurityManager) batchBlockIPs(targets []blockTarget) {
+	if len(targets) == 0 {
 		return
 	}
 
 	logger := GetLogger()
 
-	chain := sm.cfg.IPTablesChain
-	for _, ip := range ips {
-		err := blockIPWithIptables(ip, chain)
+	for _, tgt := range targets {
+		ttl := sm.cfg.BlockDuration
+		if tgt.permanent {
+			ttl = 0
+		}
+
+		err := sm.ipset.BlockIP(tgt.ip, tgt.reason, ttl)
 		if err != nil {
-			logger.Error("Failed to block IP %s: %v", ip, err)
+			logger.Error("Failed to block IP %s: %v", tgt.ip, err)
 		}
 	}
-}
-
-// getIPTablesRules returns the current rules for the given chain.
-func getIPTablesRules(chain string) ([]string, error) {
-	out, err := runIptablesWithRetry("-S", chain)
-	if err != nil {
-		return nil, fmt.Errorf("listing iptables rules: %w: %s", err, out)
-	}
-
-	lines := strings.Split(string(out), "\n")
-	rules := make([]string, 0, len(lines))
-
-	for _, l := range lines {
-		if l != "" {
-			rules = append(rules, l)
-		}
-	}
-
-	return rules, nil
 }

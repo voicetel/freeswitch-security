@@ -238,6 +238,16 @@ func validateIP(ip string) error {
 func registerRoutes(router *gin.Engine) {
 	config := GetConfig()
 
+	// Gate every state-changing endpoint (the chanDaemon unban fan-out plus
+	// the security/cache mutations) on the source-IP allow-list. Safe reads
+	// stay open. An empty/unparseable list leaves the API unrestricted.
+	allowList, err := parseAllowedIPs(config.Security.ChanDaemon.AllowedAPIIPs)
+	if err != nil {
+		GetLogger().Error("chanDaemon API allow-list: %v", err)
+	}
+
+	router.Use(allowListMiddleware(allowList))
+
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
@@ -272,6 +282,12 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 
 	router.GET("/system/stats", systemStatsHandler())
 
+	// chanDaemon (D39) unban fan-out receiver. chanDaemon pushes an
+	// unauthenticated DELETE here when a customer/operator lifts a ban; the
+	// allow-list middleware is the only gate. Path and method must match what
+	// chanDaemon constructs: DELETE {blocker_url}/api/v1/ips/{ip}/block.
+	router.DELETE("/api/v1/ips/:ip/block", chanDaemonUnbanHandler(sm))
+
 	security := router.Group("/security")
 	{
 		security.GET("/status", securityStatusHandler(sm, eslManager))
@@ -296,13 +312,13 @@ func systemStatsHandler() gin.HandlerFunc {
 		c.JSON(200, gin.H{
 			"goroutines": runtime.NumGoroutine(),
 			"memory": gin.H{
-				"alloc_mb":       ms.Alloc / 1024 / 1024,
-				"total_alloc_mb": ms.TotalAlloc / 1024 / 1024,
-				"sys_mb":         ms.Sys / 1024 / 1024,
-				"gc_runs":        ms.NumGC,
-				"heap_objects":   ms.HeapObjects,
+				"allocMb":      ms.Alloc / 1024 / 1024,
+				"totalAllocMb": ms.TotalAlloc / 1024 / 1024,
+				"sysMb":        ms.Sys / 1024 / 1024,
+				"gcRuns":       ms.NumGC,
+				"heapObjects":  ms.HeapObjects,
 			},
-			"cpu_cores": runtime.NumCPU(),
+			"cpuCores": runtime.NumCPU(),
 		})
 	}
 }
@@ -311,13 +327,13 @@ func securityStatusHandler(sm *SecurityManager, em *ESLManager) gin.HandlerFunc 
 	return func(c *gin.Context) {
 		enabled, autoBlock := sm.SecurityConfigView()
 		c.JSON(200, gin.H{
-			keyEnabled:        enabled,
-			"auto_block":      autoBlock,
-			"whitelist_count": len(sm.GetWhitelistedIPs()),
-			"blacklist_count": len(sm.GetBlacklistedIPs()),
-			"esl_connected":   em.IsConnected(),
-			"esl_host":        em.Host(),
-			"esl_port":        em.Port(),
+			keyEnabled:       enabled,
+			"autoBlock":      autoBlock,
+			"whitelistCount": len(sm.GetWhitelistedIPs()),
+			"blacklistCount": len(sm.GetBlacklistedIPs()),
+			"eslConnected":   em.IsConnected(),
+			"eslHost":        em.Host(),
+			"eslPort":        em.Port(),
 		})
 	}
 }
@@ -327,6 +343,30 @@ func securityStatsHandler(sm *SecurityManager) gin.HandlerFunc {
 		stats := sm.GetSecurityStats()
 		CacheResponse("stats:security", stats)
 		c.JSON(200, stats)
+	}
+}
+
+// chanDaemonUnbanHandler lifts a ban pushed by chanDaemon's unban fan-out. It
+// removes the IP from the blacklist and the kernel ipset via RemoveFromBlacklist.
+// A successful lift is idempotent (removing an unknown IP is a no-op) so a retry
+// from chanDaemon is harmless. Returns 400 for a malformed IP, 200 otherwise.
+func chanDaemonUnbanHandler(sm *SecurityManager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := c.Param("ip")
+
+		err := validateIP(ip)
+		if err != nil {
+			c.JSON(400, gin.H{respKeyError: err.Error()})
+
+			return
+		}
+
+		sm.RemoveFromBlacklist(ip)
+		c.JSON(200, gin.H{
+			"ip":           ip,
+			"banned":       false,
+			respKeyMessage: "IP unblocked successfully",
+		})
 	}
 }
 
@@ -355,7 +395,7 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 		whitelist.POST("", func(c *gin.Context) {
 			var req struct {
 				IP        string `binding:"required" json:"ip"`
-				UserID    string `json:"user_id"`
+				UserID    string `json:"userId"`
 				Domain    string `json:"domain"`
 				Permanent bool   `json:"permanent"`
 			}
@@ -398,7 +438,7 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 		whitelist.POST("/batch", func(c *gin.Context) {
 			var batch []struct {
 				IP        string `binding:"required" json:"ip"`
-				UserID    string `json:"user_id"`
+				UserID    string `json:"userId"`
 				Domain    string `json:"domain"`
 				Permanent bool   `json:"permanent"`
 			}
@@ -467,7 +507,7 @@ func registerWhitelistRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 			c.JSON(200, gin.H{
 				"ip":          ip,
 				"whitelisted": true,
-				"user_id":     entry.UserID,
+				"userId":      entry.UserID,
 				"domain":      entry.Domain,
 			})
 		})
@@ -735,8 +775,8 @@ func registerUntrustedRoutes(g *gin.RouterGroup, sm *SecurityManager) {
 		untrustedNetworks.GET("/test/:domain", func(c *gin.Context) {
 			domain := c.Param("domain")
 			c.JSON(200, gin.H{
-				"domain":       domain,
-				"is_untrusted": sm.IsUntrustedDomain(domain),
+				"domain":      domain,
+				"isUntrusted": sm.IsUntrustedDomain(domain),
 			})
 		})
 	}

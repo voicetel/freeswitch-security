@@ -79,13 +79,34 @@ func doJSON(tb testing.TB, router http.Handler, method, url, body string) *httpt
 	return rec
 }
 
+// doJSONFrom is doJSON with an explicit source RemoteAddr, for exercising the
+// chanDaemon API allow-list on state-changing endpoints.
+func doJSONFrom(tb testing.TB, router http.Handler, method, url, body, remoteAddr string) *httptest.ResponseRecorder {
+	tb.Helper()
+
+	var req *http.Request
+	if body != "" {
+		req = httptest.NewRequestWithContext(context.Background(), method, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req = httptest.NewRequestWithContext(context.Background(), method, url, http.NoBody)
+	}
+
+	req.RemoteAddr = remoteAddr
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	return rec
+}
+
 func TestRoute_Whitelist_Add(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)
 	router := newWhitelistRouter(sm)
 
 	rec := doJSON(t, router, "POST", "/security/whitelist",
-		`{"ip":"203.0.113.7","user_id":"alice","domain":"x.example"}`)
+		`{"ip":"203.0.113.7","userId":"alice","domain":"x.example"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
@@ -101,7 +122,7 @@ func TestRoute_Whitelist_Add_InvalidIP(t *testing.T) {
 	router := newWhitelistRouter(sm)
 
 	rec := doJSON(t, router, "POST", "/security/whitelist",
-		`{"ip":"not-an-ip","user_id":"alice"}`)
+		`{"ip":"not-an-ip","userId":"alice"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body)
 	}
@@ -112,7 +133,7 @@ func TestRoute_Whitelist_Add_MissingIP(t *testing.T) {
 	sm := newTestSecurityManager(t)
 	router := newWhitelistRouter(sm)
 
-	rec := doJSON(t, router, "POST", "/security/whitelist", `{"user_id":"alice"}`)
+	rec := doJSON(t, router, "POST", "/security/whitelist", `{"userId":"alice"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing required ip, got %d", rec.Code)
 	}
@@ -145,8 +166,8 @@ func TestRoute_Whitelist_GetByIP(t *testing.T) {
 		t.Errorf("expected whitelisted=true, got %v", resp)
 	}
 
-	if resp["user_id"] != testUserBob {
-		t.Errorf("expected user_id=bob, got %v", resp["user_id"])
+	if resp["userId"] != testUserBob {
+		t.Errorf("expected user_id=bob, got %v", resp["userId"])
 	}
 
 	// Unknown IP returns whitelisted=false (200).
@@ -219,9 +240,9 @@ func TestRoute_Whitelist_Batch(t *testing.T) {
 	router := newWhitelistRouter(sm)
 
 	body := `[
-		{"ip":"203.0.113.20","user_id":"a","domain":"x.example"},
-		{"ip":"203.0.113.21","user_id":"b","domain":"y.example"},
-		{"ip":"not-an-ip","user_id":"c"}
+		{"ip":"203.0.113.20","userId":"a","domain":"x.example"},
+		{"ip":"203.0.113.21","userId":"b","domain":"y.example"},
+		{"ip":"not-an-ip","userId":"c"}
 	]`
 
 	rec := doJSON(t, router, "POST", "/security/whitelist/batch", body)
@@ -352,7 +373,7 @@ func TestRoute_Untrusted_AddListRemove(t *testing.T) {
 
 	_ = json.Unmarshal(rec.Body.Bytes(), &testResp)
 
-	if testResp["is_untrusted"] != true {
+	if testResp["isUntrusted"] != true {
 		t.Errorf("expected is_untrusted=true, got %v", testResp)
 	}
 
@@ -483,7 +504,7 @@ func TestRoute_Whitelist_ConcurrentAdds(t *testing.T) {
 			defer wg.Done()
 
 			ip := fmt.Sprintf("203.0.113.%d", 100+id)
-			body := fmt.Sprintf(`{"ip":%q,"user_id":"u","domain":"d"}`, ip)
+			body := fmt.Sprintf(`{"ip":%q,"userId":"u","domain":"d"}`, ip)
 
 			for j := 0; j < 10 && ctx.Err() == nil; j++ {
 				req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/security/whitelist",
@@ -603,12 +624,12 @@ func TestRoute_SecurityStatusHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if resp["enabled"] != true || resp["esl_connected"] != false {
+	if resp["enabled"] != true || resp["eslConnected"] != false {
 		t.Errorf("unexpected response: %v", resp)
 	}
 
-	if resp["esl_host"] != "192.0.2.9" {
-		t.Errorf("esl_host = %v", resp["esl_host"])
+	if resp["eslHost"] != "192.0.2.9" {
+		t.Errorf("esl_host = %v", resp["eslHost"])
 	}
 }
 
@@ -845,7 +866,7 @@ func TestRoute_Whitelist_DefaultDomain(t *testing.T) {
 	router := newWhitelistRouter(sm)
 
 	rec := doJSON(t, router, "POST", "/security/whitelist",
-		`{"ip":"203.0.113.222","user_id":"nodomain"}`)
+		`{"ip":"203.0.113.222","userId":"nodomain"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
@@ -979,7 +1000,7 @@ func TestRoute_Whitelist_AddTimeout(t *testing.T) {
 	router := newWhitelistRouter(sm)
 
 	rec := doJSON(t, router, "POST", "/security/whitelist",
-		`{"ip":"203.0.113.240","user_id":"u","domain":"d"}`)
+		`{"ip":"203.0.113.240","userId":"u","domain":"d"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 when whitelist enqueue times out, got %d", rec.Code)
 	}

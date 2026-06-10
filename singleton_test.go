@@ -236,15 +236,42 @@ func TestRegisterRoutes_SecurityDisabled(t *testing.T) {
 		t.Errorf("cache stats status=%d", rec.Code)
 	}
 
-	rec = doJSON(t, router, "POST", "/cache/security/clear", "")
+	// /cache/security/clear is state-changing, so the default chanDaemon
+	// allow-list now gates it; loopback is permitted.
+	rec = doJSONFrom(t, router, "POST", "/cache/security/clear", "", "127.0.0.1:5000")
 	if rec.Code != http.StatusOK {
 		t.Errorf("cache clear status=%d body=%s", rec.Code, rec.Body)
+	}
+
+	// A mutation from a non-allowed source is rejected by the allow-list.
+	rec = doJSONFrom(t, router, "POST", "/cache/security/clear", "", "8.8.8.8:5000")
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 from disallowed source, got %d", rec.Code)
 	}
 
 	// Security routes must not have been registered.
 	rec = doJSON(t, router, "GET", "/security/status", "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for security routes when disabled, got %d", rec.Code)
+	}
+}
+
+//nolint:paralleltest // mutates global config
+func TestRegisterRoutes_BadAllowList(t *testing.T) {
+	cfg := GetConfig()
+	saved := cfg.Security.ChanDaemon.AllowedAPIIPs
+	cfg.Security.ChanDaemon.AllowedAPIIPs = []string{testInvalidIP}
+
+	defer func() { cfg.Security.ChanDaemon.AllowedAPIIPs = saved }()
+
+	// An unparseable allow-list is logged and treated as unrestricted; the
+	// router must still come up and serve.
+	router := gin.New()
+	registerRoutes(router)
+
+	rec := doJSON(t, router, "GET", "/health", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("health status=%d with a bad allow-list", rec.Code)
 	}
 }
 

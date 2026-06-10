@@ -16,9 +16,12 @@ import (
 
 // Network fixtures shared across the security tests.
 const (
-	testTrustedCIDR = "10.0.0.0/8"
-	testPrivateCIDR = "192.168.0.0/16"
-	testLoopbackIP  = "127.0.0.1"
+	testTrustedCIDR     = "10.0.0.0/8"
+	testPrivateCIDR     = "192.168.0.0/16"
+	testLoopbackIP      = "127.0.0.1"
+	testUntrustedDomain = "evil.example"
+	testSampleIP        = "10.1.2.3"
+	testChain           = "TEST"
 )
 
 // newTestSecurityManager builds an isolated SecurityManager for tests. It
@@ -44,7 +47,7 @@ func newTestSecurityManager(tb testing.TB) *SecurityManager {
 		wrongStates:     make(map[string]WrongCallStateEntry),
 		trustedNetworks: trusted,
 		untrustedPatterns: map[string]struct{}{
-			"evil.example": {},
+			testUntrustedDomain: {},
 		},
 		ipset: newTestIPSet(),
 		cfg: effectiveSecurityConfig{
@@ -52,7 +55,7 @@ func newTestSecurityManager(tb testing.TB) *SecurityManager {
 			AutoBlockEnabled:       false,
 			WhitelistEnabled:       true,
 			AutoWhitelistOnSuccess: false,
-			IPTablesChain:          "TEST",
+			IPTablesChain:          testChain,
 			IPSetName:              testIPSetName,
 			DryRun:                 false,
 			MaxFailedAttempts:      3,
@@ -162,7 +165,7 @@ func TestIsIPWhitelisted_TrustedNetwork(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)
 
-	if !sm.IsIPWhitelisted("10.1.2.3") {
+	if !sm.IsIPWhitelisted(testSampleIP) {
 		t.Error("IP in trusted network 10.0.0.0/8 should be whitelisted")
 	}
 
@@ -220,12 +223,12 @@ func TestAddToBlacklist_RejectsTrustedIP(t *testing.T) {
 
 	sm := newTestSecurityManager(t)
 
-	err := sm.AddToBlacklist("10.1.2.3", "test", false)
+	err := sm.AddToBlacklist(testSampleIP, "test", false)
 	if err == nil {
 		t.Error("expected error blacklisting IP in trusted network")
 	}
 
-	if sm.IsIPBlacklisted("10.1.2.3") {
+	if sm.IsIPBlacklisted(testSampleIP) {
 		t.Error("trusted IP must not be blacklisted")
 	}
 }
@@ -291,13 +294,13 @@ func TestProcessFailedRegistration_TrustedIPNotBlacklisted(t *testing.T) {
 	sm.cfg.AutoBlockEnabled = true
 
 	for range 10 {
-		sm.ProcessFailedRegistration("10.1.2.3", "u", "example.com")
+		sm.ProcessFailedRegistration(testSampleIP, "u", "example.com")
 	}
 
 	// Drain time
 	time.Sleep(300 * time.Millisecond)
 
-	if sm.IsIPBlacklisted("10.1.2.3") {
+	if sm.IsIPBlacklisted(testSampleIP) {
 		t.Error("trusted IP must not be blacklisted via failed attempts")
 	}
 }
@@ -517,7 +520,7 @@ func TestBatchBlacklist(t *testing.T) {
 	reqs := []BatchBlacklistRequest{
 		{IP: "203.0.113.80", Reason: "test1"},
 		{IP: "203.0.113.81", Reason: "test2"},
-		{IP: "10.1.2.3", Reason: "trusted"},    // should be rejected (trusted net)
+		{IP: testSampleIP, Reason: "trusted"},  // should be rejected (trusted net)
 		{IP: testInvalidIP, Reason: "invalid"}, // should be rejected (invalid IP)
 	}
 
@@ -711,7 +714,7 @@ func BenchmarkIsIPWhitelisted_TrustedHit(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_ = sm.IsIPWhitelisted("10.1.2.3")
+		_ = sm.IsIPWhitelisted(testSampleIP)
 	}
 }
 
@@ -1025,7 +1028,7 @@ func newDrainedSecurityManager(tb testing.TB) *SecurityManager {
 			AutoBlockEnabled:       false,
 			WhitelistEnabled:       true,
 			AutoWhitelistOnSuccess: false,
-			IPTablesChain:          "TEST",
+			IPTablesChain:          testChain,
 			IPSetName:              testIPSetName,
 			DryRun:                 false,
 			MaxFailedAttempts:      3,
@@ -1174,7 +1177,7 @@ func TestIPListStatus(t *testing.T) {
 	}{
 		{testIPWhitelisted, true, false}, // whitelisted
 		{testIPBlacklisted, false, true}, // blacklisted
-		{"10.1.2.3", true, false},        // trusted network
+		{testSampleIP, true, false},      // trusted network
 		{"198.51.100.99", false, false},  // unknown
 		{testInvalidIP, false, false},    // invalid
 	}

@@ -184,7 +184,7 @@ func TestBuildConfig_CreatesDefaultFile(t *testing.T) {
 		t.Errorf("written config chain = %q", roundTrip.Security.IPTablesChain)
 	}
 
-	if roundTrip.Security.IPSetName != "freeswitch-security" {
+	if roundTrip.Security.IPSetName != projectName {
 		t.Errorf("written config ipset name = %q", roundTrip.Security.IPSetName)
 	}
 }

@@ -40,19 +40,6 @@ type RateManager struct {
 // prime works.
 const shardMixPrime = 31
 
-// RateLimitConfig holds rate-limiting configuration (JSON shape).
-type RateLimitConfig struct {
-	Enabled            bool   `json:"enabled"`
-	CallRateLimit      int    `json:"call_rate_limit"`
-	CallRateInterval   string `json:"call_rate_interval"`
-	RegistrationLimit  int    `json:"registration_limit"`
-	RegistrationWindow string `json:"registration_window"`
-	AutoBlockOnExceed  bool   `json:"auto_block_on_exceed"`
-	BlockDuration      string `json:"block_duration"`
-	WhitelistBypass    bool   `json:"whitelist_bypass"`
-	CleanupInterval    string `json:"cleanup_interval"`
-}
-
 // defaultRateBlockDuration is the fallback block duration when the configured
 // value is missing or fails to parse.
 const defaultRateBlockDuration = 15 * time.Minute
@@ -74,9 +61,9 @@ type effectiveRateConfig struct {
 // RateCounter tracks request rates for a single IP.
 type RateCounter struct {
 	Count        int       `json:"count"`
-	FirstRequest time.Time `json:"first_request"`
-	LastRequest  time.Time `json:"last_request"`
-	UserIDs      []string  `json:"user_ids"`
+	FirstRequest time.Time `json:"firstRequest"`
+	LastRequest  time.Time `json:"lastRequest"`
+	UserIDs      []string  `json:"userIds"`
 	Domains      []string  `json:"domains"`
 }
 
@@ -219,15 +206,15 @@ func (rm *RateManager) CleanupNow() (int, int) {
 // RateLimitConfigView returns a snapshot of the rate config used by routes.
 func (rm *RateManager) RateLimitConfigView() map[string]any {
 	return map[string]any{
-		keyEnabled:             rm.cfg.Enabled,
-		"call_rate_limit":      rm.cfg.CallRateLimit,
-		"call_rate_interval":   rm.cfg.CallRateInterval.String(),
-		"registration_limit":   rm.cfg.RegistrationLimit,
-		"registration_window":  rm.cfg.RegWindow.String(),
-		"auto_block_on_exceed": rm.cfg.AutoBlockOnExceed,
-		"block_duration":       rm.cfg.BlockDuration.String(),
-		"whitelist_bypass":     rm.cfg.WhitelistBypass,
-		"cleanup_interval":     rm.cfg.CleanupInterval.String(),
+		keyEnabled:           rm.cfg.Enabled,
+		"callRateLimit":      rm.cfg.CallRateLimit,
+		"callRateInterval":   rm.cfg.CallRateInterval.String(),
+		"registrationLimit":  rm.cfg.RegistrationLimit,
+		"registrationWindow": rm.cfg.RegWindow.String(),
+		"autoBlockOnExceed":  rm.cfg.AutoBlockOnExceed,
+		"blockDuration":      rm.cfg.BlockDuration.String(),
+		"whitelistBypass":    rm.cfg.WhitelistBypass,
+		"cleanupInterval":    rm.cfg.CleanupInterval.String(),
 	}
 }
 

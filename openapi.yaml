@@ -1,0 +1,430 @@
+openapi: 3.0.3
+info:
+  title: freeswitch-security REST API
+  version: 1.0.0
+  description: |
+    Control and monitoring API for **freeswitch-security**, the FreeSWITCH ESL →
+    ipset IP blocker for the VoiceTel fleet.
+
+    ## Role in the fleet
+    This daemon enforces bans locally (kernel ipset behind one iptables match-set
+    DROP rule) and participates in the central **chanDaemon** ban repository (D39):
+    every enacted ban is reported to chanDaemon, and chanDaemon pushes
+    customer/operator unbans back to `DELETE /api/v1/ips/{ip}/block`. See
+    `chandaemon.md`.
+
+    ## Authentication / access control
+    There is no token. **State-changing** endpoints (`POST`/`PUT`/`PATCH`/`DELETE`)
+    are restricted by a **source-IP allow-list**
+    (`security.chandaemon.allowed_api_ips`, IPs and CIDRs) enforced in Go against
+    the raw connection address (never `X-Forwarded-For`). It defaults to the
+    chanDaemon nodes plus loopback, so the API is restricted by default; an empty
+    list leaves it unrestricted. Read-only `GET` endpoints are always open; a
+    non-allowed source receives `403`. For production, bind to localhost or front
+    it with an authenticating reverse proxy.
+
+    Request and response property names are `camelCase`, consistent with the
+    rest of the fleet (chanDaemon, opensips-journal-blocker).
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+  contact:
+    name: VoiceTel Platform Engineering
+    url: https://voicetel.com
+servers:
+  - url: http://{host}:{port}
+    description: This blocker's API (config server.host/server.port; default 127.0.0.1:8088)
+    variables:
+      host:
+        default: 127.0.0.1
+        description: API bind address
+      port:
+        default: "8088"
+        description: API port
+
+tags:
+  - name: Health & Monitoring
+    description: Liveness, system, and security statistics.
+  - name: chanDaemon
+    description: The central ban-repository unban fan-out receiver.
+  - name: Whitelist
+    description: Inspect and mutate the IP whitelist.
+  - name: Blacklist
+    description: Inspect and mutate the IP blacklist (bans).
+
+paths:
+  /health:
+    get:
+      tags: [Health & Monitoring]
+      summary: Health check
+      description: Liveness probe; returns a status word once the server is serving.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is serving.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: "ok" }
+
+  /system/stats:
+    get:
+      tags: [Health & Monitoring]
+      summary: Go runtime statistics
+      description: Goroutine count, memory usage, and CPU info for the running process.
+      operationId: getSystemStats
+      responses:
+        "200":
+          description: Goroutine count, memory, and CPU info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SystemStats" }
+              example:
+                goroutines: 38
+                cpuCores: 8
+                memory: { allocMb: 12, totalAllocMb: 540, sysMb: 30, gcRuns: 9, heapObjects: 80432 }
+
+  /security/status:
+    get:
+      tags: [Health & Monitoring]
+      summary: Security system overview
+      description: Enabled flags, whitelist/blacklist counts, and the ESL connection state.
+      operationId: getSecurityStatus
+      responses:
+        "200":
+          description: Enabled flags, whitelist/blacklist counts, ESL connection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecurityStatus" }
+              example:
+                enabled: true
+                autoBlock: true
+                whitelistCount: 234
+                blacklistCount: 45
+                eslConnected: true
+                eslHost: "127.0.0.1"
+                eslPort: "8021"
+
+  /security/stats:
+    get:
+      tags: [Health & Monitoring]
+      summary: Detailed security statistics
+      description: |
+        Counters for registrations, blocks, and (when chanDaemon reporting is
+        enabled) `reportsSent` / `reportsFailed`.
+      operationId: getSecurityStats
+      responses:
+        "200":
+          description: Security counters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecurityStats" }
+              example:
+                totalRegistrations: 1548293
+                failedRegistrations: 842
+                blockedAttempts: 45
+                wrongCallStates: 12
+                activeWhitelistEntries: 234
+                activeBlacklistEntries: 45
+                reportsSent: 312
+                reportsFailed: 0
+
+  /api/v1/ips/{ip}/block:
+    delete:
+      tags: [chanDaemon]
+      summary: Lift a ban (chanDaemon unban fan-out)
+      description: |
+        Removes the IP from the blacklist and the kernel ipset. This is the
+        receiver for chanDaemon's unban fan-out: chanDaemon sends an
+        unauthenticated `DELETE` here when a customer/operator lifts a ban, so
+        the only gate is the source-IP allow-list. The operation is idempotent —
+        lifting an IP that is not banned still returns `200`.
+      operationId: unblockIP
+      parameters:
+        - $ref: "#/components/parameters/IPPath"
+      responses:
+        "200":
+          description: Ban lifted (or the IP was not banned).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UnbanResponse" }
+              example: { ip: "203.0.113.50", banned: false, message: "IP unblocked successfully" }
+        "400":
+          $ref: "#/components/responses/InvalidIP"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/whitelist:
+    get:
+      tags: [Whitelist]
+      summary: List whitelisted IPs
+      description: Returns the active whitelist entries, keyed by IP address.
+      operationId: listWhitelist
+      responses:
+        "200":
+          description: Whitelisted IPs keyed by address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WhitelistMap" }
+              example:
+                "203.0.113.7":
+                  ip: "203.0.113.7"
+                  userId: "2017301000"
+                  domain: "x.example"
+                  permanent: false
+    post:
+      tags: [Whitelist]
+      summary: Add an IP to the whitelist
+      description: Adds an IP to the whitelist; rejects a malformed IP with 400.
+      operationId: addWhitelist
+      requestBody:
+        required: true
+        description: The IP to whitelist and its optional user/domain/permanent flags.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WhitelistRequest" }
+            example: { ip: "203.0.113.7", userId: "2017301000", domain: "x.example", permanent: false }
+      responses:
+        "200":
+          description: IP whitelisted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "IP 203.0.113.7 added to whitelist for 2017301000@x.example" }
+        "400":
+          $ref: "#/components/responses/InvalidIP"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/whitelist/{ip}:
+    delete:
+      tags: [Whitelist]
+      summary: Remove an IP from the whitelist
+      description: Removes the given IP from the whitelist; a no-op if it is absent.
+      operationId: removeWhitelist
+      parameters:
+        - $ref: "#/components/parameters/IPPath"
+      responses:
+        "200":
+          description: IP removed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "IP 203.0.113.7 removed from whitelist" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/blacklist:
+    get:
+      tags: [Blacklist]
+      summary: List blacklisted IPs
+      description: Returns the active blacklist entries (bans), keyed by IP address.
+      operationId: listBlacklist
+      responses:
+        "200":
+          description: Blacklisted IPs keyed by address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BlacklistMap" }
+              example:
+                "203.0.113.50":
+                  ip: "203.0.113.50"
+                  reason: "Exceeded max failed registrations (5)"
+                  permanent: false
+    post:
+      tags: [Blacklist]
+      summary: Manually blacklist an IP
+      description: |
+        Bans the IP (added to the blacklist and the kernel ipset). When
+        chanDaemon reporting is enabled the ban is also reported. Rejected if the
+        IP is whitelisted or in a trusted network.
+      operationId: addBlacklist
+      requestBody:
+        required: true
+        description: The IP to ban, its reason, and an optional permanent flag.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlacklistRequest" }
+            example: { ip: "203.0.113.50", reason: "manual block", permanent: false }
+      responses:
+        "200":
+          description: IP blacklisted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "IP 203.0.113.50 added to blacklist" }
+        "400":
+          description: Invalid IP, or the IP is whitelisted / in a trusted network.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "cannot blacklist whitelisted IP: 203.0.113.50" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/blacklist/{ip}:
+    delete:
+      tags: [Blacklist]
+      summary: Remove an IP from the blacklist
+      description: Local unban. Note chanDaemon's fan-out uses `DELETE /api/v1/ips/{ip}/block` instead.
+      operationId: removeBlacklist
+      parameters:
+        - $ref: "#/components/parameters/IPPath"
+      responses:
+        "200":
+          description: IP removed and unblocked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "IP 203.0.113.50 removed from blacklist" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+components:
+  parameters:
+    IPPath:
+      name: ip
+      in: path
+      required: true
+      description: IPv4 address.
+      schema: { type: string, format: ipv4, example: "203.0.113.50" }
+
+  responses:
+    InvalidIP:
+      description: Malformed IP address.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "invalid IP address: not-an-ip" }
+    Forbidden:
+      description: The source IP is not in the API allow-list.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "source IP not permitted for this operation" }
+
+  schemas:
+    Health:
+      type: object
+      description: Liveness status word.
+      properties:
+        status: { type: string, example: "ok", description: "always \"ok\" when serving" }
+
+    Error:
+      type: object
+      description: Plain error envelope returned on a non-2xx response.
+      properties:
+        error: { type: string, example: "source IP not permitted for this operation", description: "human-readable error detail" }
+
+    StatusMessage:
+      type: object
+      description: Acknowledgement of a successful mutation.
+      properties:
+        status: { type: string, example: "success", description: "always \"success\" on a 200" }
+        message: { type: string, example: "IP 203.0.113.50 added to blacklist", description: "human-readable confirmation" }
+
+    UnbanResponse:
+      type: object
+      description: Result of lifting a ban via the chanDaemon unban endpoint.
+      properties:
+        ip: { type: string, example: "203.0.113.50", description: "the IP that was unblocked" }
+        banned: { type: boolean, example: false, description: "always false on success" }
+        message: { type: string, example: "IP unblocked successfully", description: "unblock confirmation" }
+
+    SystemStats:
+      type: object
+      description: Go runtime statistics for the running process.
+      properties:
+        goroutines: { type: integer, example: 38, description: "live goroutines" }
+        cpuCores: { type: integer, example: 8, description: "GOMAXPROCS / logical CPUs" }
+        memory:
+          type: object
+          description: Heap and GC counters (MB unless noted).
+          properties:
+            allocMb: { type: integer, example: 12, description: "currently allocated heap (MB)" }
+            totalAllocMb: { type: integer, example: 540, description: "cumulative allocated (MB)" }
+            sysMb: { type: integer, example: 30, description: "memory obtained from the OS (MB)" }
+            gcRuns: { type: integer, example: 9, description: "completed GC cycles" }
+            heapObjects: { type: integer, example: 80432, description: "live heap objects" }
+
+    SecurityStatus:
+      type: object
+      description: High-level security and ESL connection overview.
+      properties:
+        enabled: { type: boolean, example: true, description: "security subsystem enabled" }
+        autoBlock: { type: boolean, example: true, description: "auto-block (firewall) enabled" }
+        whitelistCount: { type: integer, example: 234, description: "active whitelist entries" }
+        blacklistCount: { type: integer, example: 45, description: "active blacklist entries" }
+        eslConnected: { type: boolean, example: true, description: "ESL connection up" }
+        eslHost: { type: string, example: "127.0.0.1", description: "configured ESL host" }
+        eslPort: { type: string, example: "8021", description: "configured ESL port" }
+
+    WhitelistRequest:
+      type: object
+      description: A request to add an IP to the whitelist.
+      required: [ip]
+      properties:
+        ip: { type: string, format: ipv4, example: "203.0.113.7", description: "the IP to whitelist" }
+        userId: { type: string, example: "2017301000", description: "associated SIP user (optional)" }
+        domain: { type: string, example: "x.example", description: "associated domain (optional; defaults to freeswitch.default_domain)" }
+        permanent: { type: boolean, example: false, description: "never expire this entry" }
+
+    BlacklistRequest:
+      type: object
+      description: A request to manually ban an IP.
+      required: [ip]
+      properties:
+        ip: { type: string, format: ipv4, example: "203.0.113.50", description: "the IP to ban" }
+        reason: { type: string, example: "manual block", description: "free-text ban reason" }
+        permanent: { type: boolean, example: false, description: "never expire this ban" }
+
+    WhitelistEntry:
+      type: object
+      description: One whitelist entry.
+      properties:
+        ip: { type: string, example: "203.0.113.7", description: "the whitelisted IP" }
+        userId: { type: string, example: "2017301000", description: "associated SIP user" }
+        domain: { type: string, example: "x.example", description: "associated domain" }
+        permanent: { type: boolean, example: false, description: "true if the entry never expires" }
+        addedAt: { type: string, format: date-time, example: "2026-06-10T10:00:00Z", description: "when the entry was created" }
+        expiresAt: { type: string, format: date-time, example: "2026-06-11T10:00:00Z", description: "when the entry expires (ignored if permanent)" }
+        lastSeen: { type: string, format: date-time, example: "2026-06-10T10:05:50Z", description: "last activity that refreshed the entry" }
+
+    BlacklistEntry:
+      type: object
+      description: One blacklist entry (an active ban).
+      properties:
+        ip: { type: string, example: "203.0.113.50", description: "the banned IP" }
+        reason: { type: string, example: "Exceeded max failed registrations (5)", description: "why the IP was banned" }
+        permanent: { type: boolean, example: false, description: "true if the ban never expires" }
+        failCount: { type: integer, example: 5, description: "failed attempts recorded before the ban" }
+        addedAt: { type: string, format: date-time, example: "2026-06-10T10:00:00Z", description: "when the ban was created" }
+        expiresAt: { type: string, format: date-time, example: "2026-06-10T11:00:00Z", description: "when the ban expires (ignored if permanent)" }
+
+    WhitelistMap:
+      type: object
+      description: Active whitelist entries keyed by IP address.
+      additionalProperties:
+        $ref: "#/components/schemas/WhitelistEntry"
+
+    BlacklistMap:
+      type: object
+      description: Active blacklist entries keyed by IP address.
+      additionalProperties:
+        $ref: "#/components/schemas/BlacklistEntry"
+
+    SecurityStats:
+      type: object
+      description: Security counters; report counters appear when chanDaemon reporting is enabled.
+      properties:
+        totalRegistrations: { type: integer, example: 1548293, description: "successful registrations seen" }
+        failedRegistrations: { type: integer, example: 842, description: "failed registration attempts" }
+        blockedAttempts: { type: integer, example: 45, description: "blacklist additions processed" }
+        wrongCallStates: { type: integer, example: 12, description: "wrong-call-state events" }
+        lastRegistrationTime: { type: string, format: date-time, example: "2026-06-10T10:05:50Z", description: "time of the last successful registration (zero value when none)" }
+        lastFailedTime: { type: string, format: date-time, example: "2026-06-10T10:04:10Z", description: "time of the last failed-registration batch (zero value when none)" }
+        lastWrongCallStateTime: { type: string, format: date-time, example: "2026-06-10T09:58:01Z", description: "time of the last wrong-call-state batch (zero value when none)" }
+        activeWhitelistEntries: { type: integer, example: 234, description: "current whitelist size" }
+        activeBlacklistEntries: { type: integer, example: 45, description: "current blacklist size" }
+        reportsSent: { type: integer, example: 312, description: "chanDaemon reports accepted (reporting enabled only)" }
+        reportsFailed: { type: integer, example: 0, description: "chanDaemon reports failed (reporting enabled only)" }

@@ -50,7 +50,19 @@ type AppConfig struct {
 		ReconnectBackoff       string   `json:"reconnect_backoff"`
 		MaxWrongCallStates     int      `json:"max_wrong_call_states"`
 		WrongCallStateWindow   string   `json:"wrong_call_state_window"`
-		RateLimit              struct {
+		// ChanDaemon is the D39 central IP-ban repository integration: this
+		// node reports every firewall block to chanDaemon, and chanDaemon
+		// pushes customer/operator unbans back to the unban endpoint
+		// (DELETE /api/v1/ips/:ip/block), gated by AllowedAPIIPs.
+		ChanDaemon struct {
+			Enabled       bool     `json:"enabled"`
+			ReportURL     string   `json:"report_url"`
+			BlockerURL    string   `json:"blocker_url"`
+			ServiceName   string   `json:"service_name"`
+			ReportTimeout string   `json:"report_timeout"`
+			AllowedAPIIPs []string `json:"allowed_api_ips"`
+		} `json:"chandaemon"`
+		RateLimit struct {
 			Enabled            bool   `json:"enabled"`
 			CallRateLimit      int    `json:"call_rate_limit"`
 			CallRateInterval   string `json:"call_rate_interval"`
@@ -73,6 +85,36 @@ const defaultFreeSWITCHDomain = "example.com"
 // inserted into; it must be a chain the kernel actually traverses.
 const defaultIPTablesChain = "INPUT"
 
+// projectName is the daemon's identity, reused as the default ipset name and
+// the chanDaemon service identity (D40).
+const projectName = "freeswitch-security"
+
+// defaultLoopbackIP is the IPv4 loopback address used for several listen and
+// allow-list defaults; defaultLoopbackIPv6 is its IPv6 counterpart.
+const (
+	defaultLoopbackIP   = "127.0.0.1"
+	defaultLoopbackIPv6 = "::1"
+)
+
+// chanDaemon (D39) integration defaults. Reporting is ON by default and points
+// at the production ingress; set ReportURL empty (or Enabled false) for a
+// standalone install. ServiceName (D40) distinguishes blocker types in the
+// fleet. The API allow-list defaults to the chanDaemon nodes plus loopback so
+// the unban endpoint and other state-changing routes are restricted out of the
+// box; an empty list leaves the API unrestricted.
+const (
+	defaultChanDaemonReportURL     = "https://ipban.support.voicetel.com/api/v1/ip-bans/report"
+	defaultChanDaemonServiceName   = projectName
+	defaultChanDaemonReportTimeout = "5s"
+)
+
+// defaultChanDaemonAllowedAPIIPs returns the source IPs/CIDRs permitted to drive
+// state-changing API endpoints (the chanDaemon nodes plus loopback). Returned by
+// a function because a slice cannot be a Go constant.
+func defaultChanDaemonAllowedAPIIPs() []string {
+	return []string{"3.17.211.50", "104.225.13.77", "192.73.246.109", defaultLoopbackIP, defaultLoopbackIPv6}
+}
+
 var (
 	config     *AppConfig
 	configOnce sync.Once
@@ -83,7 +125,7 @@ func defaultConfig() *AppConfig {
 	cfg := &AppConfig{}
 
 	// Server defaults
-	cfg.Server.Host = "127.0.0.1"
+	cfg.Server.Host = defaultLoopbackIP
 	cfg.Server.Port = "8088"
 	cfg.Server.LogRequests = true
 	cfg.Server.LogResponses = false
@@ -100,7 +142,7 @@ func defaultConfig() *AppConfig {
 
 	// Security defaults
 	cfg.Security.Enabled = true
-	cfg.Security.ESLHost = "127.0.0.1"
+	cfg.Security.ESLHost = defaultLoopbackIP
 	cfg.Security.ESLPort = "8021"
 	cfg.Security.ESLPassword = "ClueCon"
 	// Default allowed ESL commands (common, safe commands)
@@ -123,13 +165,21 @@ func defaultConfig() *AppConfig {
 	}
 	cfg.Security.UntrustedNetworks = []string{}
 	cfg.Security.IPTablesChain = defaultIPTablesChain
-	cfg.Security.IPSetName = "freeswitch-security"
+	cfg.Security.IPSetName = projectName
 	cfg.Security.DryRun = false
 	cfg.Security.AutoWhitelistOnSuccess = true
 	cfg.Security.ESLLogLevel = logLevelInfoStr
 	cfg.Security.ReconnectBackoff = "5s"
 	cfg.Security.MaxWrongCallStates = 5
 	cfg.Security.WrongCallStateWindow = "10m"
+
+	// chanDaemon (D39) reporting + unban fan-out, on by default (fleet parity).
+	cfg.Security.ChanDaemon.Enabled = true
+	cfg.Security.ChanDaemon.ReportURL = defaultChanDaemonReportURL
+	cfg.Security.ChanDaemon.BlockerURL = ""
+	cfg.Security.ChanDaemon.ServiceName = defaultChanDaemonServiceName
+	cfg.Security.ChanDaemon.ReportTimeout = defaultChanDaemonReportTimeout
+	cfg.Security.ChanDaemon.AllowedAPIIPs = defaultChanDaemonAllowedAPIIPs()
 
 	// Rate Limit defaults - centralized here
 	cfg.Security.RateLimit.Enabled = true
@@ -314,6 +364,14 @@ func loadEnvironmentVariables(config *AppConfig) {
 	envString("SECURITY_WRONG_CALL_STATE_WINDOW", &config.Security.WrongCallStateWindow)
 	envJSONStringSlice("SECURITY_TRUSTED_NETWORKS", &config.Security.TrustedNetworks)
 	envJSONStringSlice("SECURITY_UNTRUSTED_NETWORKS", &config.Security.UntrustedNetworks)
+
+	// chanDaemon (D39)
+	envBool("SECURITY_CHANDAEMON_ENABLED", &config.Security.ChanDaemon.Enabled)
+	envString("SECURITY_CHANDAEMON_REPORT_URL", &config.Security.ChanDaemon.ReportURL)
+	envString("SECURITY_CHANDAEMON_BLOCKER_URL", &config.Security.ChanDaemon.BlockerURL)
+	envString("SECURITY_CHANDAEMON_SERVICE_NAME", &config.Security.ChanDaemon.ServiceName)
+	envString("SECURITY_CHANDAEMON_REPORT_TIMEOUT", &config.Security.ChanDaemon.ReportTimeout)
+	envJSONStringSlice("SECURITY_CHANDAEMON_ALLOWED_API_IPS", &config.Security.ChanDaemon.AllowedAPIIPs)
 
 	// Rate limit
 	envBool("SECURITY_RATE_LIMIT_ENABLED", &config.Security.RateLimit.Enabled)

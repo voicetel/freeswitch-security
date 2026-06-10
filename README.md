@@ -212,6 +212,12 @@ Override any configuration value using environment variables:
 | `SECURITY_IPTABLES_CHAIN` | Chain holding the ipset match-set DROP rule | `INPUT` |
 | `SECURITY_IPSET_NAME` | Name of the managed ipset | `freeswitch-security` |
 | `SECURITY_DRY_RUN` | Log firewall actions without executing them | `true` |
+| `SECURITY_CHANDAEMON_ENABLED` | Report bans to the central chanDaemon repository | `true` |
+| `SECURITY_CHANDAEMON_REPORT_URL` | chanDaemon report endpoint (empty disables reporting) | `https://ipban.support.voicetel.com/api/v1/ip-bans/report` |
+| `SECURITY_CHANDAEMON_BLOCKER_URL` | This node's own base URL chanDaemon pushes unbans to | `http://198.51.100.10:8080` |
+| `SECURITY_CHANDAEMON_SERVICE_NAME` | Sending-daemon identity in reports | `freeswitch-security` |
+| `SECURITY_CHANDAEMON_REPORT_TIMEOUT` | Per-report POST timeout | `5s` |
+| `SECURITY_CHANDAEMON_ALLOWED_API_IPS` | Source IPs/CIDRs allowed to drive state-changing endpoints (JSON array; empty = unrestricted) | `["127.0.0.1","::1"]` |
 | `SERVER_PPROF_ENABLED` | Enable pprof diagnostics server | `true` |
 | `SERVER_PPROF_ADDR` | pprof bind address (keep loopback) | `127.0.0.1:6060` |
 
@@ -280,7 +286,13 @@ same chain on every push and pull request.
 | `GET` | `/health` | Health check |
 | `GET` | `/system/stats` | System resource usage |
 | `GET` | `/security/status` | Security system overview |
-| `GET` | `/security/stats` | Detailed security statistics |
+| `GET` | `/security/stats` | Detailed security statistics (includes `reportsSent`/`reportsFailed`) |
+| `DELETE` | `/api/v1/ips/{ip}/block` | Lift a ban — the chanDaemon unban fan-out receiver (gated by the API allow-list) |
+
+State-changing endpoints (`POST`/`PUT`/`PATCH`/`DELETE`) are restricted to the
+source IPs in `security.chandaemon.allowed_api_ips`; read-only `GET`s are always
+open. See [chandaemon.md](chandaemon.md) for the central ban-repository
+integration (ban reporting and the unban fan-out).
 
 ### Security Management
 
@@ -293,7 +305,7 @@ GET /security/whitelist
 POST /security/whitelist
 {
   "ip": "192.168.1.100",
-  "user_id": "1001",
+  "userId": "1001",
   "domain": "example.com",
   "permanent": false
 }
@@ -301,8 +313,8 @@ POST /security/whitelist
 # Batch whitelist operations
 POST /security/whitelist/batch
 [
-  {"ip": "192.168.1.100", "user_id": "1001"},
-  {"ip": "192.168.1.101", "user_id": "1002"}
+  {"ip": "192.168.1.100", "userId": "1001"},
+  {"ip": "192.168.1.101", "userId": "1002"}
 ]
 
 # Remove from whitelist

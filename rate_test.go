@@ -34,6 +34,22 @@ func defaultTestRateConfig() effectiveRateConfig {
 	}
 }
 
+func TestRateManager_ShardForEmptyIP(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+	rm := newTestRateManager(t, sm, defaultTestRateConfig())
+
+	// An empty IP must resolve to shard 0 rather than indexing into an empty
+	// string; a non-empty IP resolves to a valid shard.
+	if rm.shardFor("") != &rm.shards[0] {
+		t.Error("empty IP should map to shard 0")
+	}
+
+	if rm.shardFor("203.0.113.9") == nil {
+		t.Error("non-empty IP should map to a shard")
+	}
+}
+
 func TestRateManager_Disabled(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)
@@ -228,7 +244,7 @@ func BenchmarkCheckCallRate_TrustedNet(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_ = rm.CheckCallRate("10.1.2.3", "u", "d")
+		_ = rm.CheckCallRate(testSampleIP, "u", "d")
 	}
 }
 
@@ -384,16 +400,16 @@ func TestRateManager_ConfigView(t *testing.T) {
 		t.Errorf("enabled = %v", view["enabled"])
 	}
 
-	if view["call_rate_limit"] != cfg.CallRateLimit {
-		t.Errorf("call_rate_limit = %v", view["call_rate_limit"])
+	if view["callRateLimit"] != cfg.CallRateLimit {
+		t.Errorf("call_rate_limit = %v", view["callRateLimit"])
 	}
 
-	if view["call_rate_interval"] != cfg.CallRateInterval.String() {
-		t.Errorf("call_rate_interval = %v", view["call_rate_interval"])
+	if view["callRateInterval"] != cfg.CallRateInterval.String() {
+		t.Errorf("call_rate_interval = %v", view["callRateInterval"])
 	}
 
-	if view["whitelist_bypass"] != cfg.WhitelistBypass {
-		t.Errorf("whitelist_bypass = %v", view["whitelist_bypass"])
+	if view["whitelistBypass"] != cfg.WhitelistBypass {
+		t.Errorf("whitelist_bypass = %v", view["whitelistBypass"])
 	}
 }
 

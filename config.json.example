@@ -46,6 +46,20 @@
     "reconnect_backoff": "5s",
     "max_wrong_call_states": 5,
     "wrong_call_state_window": "10m",
+    "chandaemon": {
+      "enabled": true,
+      "report_url": "https://ipban.support.voicetel.com/api/v1/ip-bans/report",
+      "blocker_url": "",
+      "service_name": "freeswitch-security",
+      "report_timeout": "5s",
+      "allowed_api_ips": [
+        "3.17.211.50",
+        "104.225.13.77",
+        "192.73.246.109",
+        "127.0.0.1",
+        "::1"
+      ]
+    },
     "rate_limit": {
       "enabled": true,
       "call_rate_limit": 20,

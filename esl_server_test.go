@@ -433,7 +433,7 @@ func TestESLManager_AccessorsAndLogLevel(t *testing.T) {
 	}
 
 	stats := em.GetESLStats()
-	if stats["host"] != accessorHost || stats["queue_capacity"] != 0 {
+	if stats["host"] != accessorHost || stats["queueCapacity"] != 0 {
 		t.Errorf("unexpected stats: %v", stats)
 	}
 }

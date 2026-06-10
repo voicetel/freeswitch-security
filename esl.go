@@ -581,18 +581,18 @@ func (em *ESLManager) Port() string { return em.eslConfig.Port }
 // GetESLStats returns current ESL statistics.
 func (em *ESLManager) GetESLStats() map[string]any {
 	return map[string]any{
-		"connected":           em.connected.Load(),
-		"host":                em.eslConfig.Host,
-		"port":                em.eslConfig.Port,
-		"connection_attempts": em.statistics.ConnectionAttempts.Load(),
-		"connection_errors":   em.statistics.ConnectionErrors.Load(),
-		"events_processed":    em.statistics.EventsProcessed.Load(),
-		"events_queued":       em.statistics.EventsQueued.Load(),
-		"events_dropped":      em.statistics.EventsDropped.Load(),
-		"log_level":           em.eslConfig.LogLevel,
-		"worker_count":        em.workerCount,
-		"queue_length":        em.queueLen(),
-		"queue_capacity":      em.queueCap(),
+		"connected":          em.connected.Load(),
+		"host":               em.eslConfig.Host,
+		"port":               em.eslConfig.Port,
+		"connectionAttempts": em.statistics.ConnectionAttempts.Load(),
+		"connectionErrors":   em.statistics.ConnectionErrors.Load(),
+		"eventsProcessed":    em.statistics.EventsProcessed.Load(),
+		"eventsQueued":       em.statistics.EventsQueued.Load(),
+		"eventsDropped":      em.statistics.EventsDropped.Load(),
+		"logLevel":           em.eslConfig.LogLevel,
+		"workerCount":        em.workerCount,
+		"queueLength":        em.queueLen(),
+		"queueCapacity":      em.queueCap(),
 	}
 }
 

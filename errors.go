@@ -40,4 +40,8 @@ var (
 
 	// ErrESLCommandNotAllowed indicates an ESL command did not match the allowlist.
 	ErrESLCommandNotAllowed = errors.New("command not allowed")
+
+	// ErrInvalidAllowEntry indicates one or more chanDaemon API allow-list
+	// entries were not a valid IP or CIDR and were skipped.
+	ErrInvalidAllowEntry = errors.New("invalid API allow-list entry")
 )

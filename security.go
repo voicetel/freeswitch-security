@@ -57,6 +57,11 @@ type SecurityManager struct {
 	// bans expire in-kernel via the entry timeout.
 	ipset *IPSetManager
 
+	// reporter forwards every firewall block to the central chanDaemon
+	// repository (D39). nil when reporting is disabled (or in dry-run); when
+	// non-nil, each successful ipset block is reported best-effort.
+	reporter *ChanDaemonReporter
+
 	// Async work queues. Each has a single dedicated drainer goroutine.
 	blacklistQueue  chan BlacklistRequest
 	whitelistQueue  chan WhitelistRequest
@@ -77,25 +82,6 @@ type SecurityManager struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	closed atomic.Bool
-}
-
-// SecurityConfig is the JSON-tagged configuration shape (kept for API stability).
-type SecurityConfig struct {
-	Enabled                bool     `json:"enabled"`
-	TrustedNetworks        []string `json:"trusted_networks"`
-	UntrustedNetworks      []string `json:"untrusted_networks"`
-	MaxFailedAttempts      int      `json:"max_failed_attempts"`
-	FailedAttemptsWindow   string   `json:"failed_attempts_window"`
-	AutoBlockEnabled       bool     `json:"auto_block_enabled"`
-	BlockDuration          string   `json:"block_duration"`
-	WhitelistEnabled       bool     `json:"whitelist_enabled"`
-	WhitelistTTL           string   `json:"whitelist_ttl"`
-	IPTablesChain          string   `json:"iptables_chain"`
-	IPSetName              string   `json:"ipset_name"`
-	DryRun                 bool     `json:"dry_run"`
-	AutoWhitelistOnSuccess bool     `json:"auto_whitelist_on_success"`
-	MaxWrongCallStates     int      `json:"max_wrong_call_states"`
-	WrongCallStateWindow   string   `json:"wrong_call_state_window"`
 }
 
 // effectiveSecurityConfig is the validated, parsed config used at runtime.
@@ -120,10 +106,10 @@ type effectiveSecurityConfig struct {
 // WhitelistEntry represents a whitelisted IP address.
 type WhitelistEntry struct {
 	IP        string    `json:"ip"`
-	AddedAt   time.Time `json:"added_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	LastSeen  time.Time `json:"last_seen"`
-	UserID    string    `json:"user_id"`
+	AddedAt   time.Time `json:"addedAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	LastSeen  time.Time `json:"lastSeen"`
+	UserID    string    `json:"userId"`
 	Domain    string    `json:"domain"`
 	Permanent bool      `json:"permanent"`
 }
@@ -131,47 +117,53 @@ type WhitelistEntry struct {
 // BlacklistEntry represents a blacklisted IP address.
 type BlacklistEntry struct {
 	IP        string    `json:"ip"`
-	AddedAt   time.Time `json:"added_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	AddedAt   time.Time `json:"addedAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
 	Reason    string    `json:"reason"`
-	FailCount int       `json:"fail_count"`
+	FailCount int       `json:"failCount"`
 	Permanent bool      `json:"permanent"`
 }
 
 // FailedAttempt tracks failed registration attempts.
 type FailedAttempt struct {
 	Count        int       `json:"count"`
-	FirstAttempt time.Time `json:"first_attempt"`
-	LastAttempt  time.Time `json:"last_attempt"`
-	UserIDs      []string  `json:"user_ids"`
+	FirstAttempt time.Time `json:"firstAttempt"`
+	LastAttempt  time.Time `json:"lastAttempt"`
+	UserIDs      []string  `json:"userIds"`
 	Domains      []string  `json:"domains"`
 }
 
 // WrongCallStateEntry tracks wrong call state events.
 type WrongCallStateEntry struct {
 	Count        int       `json:"count"`
-	FirstAttempt time.Time `json:"first_attempt"`
-	LastAttempt  time.Time `json:"last_attempt"`
-	UserIDs      []string  `json:"user_ids"`
+	FirstAttempt time.Time `json:"firstAttempt"`
+	LastAttempt  time.Time `json:"lastAttempt"`
+	UserIDs      []string  `json:"userIds"`
 }
 
 // SecurityStats tracks security-related statistics.
 type SecurityStats struct {
-	TotalRegistrations     int       `json:"total_registrations"`
-	FailedRegistrations    int       `json:"failed_registrations"`
-	BlockedAttempts        int       `json:"blocked_attempts"`
-	WrongCallStates        int       `json:"wrong_call_states"`
-	LastRegistrationTime   time.Time `json:"last_registration_time"`
-	LastFailedTime         time.Time `json:"last_failed_time"`
-	LastWrongCallStateTime time.Time `json:"last_wrong_call_state_time"`
-	ActiveWhitelistEntries int       `json:"active_whitelist_entries"`
-	ActiveBlacklistEntries int       `json:"active_blacklist_entries"`
+	TotalRegistrations     int       `json:"totalRegistrations"`
+	FailedRegistrations    int       `json:"failedRegistrations"`
+	BlockedAttempts        int       `json:"blockedAttempts"`
+	WrongCallStates        int       `json:"wrongCallStates"`
+	LastRegistrationTime   time.Time `json:"lastRegistrationTime"`
+	LastFailedTime         time.Time `json:"lastFailedTime"`
+	LastWrongCallStateTime time.Time `json:"lastWrongCallStateTime"`
+	ActiveWhitelistEntries int       `json:"activeWhitelistEntries"`
+	ActiveBlacklistEntries int       `json:"activeBlacklistEntries"`
+	// chanDaemon (D39) reporting counters; both 0 when reporting is disabled.
+	ReportsSent   uint64 `json:"reportsSent"`
+	ReportsFailed uint64 `json:"reportsFailed"`
 }
 
-// BlacklistRequest is a queued request to blacklist an IP.
+// BlacklistRequest is a queued request to blacklist an IP. FromUser is the
+// best-effort SIP From-user associated with the block; it is forwarded to
+// chanDaemon for account attribution and is "" for manual/API blocks.
 type BlacklistRequest struct {
 	IP        string
 	Reason    string
+	FromUser  string
 	Permanent bool
 	Response  chan error
 }
@@ -198,7 +190,7 @@ type WrongStateRequest struct {
 // BatchWhitelistRequest is used for batch whitelist operations.
 type BatchWhitelistRequest struct {
 	IP        string `binding:"required" json:"ip"`
-	UserID    string `json:"user_id"`
+	UserID    string `json:"userId"`
 	Domain    string `json:"domain"`
 	Permanent bool   `json:"permanent"`
 }
@@ -336,6 +328,8 @@ func InitSecurityManager() {
 			}
 		}
 
+		securityManager.initChanDaemonReporter(cfg, logger)
+
 		// Start workers.
 		securityManager.wg.Add(5)
 		go securityManager.processBlacklistQueue()
@@ -371,6 +365,11 @@ func (sm *SecurityManager) Shutdown() {
 	close(sm.failedQueue)
 	close(sm.wrongStateQueue)
 	sm.wg.Wait()
+
+	// Drain any in-flight chanDaemon reports queued by the workers above.
+	if sm.reporter != nil {
+		sm.reporter.Wait()
+	}
 
 	logger.Info("Security manager shutdown complete")
 }
@@ -654,6 +653,10 @@ func (sm *SecurityManager) GetSecurityStats() SecurityStats {
 		stats.LastRegistrationTime = time.Unix(0, ns)
 	}
 
+	if sm.reporter != nil {
+		stats.ReportsSent, stats.ReportsFailed = sm.reporter.Stats()
+	}
+
 	return stats
 }
 
@@ -839,10 +842,10 @@ func (sm *SecurityManager) GetIPTablesInfo() (map[string]any, error) {
 	}
 
 	return map[string]any{
-		"chain":       sm.cfg.IPTablesChain,
-		"ipset":       sm.cfg.IPSetName,
-		"blocked_ips": blocked,
-		"count":       len(blocked),
+		"chain":      sm.cfg.IPTablesChain,
+		"ipset":      sm.cfg.IPSetName,
+		"blockedIps": blocked,
+		"count":      len(blocked),
 	}, nil
 }
 
@@ -850,6 +853,29 @@ func (sm *SecurityManager) GetIPTablesInfo() (map[string]any, error) {
 // by routes. Returns (enabled, autoBlockEnabled).
 func (sm *SecurityManager) SecurityConfigView() (bool, bool) {
 	return sm.cfg.Enabled, sm.cfg.AutoBlockEnabled
+}
+
+// initChanDaemonReporter builds the chanDaemon (D39) reporter when reporting is
+// enabled. Reporting is tied to actually enforcing bans: it is skipped unless
+// auto-block is on (otherwise we would report bans we did not enact) and is
+// suppressed in dry-run (which must produce no external side effects). A failure
+// to parse the timeout falls back to 5s.
+func (sm *SecurityManager) initChanDaemonReporter(cfg *AppConfig, logger *Logger) {
+	cd := cfg.Security.ChanDaemon
+
+	if !cd.Enabled || cd.ReportURL == "" || !sm.cfg.AutoBlockEnabled || sm.cfg.DryRun {
+		return
+	}
+
+	timeout := parseDurationOr(cd.ReportTimeout, 5*time.Second)
+	sm.reporter = NewChanDaemonReporter(cd.ReportURL, cd.BlockerURL, cd.ServiceName, timeout)
+
+	logger.Info("chanDaemon ban reporting enabled: %s (self %q, service %q)",
+		cd.ReportURL, cd.BlockerURL, cd.ServiceName)
+
+	if cd.BlockerURL == "" {
+		logger.Info("chanDaemon blocker_url is empty: bans are reported, but chanDaemon cannot push unbans back to this node")
+	}
 }
 
 // processBlacklistQueue drains the blacklist queue.
@@ -938,7 +964,7 @@ func (sm *SecurityManager) processBatchBlacklist(batch []BlacklistRequest) {
 		delete(sm.failedAttempts, req.IP)
 
 		if sm.cfg.AutoBlockEnabled {
-			toBlock = append(toBlock, blockTarget{ip: req.IP, reason: req.Reason, permanent: req.Permanent})
+			toBlock = append(toBlock, blockTarget{ip: req.IP, reason: req.Reason, fromUser: req.FromUser, permanent: req.Permanent})
 		}
 
 		logger.Info("Added IP %s to blacklist: %s", req.IP, req.Reason)
@@ -1149,15 +1175,17 @@ func (sm *SecurityManager) processBatchFailedAttempts(batch []FailedAttemptReque
 
 		if autoBlock && attempt.Count >= maxAttempts {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:     req.IP,
-				Reason: fmt.Sprintf("Exceeded max failed registrations (%d)", maxAttempts),
+				IP:       req.IP,
+				Reason:   fmt.Sprintf("Exceeded max failed registrations (%d)", maxAttempts),
+				FromUser: reportableUser(req.UserID),
 			})
 		}
 
 		if _, untrusted := sm.untrustedPatterns[req.Domain]; untrusted && req.Domain != "" {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:     req.IP,
-				Reason: fmt.Sprintf("Failed registration from untrusted domain %q", req.Domain),
+				IP:       req.IP,
+				Reason:   fmt.Sprintf("Failed registration from untrusted domain %q", req.Domain),
+				FromUser: reportableUser(req.UserID),
 			})
 		}
 	}
@@ -1246,8 +1274,9 @@ func (sm *SecurityManager) processBatchWrongStates(batch []WrongStateRequest) {
 
 		if autoBlock && attempt.Count >= maxStates {
 			toBlacklist = append(toBlacklist, BlacklistRequest{
-				IP:     req.IP,
-				Reason: fmt.Sprintf("Exceeded max wrong call states (%d)", maxStates),
+				IP:       req.IP,
+				Reason:   fmt.Sprintf("Exceeded max wrong call states (%d)", maxStates),
+				FromUser: reportableUser(req.UserID),
 			})
 		}
 	}
@@ -1423,9 +1452,12 @@ func (sm *SecurityManager) cleanupExpiredEntries() {
 // ----------------------------------------------------------------------
 
 // blockTarget is one accepted blacklist entry awaiting a kernel ipset add.
+// fromUser carries the best-effort SIP From-user through to the chanDaemon
+// report (it never reaches the kernel ipset itself).
 type blockTarget struct {
 	ip        string
 	reason    string
+	fromUser  string
 	permanent bool
 }
 
@@ -1448,6 +1480,14 @@ func (sm *SecurityManager) batchBlockIPs(targets []blockTarget) {
 		err := sm.ipset.BlockIP(tgt.ip, tgt.reason, ttl)
 		if err != nil {
 			logger.Error("Failed to block IP %s: %v", tgt.ip, err)
+
+			continue
+		}
+
+		// Mirror the enacted ban to chanDaemon (best-effort, async). A
+		// permanent ban (ttl 0) lets chanDaemon apply its sticky floor.
+		if sm.reporter != nil {
+			sm.reporter.Report(tgt.ip, tgt.fromUser, tgt.reason, ttl)
 		}
 	}
 }

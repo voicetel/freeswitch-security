@@ -62,7 +62,7 @@ linters:
     tagliatelle:
       case:
         rules:
-          json: snake
+          json: camel
     varnamelen:
       min-name-length: 2
       ignore-names:
@@ -113,6 +113,12 @@ linters:
       - linters:
           - containedctx
         text: found a struct that contains a context\.Context field
+      # config.go's AppConfig maps to the snake_case config.json file format
+      # (operator directive); the HTTP API itself is camelCase (tagliatelle
+      # json: camel), so only the config-file shape is exempt here.
+      - linters:
+          - tagliatelle
+        path: config\.go$
       # ipset.go (and its tests) are ported verbatim from the sibling
       # opensips-journal-blocker project to keep the two firewall backends
       # behaviourally identical. They are intentionally linted under that

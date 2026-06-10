@@ -58,12 +58,12 @@ Dynamically adjust log levels without restarting:
 
 ```bash
 # Increase verbosity for troubleshooting
-curl -X POST http://127.0.0.1:8080/security/esl/log_level \
+curl -X POST http://127.0.0.1:8088/security/esl/log-level \
   -H "Content-Type: application/json" \
   -d '{"level": "debug"}'
 
 # Return to production level
-curl -X POST http://127.0.0.1:8080/security/esl/log_level \
+curl -X POST http://127.0.0.1:8088/security/esl/log-level \
   -H "Content-Type: application/json" \
   -d '{"level": "info"}'
 ```
@@ -208,14 +208,14 @@ All log messages follow a consistent, parseable format:
 
 ```bash
 # Temporarily increase verbosity
-curl -X POST http://localhost:8080/security/esl/log_level \
+curl -X POST http://localhost:8088/security/esl/log-level \
   -d '{"level": "trace"}'
 
 # Generate test events
 # [perform actions that trigger the issue]
 
 # Return to normal level
-curl -X POST http://localhost:8080/security/esl/log_level \
+curl -X POST http://localhost:8088/security/esl/log-level \
   -d '{"level": "info"}'
 ```
 
@@ -283,7 +283,7 @@ curl -X POST http://localhost:8080/security/esl/log_level \
 
 #### Step 1: Increase Verbosity
 ```bash
-curl -X POST http://localhost:8080/security/esl/log_level \
+curl -X POST http://localhost:8088/security/esl/log-level \
   -H "Content-Type: application/json" \
   -d '{"level": "debug"}'
 ```
@@ -318,7 +318,7 @@ Look for patterns in:
 
 #### Step 5: Return to Production Level
 ```bash
-curl -X POST http://localhost:8080/security/esl/log_level \
+curl -X POST http://localhost:8088/security/esl/log-level \
   -H "Content-Type: application/json" \
   -d '{"level": "info"}'
 ```
@@ -480,13 +480,13 @@ func processWithTiming(event *Event) {
 
 ```bash
 # Daily health check
-curl -s http://localhost:8080/security/esl | jq '.connected'
+curl -s http://localhost:8088/security/esl | jq '.connected'
 
 # Weekly log level audit
 grep "ESL log level set" /var/log/freeswitch-security.log | tail -5
 
 # Performance baseline
-curl -s http://localhost:8080/security/esl | jq '{queue_length, queue_capacity, worker_count, events_dropped}'
+curl -s http://localhost:8088/security/esl | jq '{queue_length, queue_capacity, worker_count, events_dropped}'
 ```
 
 ## 🔧 Advanced Features

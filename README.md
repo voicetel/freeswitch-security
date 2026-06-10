@@ -52,18 +52,24 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 ├── main.go              # Application entry point and graceful shutdown
 ├── config.go            # Configuration management with environment variable support
 ├── cache.go             # In-memory TTL response cache (stdlib)
-├── security.go          # Core security engine: lists, batching, iptables
+├── security.go          # Core security engine: lists, batching, firewall
+├── ipset.go             # Kernel ipset firewall backend (one match-set DROP rule)
+├── reporter.go          # chanDaemon ban-reporting client (D39)
+├── allowlist.go         # Source-IP allow-list middleware for state-changing endpoints
 ├── esl.go               # Event Socket Layer integration with worker pools
 ├── rate.go              # Sharded per-IP rate limiting with automatic cleanup
 ├── routes.go            # REST API with request processing pipeline
+├── errors.go            # Sentinel errors
 ├── logging.go           # Centralized logging system with configurable levels
 ├── pprof.go             # Optional loopback-only pprof diagnostics server
 ├── Makefile             # Build, test, lint, coverage, and benchmark targets
 ├── *_test.go            # Hermetic test suite (no FreeSWITCH or iptables needed)
 ├── config.json.example  # Annotated configuration example
+├── openapi.yaml         # OpenAPI 3.0 spec for the REST API
 ├── README.md            # This comprehensive documentation
+├── chandaemon.md        # Central ban-repository (chanDaemon) integration guide
 ├── logging.md           # Detailed logging system documentation
-├── iptables.md          # IPTables integration and security guide
+├── iptables.md          # ipset firewall integration and security guide
 └── esl.md               # ESL Command API documentation
 ```
 

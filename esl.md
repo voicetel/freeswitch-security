@@ -73,12 +73,12 @@ Future versions will support dynamic whitelist management:
 
 ```bash
 # Add command to whitelist (planned feature)
-curl -X POST http://127.0.0.1:8080/security/esl/whitelist \
+curl -X POST http://127.0.0.1:8088/security/esl/whitelist \
   -H "Content-Type: application/json" \
   -d '{"command": "show dialplan"}'
 
 # Remove command from whitelist (planned feature)
-curl -X DELETE http://127.0.0.1:8080/security/esl/whitelist/show%20dialplan
+curl -X DELETE http://127.0.0.1:8088/security/esl/whitelist/show%20dialplan
 ```
 
 ### Advanced Configuration Options
@@ -98,13 +98,16 @@ curl -X DELETE http://127.0.0.1:8080/security/esl/whitelist/show%20dialplan
 
 #### Performance Tuning
 
+The ESL worker pool is sized automatically from the available CPUs and the
+event queues are fixed-size, so neither is operator-configurable. The tunable
+ESL settings are the connection parameters, the log level, and the reconnect
+backoff:
+
 ```json
 {
   "security": {
-    "esl_worker_count": 4,
-    "esl_queue_size": 1000,
-    "esl_command_timeout": "30s",
-    "esl_max_retries": 3
+    "esl_log_level": "info",
+    "reconnect_backoff": "5s"
   }
 }
 ```
@@ -136,17 +139,17 @@ curl -X DELETE http://127.0.0.1:8080/security/esl/whitelist/show%20dialplan
 
 ```bash
 # Get FreeSWITCH status
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "status"}'
 
 # Get system uptime
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "uptime"}'
 
 # Get FreeSWITCH version
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "version"}'
 ```
@@ -155,17 +158,17 @@ curl -X POST http://127.0.0.1:8080/security/esl/command \
 
 ```bash
 # Show active channels
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "show channels"}'
 
 # Show registrations
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "show registrations"}'
 
 # Show active calls
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "show calls"}'
 ```
@@ -174,12 +177,12 @@ curl -X POST http://127.0.0.1:8080/security/esl/command \
 
 ```bash
 # Show Sofia SIP profile status
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "sofia status"}'
 
 # Get detailed XML status
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "sofia xmlstatus"}'
 ```
@@ -188,12 +191,12 @@ curl -X POST http://127.0.0.1:8080/security/esl/command \
 
 ```bash
 # Reload XML configuration
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "reloadxml"}'
 
 # Change log level (if allowed)
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
   -H "Content-Type: application/json" \
   -d '{"command": "log 4"}'
 ```
@@ -207,7 +210,7 @@ For multiple commands, use individual API calls with proper error handling:
 # Batch command execution script
 
 COMMANDS=("status" "uptime" "show channels" "show registrations")
-BASE_URL="http://127.0.0.1:8080/security/esl/command"
+BASE_URL="http://127.0.0.1:8088/security/esl/command"
 
 for cmd in "${COMMANDS[@]}"; do
     echo "Executing: $cmd"
@@ -273,8 +276,8 @@ Never whitelist these potentially dangerous commands in production:
 
 ```bash
 # Restrict API access to management network only
-sudo iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 8080 -j DROP
+sudo iptables -A INPUT -p tcp --dport 8088 -s 192.168.1.0/24 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8088 -j DROP
 
 # Use reverse proxy with authentication
 # nginx configuration example:
@@ -285,7 +288,7 @@ server {
     location /security/esl/command {
         auth_basic "FreeSWITCH API";
         auth_basic_user_file /etc/nginx/.htpasswd;
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:8088;
     }
 }
 ```
@@ -356,7 +359,7 @@ execute_command() {
     local cmd="$1"
     local response
 
-    response=$(curl -s -X POST http://127.0.0.1:8080/security/esl/command \
+    response=$(curl -s -X POST http://127.0.0.1:8088/security/esl/command \
         -H "Content-Type: application/json" \
         -d "{\"command\": \"$cmd\"}")
 
@@ -416,40 +419,30 @@ Response ← Response Queue ← Command Execution ← Command Processing
 
 ```bash
 # Get ESL connection statistics
-curl -s http://127.0.0.1:8080/security/esl | jq '.'
+curl -s http://127.0.0.1:8088/security/esl | jq '.'
 
 # Expected response:
 {
   "connected": true,
   "host": "127.0.0.1",
   "port": "8021",
-  "connection_attempts": 1,
-  "connection_errors": 0,
-  "events_processed": 15234,
-  "events_queued": 25001,
-  "events_dropped": 0,
-  "log_level": "info",
-  "worker_count": 4,
-  "queue_size": 1000,
-  "queue_length": 15,
-  "queue_capacity": 1000,
-  "memory_pool_enabled": true,
-  "dynamic_sizing": true
+  "connectionAttempts": 1,
+  "connectionErrors": 0,
+  "eventsProcessed": 15234,
+  "eventsQueued": 25001,
+  "eventsDropped": 0,
+  "logLevel": "info",
+  "workerCount": 4,
+  "queueLength": 15,
+  "queueCapacity": 4096
 }
 ```
 
 #### Performance Tuning
 
-```json
-{
-  "security": {
-    "esl_worker_count": 8,        // Increase for high command volume
-    "esl_queue_size": 2000,       // Increase for burst handling
-    "esl_command_timeout": "60s", // Increase for slow commands
-    "esl_batch_size": 10          // Commands per batch operation
-  }
-}
-```
+Throughput is governed by the automatically-sized worker pool and the
+fixed-size event queues (see the metrics above to confirm headroom); there are
+no worker, queue, or timeout knobs to set. The command timeout is a fixed 10s.
 
 ## 🔧 Advanced Features
 
@@ -481,10 +474,10 @@ func (em *ESLManager) handleConnectionFailure() {
 
 ```bash
 # Monitor ESL connection health
-watch -n 5 'curl -s http://127.0.0.1:8080/security/esl | jq ".connected"'
+watch -n 5 'curl -s http://127.0.0.1:8088/security/esl | jq ".connected"'
 
 # Get detailed connection metrics
-curl -s http://127.0.0.1:8080/security/esl | jq '{
+curl -s http://127.0.0.1:8088/security/esl | jq '{
   connected: .connected,
   queue_utilization: (.queue_length / .queue_capacity * 100),
   error_rate: (.connection_errors / .connection_attempts * 100),
@@ -541,7 +534,7 @@ Predefined command templates for common operations:
 #!/bin/bash
 # /usr/local/nagios/libexec/check_freeswitch_esl
 
-API_URL="http://127.0.0.1:8080/security/esl/command"
+API_URL="http://127.0.0.1:8088/security/esl/command"
 COMMAND="status"
 
 response=$(curl -s -X POST "$API_URL" \
@@ -575,13 +568,13 @@ fi
 # FreeSWITCH metrics exporter
 
 # Get channel count
-channels=$(curl -s -X POST http://127.0.0.1:8080/security/esl/command \
+channels=$(curl -s -X POST http://127.0.0.1:8088/security/esl/command \
     -H "Content-Type: application/json" \
     -d '{"command": "show channels count"}' | \
     jq -r '.response' | grep -o '[0-9]\+')
 
 # Get registration count
-registrations=$(curl -s -X POST http://127.0.0.1:8080/security/esl/command \
+registrations=$(curl -s -X POST http://127.0.0.1:8088/security/esl/command \
     -H "Content-Type: application/json" \
     -d '{"command": "show registrations count"}' | \
     jq -r '.response' | grep -o '[0-9]\+')
@@ -606,7 +599,7 @@ EOF
 #!/bin/bash
 # Daily FreeSWITCH health check via ESL API
 
-API_URL="http://127.0.0.1:8080/security/esl/command"
+API_URL="http://127.0.0.1:8088/security/esl/command"
 LOGFILE="/var/log/freeswitch-health.log"
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -646,7 +639,7 @@ echo "[$DATE] Health check completed" >> "$LOGFILE"
 #!/bin/bash
 # Backup FreeSWITCH configuration via ESL
 
-API_URL="http://127.0.0.1:8080/security/esl/command"
+API_URL="http://127.0.0.1:8088/security/esl/command"
 BACKUP_DIR="/backup/freeswitch/$(date +%Y%m%d)"
 mkdir -p "$BACKUP_DIR"
 
@@ -678,7 +671,7 @@ echo "Configuration backup completed: $BACKUP_DIR"
 **Diagnosis**:
 ```bash
 # Check ESL connection status
-curl -s http://127.0.0.1:8080/security/esl | jq '.connected'
+curl -s http://127.0.0.1:8088/security/esl | jq '.connected'
 
 # Check FreeSWITCH CLI directly
 fs_cli -x "status"
@@ -701,7 +694,7 @@ tail -f /var/log/freeswitch-security.log | grep ESL
 **Diagnosis**:
 ```bash
 # Check queue utilization
-curl -s http://127.0.0.1:8080/security/esl | jq '{
+curl -s http://127.0.0.1:8088/security/esl | jq '{
   queue_length: .queue_length,
   queue_capacity: .queue_capacity,
   utilization: (.queue_length / .queue_capacity * 100)
@@ -725,14 +718,14 @@ top -p $(pgrep freeswitch-security)
 **Diagnosis**:
 ```bash
 # Check connection statistics
-curl -s http://127.0.0.1:8080/security/esl | jq '{
+curl -s http://127.0.0.1:8088/security/esl | jq '{
   attempts: .connection_attempts,
   errors: .connection_errors,
   error_rate: (.connection_errors / .connection_attempts * 100)
 }'
 
 # Force reconnection
-curl -X POST http://127.0.0.1:8080/security/esl/reconnect
+curl -X POST http://127.0.0.1:8088/security/esl/reconnect
 ```
 
 **Solutions**:
@@ -746,12 +739,12 @@ curl -X POST http://127.0.0.1:8080/security/esl/reconnect
 
 ```bash
 # Increase log verbosity
-curl -X POST http://127.0.0.1:8080/security/esl/log_level \
+curl -X POST http://127.0.0.1:8088/security/esl/log-level \
     -H "Content-Type: application/json" \
     -d '{"level": "debug"}'
 
 # Execute problematic command
-curl -X POST http://127.0.0.1:8080/security/esl/command \
+curl -X POST http://127.0.0.1:8088/security/esl/command \
     -H "Content-Type: application/json" \
     -d '{"command": "your_command_here"}'
 
@@ -759,7 +752,7 @@ curl -X POST http://127.0.0.1:8080/security/esl/command \
 tail -f /var/log/freeswitch-security.log | grep -E "(ESL DEBUG|ESL ERROR)"
 
 # Return to normal logging
-curl -X POST http://127.0.0.1:8080/security/esl/log_level \
+curl -X POST http://127.0.0.1:8088/security/esl/log-level \
     -H "Content-Type: application/json" \
     -d '{"level": "info"}'
 ```
@@ -796,7 +789,7 @@ telnet 127.0.0.1 8021
 
 ```bash
 # Batch command execution (planned)
-curl -X POST http://127.0.0.1:8080/api/v2/esl/batch \
+curl -X POST http://127.0.0.1:8088/api/v2/esl/batch \
     -H "Content-Type: application/json" \
     -d '{
         "commands": [
@@ -807,7 +800,7 @@ curl -X POST http://127.0.0.1:8080/api/v2/esl/batch \
     }'
 
 # Scheduled commands (planned)
-curl -X POST http://127.0.0.1:8080/api/v2/esl/schedule \
+curl -X POST http://127.0.0.1:8088/api/v2/esl/schedule \
     -H "Content-Type: application/json" \
     -d '{
         "command": "reloadxml",

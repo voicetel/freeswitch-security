@@ -29,7 +29,7 @@ Content-Type: application/json
   "ip": "203.0.113.50",
   "reason": "Exceeded max failed registrations (5)",
   "ttl": 3600,
-  "blocker": "http://198.51.100.10:8080",
+  "blocker": "http://198.51.100.10:8088",
   "service": "freeswitch-security",
   "fromUser": "2017301000"
 }

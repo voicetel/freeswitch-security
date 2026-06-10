@@ -150,8 +150,8 @@ sudo iptables -A INPUT -p tcp --dport 5060 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 16384:32768 -j ACCEPT # RTP
 
 # Security API — restrict to the management network
-sudo iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 8080 -j DROP
+sudo iptables -A INPUT -p tcp --dport 8088 -s 192.168.1.0/24 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8088 -j DROP
 ```
 
 The application installs its own match-set DROP rule at position 1 of the
@@ -175,7 +175,7 @@ End-to-end via the API:
 
 ```bash
 # Block
-curl -X POST http://127.0.0.1:8080/security/blacklist \
+curl -X POST http://127.0.0.1:8088/security/blacklist \
   -H 'Content-Type: application/json' \
   -d '{"ip":"192.0.2.100","reason":"test","permanent":false}'
 
@@ -183,16 +183,16 @@ curl -X POST http://127.0.0.1:8080/security/blacklist \
 sudo ipset test freeswitch-security 192.0.2.100   # → "... is in set ..."
 
 # Unblock
-curl -X DELETE http://127.0.0.1:8080/security/blacklist/192.0.2.100
+curl -X DELETE http://127.0.0.1:8088/security/blacklist/192.0.2.100
 sudo ipset test freeswitch-security 192.0.2.100   # → "... is NOT in set ..."
 ```
 
 The `/security/iptables` endpoint reports set state directly:
 
 ```bash
-curl -s http://127.0.0.1:8080/security/iptables | jq '.'
+curl -s http://127.0.0.1:8088/security/iptables | jq '.'
 # { "chain": "INPUT", "ipset": "freeswitch-security",
-#   "blocked_ips": ["192.0.2.100"], "count": 1 }
+#   "blockedIps": ["192.0.2.100"], "count": 1 }
 ```
 
 ## 📊 Monitoring and maintenance
@@ -253,7 +253,7 @@ and `iptables` command it *would* run without touching kernel state.
 
 - **Least privilege**: prefer `CAP_NET_ADMIN` over running as root; scope sudo
   to `ipset`/`iptables` only.
-- **Restrict the API**: bind to a management interface and firewall port 8080 to
+- **Restrict the API**: bind to a management interface and firewall port 8088 to
   trusted sources; keep the pprof endpoint loopback-only (the default).
 - **Trusted networks**: list management/internal CIDRs in `trusted_networks` so
   the app never blocks them.

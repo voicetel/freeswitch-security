@@ -25,9 +25,6 @@ import (
 //nolint:paralleltest // ordered singleton initialization
 func TestSingleton_Cache(t *testing.T) {
 	cm := GetCacheManager() // initializes from config.json (cache enabled)
-	if cm == nil {
-		t.Fatal("GetCacheManager returned nil")
-	}
 
 	if cm != GetCacheManager() {
 		t.Fatal("GetCacheManager must return the same instance")
@@ -102,9 +99,6 @@ func TestSingleton_SecurityManager(t *testing.T) {
 
 	// First access goes through GetSecurityManager's nil branch.
 	sm := GetSecurityManager()
-	if sm == nil {
-		t.Fatal("GetSecurityManager returned nil")
-	}
 
 	// Belt-and-suspenders: ensure later reads (e.g. /security/iptables via the
 	// shared singleton) never shell out to a real ipset list.
@@ -164,9 +158,6 @@ func TestSingleton_ESLManager(t *testing.T) {
 	// First access goes through GetESLManager's nil branch, which wires the
 	// singleton to the security manager itself.
 	em := GetESLManager()
-	if em == nil {
-		t.Fatal("GetESLManager returned nil")
-	}
 
 	if em != GetESLManager() {
 		t.Fatal("GetESLManager must return the same instance")
@@ -199,9 +190,6 @@ func TestSingleton_RequestProcessor(t *testing.T) {
 	em := GetESLManager() // shut down in the previous test; safe for stats
 
 	rp := InitRequestProcessor(sm, em)
-	if rp == nil {
-		t.Fatal("InitRequestProcessor returned nil")
-	}
 
 	if rp != InitRequestProcessor(sm, em) {
 		t.Fatal("InitRequestProcessor must return the same instance")

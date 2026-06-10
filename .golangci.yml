@@ -109,7 +109,7 @@ linters:
         path: logging\.go
       - linters:
           - gochecknoglobals
-        text: (securityManager|cacheManager|eslManager|globalLogger|requestProcessor|httpServer|backoffMultipliers|config|secManagerOnce|cacheManagerOnce|eslManagerOnce|globalLoggerOnce|processorOnce|configOnce|sinkBool|sinkString|sinkStrings|sinkDuration) is a global variable
+        text: (securityManager|cacheManager|eslManager|globalLogger|requestProcessor|httpServer|backoffMultipliers|config|secManagerOnce|cacheManagerOnce|eslManagerOnce|globalLoggerOnce|processorOnce|configOnce|sinkBool|sinkString|sinkStrings|sinkDuration|version|gitCommit|buildTime) is a global variable
       - linters:
           - containedctx
         text: found a struct that contains a context\.Context field

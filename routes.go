@@ -57,6 +57,7 @@ const (
 	respKeyStatus  = "status"
 	respKeyMessage = "message"
 	respKeySuccess = "success"
+	respKeyVersion = "version"
 
 	// statusTypeSecurity is the processor status-request type for security
 	// statistics; the other types appear once each in the dispatch switch.
@@ -249,11 +250,7 @@ func registerRoutes(router *gin.Engine) {
 	router.Use(allowListMiddleware(allowList))
 
 	// Health check endpoint
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			respKeyStatus: "ok",
-		})
-	})
+	router.GET("/health", healthHandler())
 
 	// Cache stats endpoint
 	router.GET("/cache/stats", func(c *gin.Context) {
@@ -303,14 +300,26 @@ func RegisterSecurityRoutes(router *gin.Engine) {
 	}
 }
 
-// systemStatsHandler returns Go runtime statistics.
+// healthHandler returns the liveness probe response, carrying the build
+// version so a running binary can be identified.
+func healthHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			respKeyStatus:  "ok",
+			respKeyVersion: version,
+		})
+	}
+}
+
+// systemStatsHandler returns Go runtime statistics and the build version.
 func systemStatsHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var ms runtime.MemStats
 
 		runtime.ReadMemStats(&ms)
 		c.JSON(200, gin.H{
-			"goroutines": runtime.NumGoroutine(),
+			respKeyVersion: version,
+			"goroutines":   runtime.NumGoroutine(),
 			"memory": gin.H{
 				"allocMb":      ms.Alloc / 1024 / 1024,
 				"totalAllocMb": ms.TotalAlloc / 1024 / 1024,

@@ -75,7 +75,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Health" }
-              example: { status: "ok" }
+              example: { status: "ok", version: "v1.5.3" }
 
   /system/stats:
     get:
@@ -90,6 +90,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SystemStats" }
               example:
+                version: "v1.5.3"
                 goroutines: 38
                 cpuCores: 8
                 memory: { allocMb: 12, totalAllocMb: 540, sysMb: 30, gcRuns: 9, heapObjects: 80432 }
@@ -768,9 +769,10 @@ components:
   schemas:
     Health:
       type: object
-      description: A single status word.
+      description: A single status word, with the build version on /health.
       properties:
         status: { type: string, example: "ok", description: "status word" }
+        version: { type: string, example: "v1.5.3", description: "build version (/health only; \"dev\" for an un-stamped build)" }
 
     Error:
       type: object
@@ -797,6 +799,7 @@ components:
       type: object
       description: Go runtime statistics for the running process.
       properties:
+        version: { type: string, example: "v1.5.3", description: "build version (\"dev\" for an un-stamped build)" }
         goroutines: { type: integer, example: 38, description: "live goroutines" }
         cpuCores: { type: integer, example: 8, description: "GOMAXPROCS / logical CPUs" }
         memory:

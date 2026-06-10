@@ -2,8 +2,7 @@
 #
 # `make build` produces a static, stripped, path-trimmed binary: CGO is
 # disabled (this service has no cgo dependencies), symbols and DWARF debug
-# info are stripped (-s -w), -trimpath removes local filesystem paths, and
-# -buildvcs=false keeps VCS metadata out of the binary.
+# info are stripped (-s -w), and -trimpath removes local filesystem paths.
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -13,12 +12,17 @@ GO      ?= go
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/freeswitch-security
 
-GOFLAGS ?= -buildvcs=false -trimpath
-LDFLAGS := -ldflags "-s -w"
+# Build-time version metadata, injected into package main via -ldflags -X.
+# VERSION is the git tag (or a -dirty/commit fallback); override by setting it
+# on the command line (e.g. `make build VERSION=v1.5.3`).
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# No cgo dependencies: force it off so the binary is static and builds are
-# unaffected by the host toolchain.
-export CGO_ENABLED := 0
+LDFLAGS := -s -w \
+	-X main.version=$(VERSION) \
+	-X main.gitCommit=$(GIT_COMMIT) \
+	-X main.buildTime=$(BUILD_TIME)
 
 # ---------------------------------------------------------------------------
 # Targets
@@ -28,7 +32,7 @@ export CGO_ENABLED := 0
 
 build:
 	@mkdir -p $(BIN_DIR)
-	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY) .
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
 run: build
 	./$(BINARY)

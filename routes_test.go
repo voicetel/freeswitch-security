@@ -424,19 +424,37 @@ func TestRoute_SystemStats(t *testing.T) {
 	if _, ok := resp["memory"]; !ok {
 		t.Errorf("missing memory key: %v", resp)
 	}
+
+	// The build version is surfaced here ("dev" without -ldflags injection).
+	if resp[respKeyVersion] != version {
+		t.Errorf("version = %v, want %q", resp[respKeyVersion], version)
+	}
 }
 
 func TestRoute_Health(t *testing.T) {
 	t.Parallel()
 
 	router := gin.New()
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{testCmdStatus: "ok"})
-	})
+	router.GET("/health", healthHandler())
 
 	rec := doJSON(t, router, "GET", "/health", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d", rec.Code)
+	}
+
+	var resp map[string]any
+
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp[respKeyStatus] != "ok" {
+		t.Errorf("status = %v, want ok", resp[respKeyStatus])
+	}
+
+	if resp[respKeyVersion] != version {
+		t.Errorf("version = %v, want %q", resp[respKeyVersion], version)
 	}
 }
 

@@ -17,6 +17,14 @@ import (
 // Global server instance for graceful shutdown.
 var httpServer *http.Server
 
+// Build-time version metadata, injected via -ldflags -X (see the Makefile).
+// The defaults apply to a plain `go build`/`go run` without the Makefile.
+var (
+	version   = "dev"
+	gitCommit = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
@@ -87,7 +95,8 @@ func run(shutdownChan <-chan os.Signal) error {
 	serverErr := make(chan error, 1)
 
 	go func() {
-		log.Printf("Starting FreeSWITCH Security server on %s:%s...", host, port)
+		log.Printf("Starting freeswitch-security %s (commit %s, built %s) on %s:%s...",
+			version, gitCommit, buildTime, host, port)
 
 		err := httpServer.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

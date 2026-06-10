@@ -629,7 +629,7 @@ func registerESLRoutes(g *gin.RouterGroup, eslManager *ESLManager, processor *Re
 		})
 
 		// Set log level
-		esl.POST("/log_level", func(c *gin.Context) {
+		esl.POST("/log-level", func(c *gin.Context) {
 			var req struct {
 				Level string `binding:"required" json:"level"` // error, info, debug, trace
 			}

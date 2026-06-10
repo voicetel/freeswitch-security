@@ -47,10 +47,20 @@ tags:
     description: Liveness, system, and security statistics.
   - name: chanDaemon
     description: The central ban-repository unban fan-out receiver.
+  - name: Cache
+    description: Response-cache statistics and control.
   - name: Whitelist
     description: Inspect and mutate the IP whitelist.
   - name: Blacklist
     description: Inspect and mutate the IP blacklist (bans).
+  - name: Tracking
+    description: Failed-registration and wrong-call-state tracking, and the firewall view.
+  - name: ESL
+    description: FreeSWITCH event-socket status and control.
+  - name: Rate Limiting
+    description: Call/registration rate-limit configuration and counters.
+  - name: Untrusted Networks
+    description: The untrusted-domain pattern list.
 
 paths:
   /health:
@@ -129,6 +139,39 @@ paths:
                 reportsSent: 312
                 reportsFailed: 0
 
+  /cache/stats:
+    get:
+      tags: [Cache]
+      summary: Cache statistics
+      description: Response-cache hit/miss counters and effective TTL. When the cache is disabled only `enabled` is returned.
+      operationId: getCacheStats
+      responses:
+        "200":
+          description: Cache counters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CacheStats" }
+              example:
+                enabled: true
+                security: { hits: 800, misses: 47, entries: 1, ttl: "5m0s" }
+                operations: { writes: 47, reads: 800, misses: 47, deletes: 0 }
+
+  /cache/security/clear:
+    post:
+      tags: [Cache]
+      summary: Clear the security response cache
+      description: Drops the cached `/security/stats` response. State-changing, so gated by the source-IP allow-list.
+      operationId: clearSecurityCache
+      responses:
+        "200":
+          description: Cache cleared.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: "security cache cleared" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   /api/v1/ips/{ip}/block:
     delete:
       tags: [chanDaemon]
@@ -196,7 +239,54 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /security/whitelist/batch:
+    post:
+      tags: [Whitelist]
+      summary: Add many IPs to the whitelist
+      description: Adds up to 1000 IPs in one request; each entry's outcome is reported independently.
+      operationId: addWhitelistBatch
+      requestBody:
+        required: true
+        description: The IPs to whitelist (max 1000).
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/WhitelistRequest" }
+            example:
+              - { ip: "203.0.113.7", userId: "2017301000" }
+              - { ip: "203.0.113.8", userId: "2017301001" }
+      responses:
+        "200":
+          description: Per-entry whitelist results.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchResults" }
+              example: { results: [ { ip: "203.0.113.7", status: "success" }, { ip: "bad", error: "invalid IP address: bad" } ] }
+        "400":
+          description: Malformed request body, or more than 1000 entries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "batch size exceeds limit of 1000" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   /security/whitelist/{ip}:
+    get:
+      tags: [Whitelist]
+      summary: Check whitelist status of an IP
+      description: Reports whether the IP is whitelisted, with the associated user/domain when it is.
+      operationId: getWhitelistEntry
+      parameters:
+        - $ref: "#/components/parameters/IPPath"
+      responses:
+        "200":
+          description: Whitelist status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WhitelistCheck" }
+              example: { ip: "203.0.113.7", whitelisted: true, userId: "2017301000", domain: "x.example" }
     delete:
       tags: [Whitelist]
       summary: Remove an IP from the whitelist
@@ -262,7 +352,54 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /security/blacklist/batch:
+    post:
+      tags: [Blacklist]
+      summary: Ban many IPs
+      description: Bans up to 1000 IPs in one request; each entry's outcome is reported independently.
+      operationId: addBlacklistBatch
+      requestBody:
+        required: true
+        description: The IPs to ban (max 1000).
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/BlacklistRequest" }
+            example:
+              - { ip: "203.0.113.50", reason: "scanner" }
+              - { ip: "203.0.113.51", reason: "scanner" }
+      responses:
+        "200":
+          description: Per-entry blacklist results.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchResults" }
+              example: { results: [ { ip: "203.0.113.50", status: "success" } ] }
+        "400":
+          description: Malformed body or a batch over the 1000-entry limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "batch size exceeds limit of 1000" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   /security/blacklist/{ip}:
+    get:
+      tags: [Blacklist]
+      summary: Check blacklist status of an IP
+      description: Reports whether the IP is currently blacklisted.
+      operationId: getBlacklistEntry
+      parameters:
+        - $ref: "#/components/parameters/IPPath"
+      responses:
+        "200":
+          description: Blacklist status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BlacklistCheck" }
+              example: { ip: "203.0.113.50", blacklisted: true }
     delete:
       tags: [Blacklist]
       summary: Remove an IP from the blacklist
@@ -279,6 +416,325 @@ paths:
               example: { status: "success", message: "IP 203.0.113.50 removed from blacklist" }
         "403":
           $ref: "#/components/responses/Forbidden"
+
+  /security/failed:
+    get:
+      tags: [Tracking]
+      summary: List tracked failed-registration attempts
+      description: Returns per-IP failed-registration tracking, keyed by IP address.
+      operationId: getFailedAttempts
+      responses:
+        "200":
+          description: Failed-attempt records keyed by IP.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FailedAttemptMap" }
+              example:
+                "203.0.113.50":
+                  count: 4
+                  firstAttempt: "2026-06-10T10:00:00Z"
+                  lastAttempt: "2026-06-10T10:03:10Z"
+                  userIds: ["2017301000"]
+                  domains: ["x.example"]
+
+  /security/wrong-call-states:
+    get:
+      tags: [Tracking]
+      summary: List tracked wrong-call-state events
+      description: Returns per-IP wrong-call-state tracking, keyed by IP address.
+      operationId: getWrongCallStates
+      responses:
+        "200":
+          description: Wrong-call-state records keyed by IP.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WrongStateMap" }
+              example:
+                "203.0.113.60":
+                  count: 5
+                  firstAttempt: "2026-06-10T09:50:00Z"
+                  lastAttempt: "2026-06-10T09:58:01Z"
+                  userIds: ["2017309999"]
+
+  /security/iptables:
+    get:
+      tags: [Tracking]
+      summary: Firewall (ipset) view
+      description: The IPs currently in the kernel ipset and the chain holding the match-set DROP rule.
+      operationId: getIPTablesInfo
+      responses:
+        "200":
+          description: Firewall state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IPTablesInfo" }
+              example: { chain: "INPUT", ipset: "freeswitch-security", blockedIps: ["203.0.113.50"], count: 1 }
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /security/esl:
+    get:
+      tags: [ESL]
+      summary: ESL connection status and counters
+      description: FreeSWITCH event-socket connection state, event counters, and worker/queue metrics.
+      operationId: getESLStats
+      responses:
+        "200":
+          description: ESL status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ESLStats" }
+              example:
+                connected: true
+                host: "127.0.0.1"
+                port: "8021"
+                connectionAttempts: 1
+                connectionErrors: 0
+                eventsProcessed: 1548000
+                eventsQueued: 1548000
+                eventsDropped: 0
+                logLevel: "info"
+                workerCount: 4
+                queueLength: 0
+                queueCapacity: 4096
+
+  /security/esl/log-level:
+    post:
+      tags: [ESL]
+      summary: Set the ESL log level
+      description: Sets the runtime log level (error, info, debug, trace).
+      operationId: setESLLogLevel
+      requestBody:
+        required: true
+        description: The log level to apply.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LogLevelRequest" }
+            example: { level: "debug" }
+      responses:
+        "200":
+          description: Log level set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "ESL log level set to debug" }
+        "400":
+          description: Missing the required `level` field.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "Key: 'level' Error:Field validation for 'level' failed on the 'required' tag" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/esl/reconnect:
+    post:
+      tags: [ESL]
+      summary: Force an ESL reconnection
+      description: Initiates a reconnection to the FreeSWITCH event socket.
+      operationId: reconnectESL
+      responses:
+        "200":
+          description: Reconnection initiated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "ESL reconnection initiated" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/esl/command:
+    post:
+      tags: [ESL]
+      summary: Run an allow-listed ESL command
+      description: Executes an ESL command (subject to the configured command allow-list) with a 10s timeout.
+      operationId: sendESLCommand
+      requestBody:
+        required: true
+        description: The ESL command to run.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommandRequest" }
+            example: { command: "status" }
+      responses:
+        "200":
+          description: Command output.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommandResponse" }
+              example: { command: "status", response: "UP 0 years, 0 days, 1 hour" }
+        "400":
+          description: Missing the required `command` field.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "Key: 'command' Error:Field validation for 'command' failed on the 'required' tag" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: The command failed (e.g. not allow-listed, or ESL disconnected).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "command not allowed" }
+        "504":
+          description: The command timed out.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "command execution timeout" }
+
+  /security/rate-limit:
+    get:
+      tags: [Rate Limiting]
+      summary: Rate-limit configuration
+      description: The effective call/registration rate-limit configuration in force.
+      operationId: getRateLimitConfig
+      responses:
+        "200":
+          description: Rate-limit configuration.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RateLimitConfig" }
+              example:
+                enabled: true
+                callRateLimit: 20
+                callRateInterval: "1m0s"
+                registrationLimit: 10
+                registrationWindow: "1m0s"
+                autoBlockOnExceed: true
+                blockDuration: "15m0s"
+                whitelistBypass: true
+                cleanupInterval: "5m0s"
+
+  /security/rate-limit/calls:
+    get:
+      tags: [Rate Limiting]
+      summary: Current per-IP call counters
+      description: A snapshot of the per-IP call-rate counters, keyed by IP address.
+      operationId: getCallRates
+      responses:
+        "200":
+          description: Per-IP call counters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RateCounterMap" }
+              example:
+                "203.0.113.5":
+                  count: 12
+                  firstRequest: "2026-06-10T10:00:00Z"
+                  lastRequest: "2026-06-10T10:00:40Z"
+                  userIds: ["2017301000"]
+                  domains: ["x.example"]
+
+  /security/rate-limit/registrations:
+    get:
+      tags: [Rate Limiting]
+      summary: Current per-IP registration counters
+      description: A snapshot of the per-IP registration-rate counters, keyed by IP address.
+      operationId: getRegistrationRates
+      responses:
+        "200":
+          description: Per-IP registration counters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RateCounterMap" }
+              example:
+                "203.0.113.5":
+                  count: 3
+                  firstRequest: "2026-06-10T10:00:00Z"
+                  lastRequest: "2026-06-10T10:00:30Z"
+                  userIds: ["2017301000"]
+                  domains: ["x.example"]
+
+  /security/untrusted-networks:
+    get:
+      tags: [Untrusted Networks]
+      summary: List untrusted-domain patterns
+      description: Returns every exact-match domain pattern that triggers a ban on a failed registration.
+      operationId: listUntrustedNetworks
+      responses:
+        "200":
+          description: The untrusted-domain patterns.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PatternList" }
+              example: ["evil.example", "scanner.example"]
+    post:
+      tags: [Untrusted Networks]
+      summary: Add an untrusted-domain pattern
+      description: Adds an exact-match domain pattern to the untrusted list.
+      operationId: addUntrustedNetwork
+      requestBody:
+        required: true
+        description: The pattern to add.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatternRequest" }
+            example: { pattern: "evil.example" }
+      responses:
+        "200":
+          description: Pattern added.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "Pattern 'evil.example' added to untrusted networks" }
+        "400":
+          description: Missing pattern, or the pattern already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "untrusted pattern already exists: \"evil.example\"" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/untrusted-networks/{pattern}:
+    delete:
+      tags: [Untrusted Networks]
+      summary: Remove an untrusted-domain pattern
+      description: Removes a pattern from the untrusted list.
+      operationId: removeUntrustedNetwork
+      parameters:
+        - name: pattern
+          in: path
+          required: true
+          description: The exact pattern to remove.
+          schema: { type: string, example: "evil.example" }
+      responses:
+        "200":
+          description: Pattern removed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+              example: { status: "success", message: "Pattern 'evil.example' removed from untrusted networks" }
+        "400":
+          description: The pattern was not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "untrusted pattern not found: \"evil.example\"" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /security/untrusted-networks/test/{domain}:
+    get:
+      tags: [Untrusted Networks]
+      summary: Test a domain against the untrusted patterns
+      description: Reports whether the given domain matches any untrusted pattern.
+      operationId: testUntrustedDomain
+      parameters:
+        - name: domain
+          in: path
+          required: true
+          description: The domain to test.
+          schema: { type: string, example: "evil.example" }
+      responses:
+        "200":
+          description: Match result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UntrustedTest" }
+              example: { domain: "evil.example", isUntrusted: true }
 
 components:
   parameters:
@@ -302,13 +758,19 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "source IP not permitted for this operation" }
+    ServerError:
+      description: An internal error (e.g. the firewall list could not be read).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "failed to list ipset" }
 
   schemas:
     Health:
       type: object
-      description: Liveness status word.
+      description: A single status word.
       properties:
-        status: { type: string, example: "ok", description: "always \"ok\" when serving" }
+        status: { type: string, example: "ok", description: "status word" }
 
     Error:
       type: object
@@ -359,6 +821,28 @@ components:
         eslHost: { type: string, example: "127.0.0.1", description: "configured ESL host" }
         eslPort: { type: string, example: "8021", description: "configured ESL port" }
 
+    CacheStats:
+      type: object
+      description: Response-cache counters; only `enabled` appears when the cache is off.
+      properties:
+        enabled: { type: boolean, example: true, description: "cache enabled" }
+        security:
+          type: object
+          description: Cached-response counters and TTL.
+          properties:
+            hits: { type: integer, example: 800, description: "cache reads served" }
+            misses: { type: integer, example: 47, description: "cache misses" }
+            entries: { type: integer, example: 1, description: "live cached entries" }
+            ttl: { type: string, example: "5m0s", description: "cached-response TTL" }
+        operations:
+          type: object
+          description: Raw operation counters.
+          properties:
+            writes: { type: integer, example: 47, description: "cache writes" }
+            reads: { type: integer, example: 800, description: "cache reads" }
+            misses: { type: integer, example: 47, description: "cache misses (operations counter)" }
+            deletes: { type: integer, example: 0, description: "cache deletes" }
+
     WhitelistRequest:
       type: object
       description: A request to add an IP to the whitelist.
@@ -377,6 +861,40 @@ components:
         ip: { type: string, format: ipv4, example: "203.0.113.50", description: "the IP to ban" }
         reason: { type: string, example: "manual block", description: "free-text ban reason" }
         permanent: { type: boolean, example: false, description: "never expire this ban" }
+
+    BatchResults:
+      type: object
+      description: Per-entry outcomes of a batch whitelist/blacklist operation.
+      properties:
+        results:
+          type: array
+          description: One result per submitted entry, in order.
+          example: [ { ip: "203.0.113.7", status: "success" }, { ip: "bad", error: "invalid IP address: bad" } ]
+          items: { $ref: "#/components/schemas/BatchResult" }
+
+    BatchResult:
+      type: object
+      description: One entry's outcome; carries either `status` (success) or `error`.
+      properties:
+        ip: { type: string, example: "203.0.113.7", description: "the submitted IP" }
+        status: { type: string, example: "success", description: "present on success" }
+        error: { type: string, example: "invalid IP address: bad", description: "present on failure" }
+
+    WhitelistCheck:
+      type: object
+      description: Whitelist status of one IP; user/domain present only when whitelisted.
+      properties:
+        ip: { type: string, example: "203.0.113.7", description: "the IP queried" }
+        whitelisted: { type: boolean, example: true, description: "true if currently whitelisted" }
+        userId: { type: string, example: "2017301000", description: "associated SIP user (present when whitelisted)" }
+        domain: { type: string, example: "x.example", description: "associated domain (present when whitelisted)" }
+
+    BlacklistCheck:
+      type: object
+      description: Blacklist status of one IP.
+      properties:
+        ip: { type: string, example: "203.0.113.50", description: "the IP whose ban status was queried" }
+        blacklisted: { type: boolean, example: true, description: "true if currently blacklisted" }
 
     WhitelistEntry:
       type: object
@@ -401,6 +919,115 @@ components:
         addedAt: { type: string, format: date-time, example: "2026-06-10T10:00:00Z", description: "when the ban was created" }
         expiresAt: { type: string, format: date-time, example: "2026-06-10T11:00:00Z", description: "when the ban expires (ignored if permanent)" }
 
+    FailedAttempt:
+      type: object
+      description: Per-IP failed-registration tracking.
+      properties:
+        count: { type: integer, example: 4, description: "failed attempts in the window" }
+        firstAttempt: { type: string, format: date-time, example: "2026-06-10T10:00:00Z", description: "first attempt time" }
+        lastAttempt: { type: string, format: date-time, example: "2026-06-10T10:03:10Z", description: "most recent attempt time" }
+        userIds: { type: array, items: { type: string }, example: ["2017301000"], description: "distinct SIP users seen" }
+        domains: { type: array, items: { type: string }, example: ["x.example"], description: "distinct domains seen" }
+
+    WrongCallStateEntry:
+      type: object
+      description: Per-IP wrong-call-state tracking.
+      properties:
+        count: { type: integer, example: 5, description: "wrong-call-state events in the window" }
+        firstAttempt: { type: string, format: date-time, example: "2026-06-10T09:50:00Z", description: "first event time" }
+        lastAttempt: { type: string, format: date-time, example: "2026-06-10T09:58:01Z", description: "most recent event time" }
+        userIds: { type: array, items: { type: string }, example: ["2017309999"], description: "distinct SIP users in the wrong-state events" }
+
+    RateCounter:
+      type: object
+      description: Per-IP rate counter for calls or registrations.
+      properties:
+        count: { type: integer, example: 12, description: "requests in the current window" }
+        firstRequest: { type: string, format: date-time, example: "2026-06-10T10:00:00Z", description: "window start" }
+        lastRequest: { type: string, format: date-time, example: "2026-06-10T10:00:40Z", description: "most recent request" }
+        userIds: { type: array, items: { type: string }, example: ["2017301000"], description: "distinct SIP users in the rate window" }
+        domains: { type: array, items: { type: string }, example: ["x.example"], description: "distinct domains in the rate window" }
+
+    IPTablesInfo:
+      type: object
+      description: Firewall (ipset) state.
+      properties:
+        chain: { type: string, example: "INPUT", description: "chain holding the match-set DROP rule" }
+        ipset: { type: string, example: "freeswitch-security", description: "name of the managed ipset" }
+        blockedIps: { type: array, items: { type: string }, example: ["203.0.113.50"], description: "IPs currently in the set" }
+        count: { type: integer, example: 1, description: "number of blocked IPs" }
+
+    ESLStats:
+      type: object
+      description: FreeSWITCH event-socket status and counters.
+      properties:
+        connected: { type: boolean, example: true, description: "connection up" }
+        host: { type: string, example: "127.0.0.1", description: "ESL host" }
+        port: { type: string, example: "8021", description: "ESL port" }
+        connectionAttempts: { type: integer, example: 1, description: "connection attempts" }
+        connectionErrors: { type: integer, example: 0, description: "connection errors" }
+        eventsProcessed: { type: integer, example: 1548000, description: "events processed" }
+        eventsQueued: { type: integer, example: 1548000, description: "events enqueued" }
+        eventsDropped: { type: integer, example: 0, description: "events dropped (queue full)" }
+        logLevel: { type: string, example: "info", description: "current ESL log level" }
+        workerCount: { type: integer, example: 4, description: "event worker goroutines" }
+        queueLength: { type: integer, example: 0, description: "queued events now" }
+        queueCapacity: { type: integer, example: 4096, description: "total queue capacity" }
+
+    LogLevelRequest:
+      type: object
+      description: A request to set the ESL log level.
+      required: [level]
+      properties:
+        level: { type: string, enum: [error, info, debug, trace], example: "debug", description: "log level to apply" }
+
+    CommandRequest:
+      type: object
+      description: An ESL command to run.
+      required: [command]
+      properties:
+        command: { type: string, example: "status", description: "the ESL command" }
+
+    CommandResponse:
+      type: object
+      description: The result of an ESL command.
+      properties:
+        command: { type: string, example: "status", description: "the command that was run" }
+        response: { type: string, example: "UP 0 years, 0 days, 1 hour", description: "raw ESL output" }
+
+    RateLimitConfig:
+      type: object
+      description: Effective rate-limit configuration.
+      properties:
+        enabled: { type: boolean, example: true, description: "rate limiting enabled" }
+        callRateLimit: { type: integer, example: 20, description: "calls allowed per interval" }
+        callRateInterval: { type: string, example: "1m0s", description: "call-rate window" }
+        registrationLimit: { type: integer, example: 10, description: "registrations allowed per window" }
+        registrationWindow: { type: string, example: "1m0s", description: "registration window" }
+        autoBlockOnExceed: { type: boolean, example: true, description: "auto-ban on limit breach" }
+        blockDuration: { type: string, example: "15m0s", description: "ban length on breach" }
+        whitelistBypass: { type: boolean, example: true, description: "whitelisted IPs bypass limits" }
+        cleanupInterval: { type: string, example: "5m0s", description: "counter cleanup interval" }
+
+    PatternRequest:
+      type: object
+      description: An untrusted-domain pattern to add.
+      required: [pattern]
+      properties:
+        pattern: { type: string, example: "evil.example", description: "exact-match domain pattern" }
+
+    UntrustedTest:
+      type: object
+      description: Result of testing a domain against the untrusted patterns.
+      properties:
+        domain: { type: string, example: "evil.example", description: "the domain tested" }
+        isUntrusted: { type: boolean, example: true, description: "true if it matches a pattern" }
+
+    PatternList:
+      type: array
+      description: Untrusted-domain patterns.
+      items: { type: string, example: "evil.example" }
+
     WhitelistMap:
       type: object
       description: Active whitelist entries keyed by IP address.
@@ -412,6 +1039,24 @@ components:
       description: Active blacklist entries keyed by IP address.
       additionalProperties:
         $ref: "#/components/schemas/BlacklistEntry"
+
+    FailedAttemptMap:
+      type: object
+      description: Failed-attempt records keyed by IP address.
+      additionalProperties:
+        $ref: "#/components/schemas/FailedAttempt"
+
+    WrongStateMap:
+      type: object
+      description: Wrong-call-state records keyed by IP address.
+      additionalProperties:
+        $ref: "#/components/schemas/WrongCallStateEntry"
+
+    RateCounterMap:
+      type: object
+      description: Per-IP rate counters keyed by IP address.
+      additionalProperties:
+        $ref: "#/components/schemas/RateCounter"
 
     SecurityStats:
       type: object

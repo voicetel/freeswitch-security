@@ -132,7 +132,7 @@ machine-dependent — the architecture below is the point):
 {
   "server": {
     "host": "127.0.0.1",
-    "port": "8080",
+    "port": "8088",
     "log_requests": true,
     "log_responses": false,
     "pprof_enabled": false,
@@ -202,7 +202,7 @@ Override any configuration value using environment variables:
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `SERVER_HOST` | Server bind address | `0.0.0.0` |
-| `SERVER_PORT` | Server port | `8080` |
+| `SERVER_PORT` | Server port | `8088` |
 | `SECURITY_ESL_HOST` | FreeSWITCH ESL host | `192.168.1.100` |
 | `SECURITY_ESL_PASSWORD` | ESL password | `mySecurePassword` |
 | `SECURITY_ESL_ALLOWED_COMMANDS` | Allowed ESL commands (JSON array) | `["status","uptime"]` |
@@ -214,7 +214,7 @@ Override any configuration value using environment variables:
 | `SECURITY_DRY_RUN` | Log firewall actions without executing them | `true` |
 | `SECURITY_CHANDAEMON_ENABLED` | Report bans to the central chanDaemon repository | `true` |
 | `SECURITY_CHANDAEMON_REPORT_URL` | chanDaemon report endpoint (empty disables reporting) | `https://ipban.support.voicetel.com/api/v1/ip-bans/report` |
-| `SECURITY_CHANDAEMON_BLOCKER_URL` | This node's own base URL chanDaemon pushes unbans to | `http://198.51.100.10:8080` |
+| `SECURITY_CHANDAEMON_BLOCKER_URL` | This node's own base URL chanDaemon pushes unbans to | `http://198.51.100.10:8088` |
 | `SECURITY_CHANDAEMON_SERVICE_NAME` | Sending-daemon identity in reports | `freeswitch-security` |
 | `SECURITY_CHANDAEMON_REPORT_TIMEOUT` | Per-report POST timeout | `5s` |
 | `SECURITY_CHANDAEMON_ALLOWED_API_IPS` | Source IPs/CIDRs allowed to drive state-changing endpoints (JSON array; empty = unrestricted) | `["127.0.0.1","::1"]` |
@@ -361,7 +361,7 @@ POST /security/esl/command
 }
 
 # Change log level
-POST /security/esl/log_level
+POST /security/esl/log-level
 {
   "level": "debug"
 }
@@ -458,13 +458,13 @@ GET /security/esl
 #### ESL Connection Problems
 ```bash
 # Check connection status
-curl http://localhost:8080/security/esl
+curl http://localhost:8088/security/esl
 
 # Force reconnection
-curl -X POST http://localhost:8080/security/esl/reconnect
+curl -X POST http://localhost:8088/security/esl/reconnect
 
 # Increase log verbosity
-curl -X POST http://localhost:8080/security/esl/log_level \
+curl -X POST http://localhost:8088/security/esl/log-level \
   -H "Content-Type: application/json" \
   -d '{"level":"debug"}'
 ```
@@ -486,7 +486,7 @@ curl -X POST http://localhost:8080/security/esl/log_level \
 export SECURITY_ESL_LOG_LEVEL=debug
 
 # Monitor resource usage
-watch -n 1 'curl -s http://localhost:8080/system/stats | jq'
+watch -n 1 'curl -s http://localhost:8088/system/stats | jq'
 ```
 
 ## 🚀 Advanced Features

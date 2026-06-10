@@ -770,12 +770,12 @@ func TestRoute_ESL(t *testing.T) {
 	old := GetLogger().GetLogLevel()
 	defer GetLogger().SetLogLevel(old)
 
-	rec = doJSON(t, router, "POST", "/security/esl/log_level", `{"level":"error"}`)
+	rec = doJSON(t, router, "POST", "/security/esl/log-level", `{"level":"error"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("log_level status=%d body=%s", rec.Code, rec.Body)
 	}
 
-	rec = doJSON(t, router, "POST", "/security/esl/log_level", `{}`)
+	rec = doJSON(t, router, "POST", "/security/esl/log-level", `{}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("log_level missing field: expected 400, got %d", rec.Code)
 	}

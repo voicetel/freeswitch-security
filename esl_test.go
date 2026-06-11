@@ -46,6 +46,9 @@ const (
 	// the fake server and the managers wired against it.
 	testESLPassword = "ClueCon"
 
+	// testSpammer is the SIP From-user fixture used in channel-create events.
+	testSpammer = "spammer"
+
 	// statusRegistered is the registration Status header fixture.
 	statusRegistered = "Registered"
 

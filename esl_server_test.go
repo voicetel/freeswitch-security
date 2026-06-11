@@ -483,7 +483,7 @@ func TestESLManager_KillsRateLimitedCall(t *testing.T) {
 		return map[string]string{
 			hdrEventName:    eventNameChannelCreate,
 			hdrVarNetworkIP: "203.0.113.180",
-			hdrVarFromUser:  "spammer",
+			hdrVarFromUser:  testSpammer,
 			hdrVarFromHost:  "spam.example",
 			hdrUniqueID:     uuid,
 		}
@@ -494,6 +494,38 @@ func TestESLManager_KillsRateLimitedCall(t *testing.T) {
 
 	if !waitFor(func() bool { return srv.commandSeen("uuid_kill uuid-kill-1") }) {
 		t.Error("expected rate-limited call to be killed via uuid_kill")
+	}
+}
+
+// TestESLManager_KillsUntrustedCall covers the untrusted-domain INVITE filter:
+// a CHANNEL_CREATE whose From-host matches an untrusted pattern is torn down via
+// uuid_kill and the source IP is blacklisted.
+func TestESLManager_KillsUntrustedCall(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	em := newServerESLManager(t, srv, 1, 16)
+
+	if !waitFor(em.IsConnected) {
+		t.Fatal("manager never connected")
+	}
+
+	// newTestSecurityManager loads testUntrustedDomain ("evil.example") as an
+	// untrusted pattern; this IP is outside the trusted 10.0.0.0/8.
+	srv.sendEvent(map[string]string{
+		hdrEventName:    eventNameChannelCreate,
+		hdrVarNetworkIP: "203.0.113.190",
+		hdrVarFromUser:  testSpammer,
+		hdrVarFromHost:  testUntrustedDomain,
+		hdrUniqueID:     "uuid-untrusted-1",
+	})
+
+	if !waitFor(func() bool { return srv.commandSeen("uuid_kill uuid-untrusted-1") }) {
+		t.Error("expected untrusted-domain call to be killed via uuid_kill")
+	}
+
+	if !waitFor(func() bool { return em.securityManager.IsIPBlacklisted("203.0.113.190") }) {
+		t.Error("expected untrusted-domain call to blacklist the source IP")
 	}
 }
 
@@ -570,7 +602,7 @@ func TestESLManager_KillError(t *testing.T) {
 		return map[string]string{
 			hdrEventName:    eventNameChannelCreate,
 			hdrVarNetworkIP: "203.0.113.181",
-			hdrVarFromUser:  "spammer",
+			hdrVarFromUser:  testSpammer,
 			hdrUniqueID:     uuid,
 		}
 	}

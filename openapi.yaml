@@ -60,7 +60,7 @@ tags:
   - name: Rate Limiting
     description: Call/registration rate-limit configuration and counters.
   - name: Untrusted Networks
-    description: The untrusted-domain pattern list.
+    description: The untrusted-domain pattern list (bans failed registrations and inbound INVITEs from matching domains).
 
 paths:
   /health:
@@ -652,7 +652,7 @@ paths:
     get:
       tags: [Untrusted Networks]
       summary: List untrusted-domain patterns
-      description: Returns every exact-match domain pattern that triggers a ban on a failed registration.
+      description: Returns every exact-match domain pattern that triggers a ban on a failed registration or an inbound INVITE.
       operationId: listUntrustedNetworks
       responses:
         "200":

@@ -233,6 +233,46 @@ func TestAddToBlacklist_RejectsTrustedIP(t *testing.T) {
 	}
 }
 
+func TestCheckUntrustedCall(t *testing.T) {
+	t.Parallel()
+	sm := newTestSecurityManager(t)
+
+	const untrustedIP = "203.0.113.50"
+
+	// Untrusted domain from a non-exempt IP: filtered, and the IP is banned.
+	if !sm.CheckUntrustedCall(untrustedIP, testSpammer, testUntrustedDomain) {
+		t.Fatal("call from untrusted domain should be filtered")
+	}
+
+	if !waitFor(func() bool { return sm.IsIPBlacklisted(untrustedIP) }) {
+		t.Error("untrusted-domain call should blacklist the source IP")
+	}
+
+	// Trusted-network IP is allowed even from an untrusted domain.
+	if sm.CheckUntrustedCall(testSampleIP, "u", testUntrustedDomain) {
+		t.Error("trusted-network IP must not be filtered")
+	}
+
+	// Whitelisted IP is allowed.
+	err := sm.AddToWhitelist("203.0.113.7", "alice", "x.example", false)
+	if err != nil {
+		t.Fatalf("seed whitelist: %v", err)
+	}
+
+	if sm.CheckUntrustedCall("203.0.113.7", "alice", testUntrustedDomain) {
+		t.Error("whitelisted IP must not be filtered")
+	}
+
+	// A non-untrusted (or empty) domain is allowed.
+	if sm.CheckUntrustedCall("203.0.113.51", "u", "good.example") {
+		t.Error("non-untrusted domain must not be filtered")
+	}
+
+	if sm.CheckUntrustedCall("203.0.113.52", "u", "") {
+		t.Error("empty domain must not be filtered")
+	}
+}
+
 func TestAddToBlacklist_RejectsWhitelistedIP(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)

@@ -499,6 +499,19 @@ func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 		return
 	}
 
+	// Filter calls from untrusted domains first. Trusted networks and
+	// whitelisted IPs are allowed (checked inside CheckUntrustedCall); a match
+	// blacklists the source IP and the call is torn down.
+	if w.manager.securityManager.CheckUntrustedCall(pe.IPAddress, pe.UserID, pe.Domain) {
+		if w.logger.enabled(LogLevelInfo) {
+			w.logger.Info("Worker #%d: call from %s blocked — untrusted domain %q", w.id, pe.IPAddress, pe.Domain)
+		}
+
+		w.terminateCall(pe, "untrusted-domain")
+
+		return
+	}
+
 	if w.manager.rateManager.CheckCallRate(pe.IPAddress, pe.UserID, pe.Domain) {
 		if w.logger.enabled(LogLevelDebug) {
 			w.logger.Debug("Worker #%d: call from %s allowed", w.id, pe.IPAddress)
@@ -511,6 +524,13 @@ func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 		w.logger.Info("Worker #%d: call from %s blocked by rate limit", w.id, pe.IPAddress)
 	}
 
+	w.terminateCall(pe, "rate-limited")
+}
+
+// terminateCall hangs up the call via uuid_kill over the live ESL connection.
+// It is a no-op when there is no UUID or the connection is down. reason is used
+// only for logging.
+func (w *EventWorker) terminateCall(pe *ProcessedEvent, reason string) {
 	if pe.CallUUID == "" {
 		return
 	}
@@ -525,9 +545,9 @@ func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 
 	_, err := client.Send("uuid_kill " + pe.CallUUID)
 	if err != nil {
-		w.logger.Error("Worker #%d: error hanging up rate-limited call %s: %v", w.id, pe.CallUUID, err)
+		w.logger.Error("Worker #%d: error hanging up %s call %s: %v", w.id, reason, pe.CallUUID, err)
 	} else {
-		w.logger.Info("Worker #%d: terminated rate-limited call %s", w.id, pe.CallUUID)
+		w.logger.Info("Worker #%d: terminated %s call %s", w.id, reason, pe.CallUUID)
 	}
 }
 

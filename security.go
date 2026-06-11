@@ -593,6 +593,32 @@ func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
 	return ok
 }
 
+// CheckUntrustedCall decides whether an inbound INVITE (CHANNEL_CREATE) from the
+// given source IP and From-domain should be filtered. Trusted networks and
+// whitelisted IPs are always allowed (checked first); otherwise, if the domain
+// matches an untrusted pattern, the source IP is queued for blacklisting (ipset
+// + chanDaemon report, like the failed-registration path) and the function
+// returns true so the caller can tear the call down. fromUser is the SIP
+// From-user, forwarded for chanDaemon account attribution.
+func (sm *SecurityManager) CheckUntrustedCall(ip, fromUser, domain string) bool {
+	// Trusted networks and whitelisted IPs win — never filtered.
+	if sm.IsIPWhitelisted(ip) {
+		return false
+	}
+
+	if !sm.IsUntrustedDomain(domain) {
+		return false
+	}
+
+	sm.enqueueBlacklist([]BlacklistRequest{{
+		IP:       ip,
+		Reason:   fmt.Sprintf("Call from untrusted domain %q", domain),
+		FromUser: reportableUser(fromUser),
+	}})
+
+	return true
+}
+
 // AddUntrustedNetwork adds to the untrusted-networks list.
 func (sm *SecurityManager) AddUntrustedNetwork(pattern string) error {
 	logger := GetLogger()

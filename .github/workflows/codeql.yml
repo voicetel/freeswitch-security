@@ -7,6 +7,7 @@ on:
     branches: [master]
   schedule:
     - cron: '27 6 * * 1'
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -21,12 +22,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [go]
+        language: [go, actions]
 
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -35,7 +37,8 @@ jobs:
         with:
           languages: ${{ matrix.language }}
 
-      - name: Autobuild
+      - if: matrix.language == 'go'
+        name: Autobuild
         uses: github/codeql-action/autobuild@v4
 
       - name: Analyze

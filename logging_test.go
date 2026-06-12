@@ -113,17 +113,13 @@ func TestLogger_Concurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for j := range 1000 {
 				logger.SetLogLevel(LogLevelDebug)
 				_ = logger.GetLogLevel()
 				logger.Debug("test %d", j)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

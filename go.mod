@@ -1,6 +1,6 @@
 module github.com/voicetel/freeswitch-security
 
-go 1.24.2
+go 1.25.0
 
 require (
 	github.com/fiorix/go-eventsocket v0.0.0-20240904143901-40effc2c18a7

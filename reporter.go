@@ -62,13 +62,9 @@ func NewChanDaemonReporter(endpoint, self, service string, timeout time.Duration
 // Report fires the POST in the background so the firewall path is never delayed
 // by the network. Wait drains in-flight reports at shutdown.
 func (r *ChanDaemonReporter) Report(ip, fromUser, reason string, ttl time.Duration) {
-	r.wg.Add(1)
-
-	go func() {
-		defer r.wg.Done()
-
+	r.wg.Go(func() {
 		r.post(ip, fromUser, reason, ttl)
-	}()
+	})
 }
 
 // Stats returns the cumulative count of (sent, failed) ban reports, for

@@ -1315,16 +1315,12 @@ func TestAddTimeouts(t *testing.T) {
 	var wg sync.WaitGroup
 
 	check := func(name string, wantErr error, fn func() error) {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			err := fn()
 			if !errors.Is(err, wantErr) {
 				t.Errorf("%s: err = %v, want %v", name, err, wantErr)
 			}
-		}()
+		})
 	}
 
 	check("blacklist enqueue", ErrTimeoutQueueing, func() error {

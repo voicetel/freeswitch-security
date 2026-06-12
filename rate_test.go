@@ -188,15 +188,11 @@ func TestRateManager_ConcurrentCalls(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 100 {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for range 10 {
 				_ = rm.CheckCallRate("203.0.113.8", "u", "d")
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

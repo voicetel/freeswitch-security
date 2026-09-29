@@ -21,9 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned to the module's Go floor rather than `stable`: the pinned
+      # golangci-lint cannot typecheck the Go 1.27 standard library yet, and
+      # the newer releases re-scope `exhaustruct` to `exhaustruct_v5`
+      # (50 new findings) with no equivalent `include` filter. Bump Go and
+      # the linter together once that config migration is done.
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: gofmt
         run: |
@@ -38,7 +43,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.12.2
 
       - name: Tests (race detector)
         run: make test

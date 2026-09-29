@@ -13,7 +13,7 @@ linters:
             - github.com/allegro/bigcache/v3
             - github.com/fiorix/go-eventsocket/eventsocket
             - github.com/gin-gonic/gin
-    exhaustruct:
+    exhaustruct_v5:
       include:
         - github.com/voicetel/freeswitch-security\.effective.*Config$
     funlen:

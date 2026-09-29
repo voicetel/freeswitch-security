@@ -1,6 +1,10 @@
 version: "2"
 linters:
   default: all
+  disable:
+    # Replaced by exhaustruct_v5 (see settings below); the deprecated name
+    # is still pulled in by `default: all` and would re-check every type.
+    - exhaustruct
   settings:
     cyclop:
       max-complexity: 15
@@ -14,7 +18,8 @@ linters:
             - github.com/fiorix/go-eventsocket/eventsocket
             - github.com/gin-gonic/gin
     exhaustruct_v5:
-      include:
+      explicit-mode: true
+      enforce-patterns:
         - github.com/voicetel/freeswitch-security\.effective.*Config$
     funlen:
       lines: 120

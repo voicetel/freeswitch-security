@@ -93,9 +93,13 @@ machine-dependent — the architecture below is the point):
 - **Registration Hot Path**: in-place whitelist refresh + atomic statistics
   keep the worker off the lock and off the batch-ticker stall
 - **ESL CVE Guard**: signature checks on `MESSAGE`/`CHANNEL_CREATE` are
-  allocation-free (~80–100 ns per check; ~112 ns added to the channel-create
+  allocation-free (~62–145 ns per check; ~83 ns added to the channel-create
   pipeline with the guard on), and the instant ban is synchronous for the
   rare exploit event — never on the per-packet hot path
+- **Whitelist Refresh Fast Path**: re-registrations take a read-lock fast
+  path; entries are rewritten (and TTL-extended) at most once per 5 minutes
+  per IP, so the security mutex is never held in write mode on the
+  per-event path
 - **Memory Efficiency**: pooled event objects, ~3 allocs/event in steady state
 - **Firewall**: kernel ipset (O(1) membership, in-kernel ban expiry) behind a
   single iptables rule
@@ -255,7 +259,10 @@ go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
 
 The benchmark suite includes `BenchmarkEventPipeline_RealisticMix`, a
 production-shaped end-to-end pipeline benchmark (~350 ns/event at 4 workers),
-and `BenchmarkRegistrationAutoWhitelist`, a canary guarding the registration
+`BenchmarkEventPipeline_ProductionDefaults`, the same mix with the production
+security defaults enabled — auto-whitelist-on-success and the ESL CVE guard —
+which is the steady-state profiling target, and
+`BenchmarkRegistrationAutoWhitelist`, a canary guarding the registration
 hot path (~230 ns; it regresses to ~100 ms if a blocking whitelist call is
 ever reintroduced). Validate changes with `benchstat` over `-count=10` runs.
 

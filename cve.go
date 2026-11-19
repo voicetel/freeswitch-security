@@ -56,8 +56,10 @@ const (
 
 	// ESL header names. FreeSWITCH emits these lowercase; the eventsocket
 	// library canonicalizes header keys MIME-style ("from_sip_ip" arrives as
-	// "From_sip_ip"), so the canonical spelling is checked first and the
-	// lowercase original is accepted as a fallback.
+	// "From_sip_ip"), so the canonical spellings below are the only ones
+	// production events carry. The matches use single exact lookups (no
+	// fallback variants) because CHANNEL_CREATE is a hot path and MESSAGE
+	// can be attacker-flooded.
 	hdrMESSAGEToUser    = "To_user"
 	hdrMESSAGETo        = "To"
 	hdrMESSAGEFromSIPIP = "From_sip_ip"
@@ -71,19 +73,19 @@ const (
 // CVE-2026-116779 exploit marker: the To user selecting the api chat proto.
 // When matched, sourceIP is the SIP peer that sent the message.
 func cve116779MessageMatch(ev *eventsocket.Event) (string, string, bool) {
-	toUser := strings.ToLower(strings.TrimSpace(firstNonEmpty(ev, hdrMESSAGEToUser, "to_user")))
-	to := strings.ToLower(strings.TrimSpace(firstNonEmpty(ev, hdrMESSAGETo, "to")))
+	toUser := strings.ToLower(strings.TrimSpace(ev.Get(hdrMESSAGEToUser)))
+	to := strings.ToLower(strings.TrimSpace(ev.Get(hdrMESSAGETo)))
 
 	if !strings.HasPrefix(toUser, cve116779ProtoMark) && !strings.HasPrefix(to, cve116779ProtoMark) {
 		return "", "", false
 	}
 
-	ip := strings.TrimSpace(firstNonEmpty(ev, hdrMESSAGEFromSIPIP, "from_sip_ip"))
+	ip := strings.TrimSpace(ev.Get(hdrMESSAGEFromSIPIP))
 	if !validIP(ip) {
 		return "", "", false
 	}
 
-	return ip, firstNonEmpty(ev, hdrMESSAGEFromUser, "from_user"), true
+	return ip, ev.Get(hdrMESSAGEFromUser), true
 }
 
 // cve116786ChannelCreateMatch reports whether a CHANNEL_CREATE event carries
@@ -91,8 +93,8 @@ func cve116779MessageMatch(ev *eventsocket.Event) (string, string, bool) {
 // chain injects execute_on_originate=system into the sip_invite_params block;
 // both the raw block and the applied variable are checked.
 func cve116786ChannelCreateMatch(ev *eventsocket.Event) (string, string, bool) {
-	executeOnOriginate := strings.ToLower(strings.TrimSpace(firstNonEmpty(ev, hdrVarExecuteOnOriginate, "variable_execute_on_originate")))
-	inviteParams := strings.ToLower(firstNonEmpty(ev, hdrVarSIPInviteParams, "variable_sip_invite_params"))
+	executeOnOriginate := strings.ToLower(strings.TrimSpace(ev.Get(hdrVarExecuteOnOriginate)))
+	inviteParams := strings.ToLower(ev.Get(hdrVarSIPInviteParams))
 
 	injected := executeOnOriginate == "system" ||
 		strings.HasPrefix(executeOnOriginate, "system ") ||
@@ -103,12 +105,12 @@ func cve116786ChannelCreateMatch(ev *eventsocket.Event) (string, string, bool) {
 		return "", "", false
 	}
 
-	ip := strings.TrimSpace(firstNonEmpty(ev, hdrVarNetworkIP, "variable_sip_network_ip"))
+	ip := strings.TrimSpace(ev.Get(hdrVarNetworkIP))
 	if !validIP(ip) {
 		return "", "", false
 	}
 
-	return ip, firstNonEmpty(ev, hdrVarFromUser, "variable_sip_from_user"), true
+	return ip, ev.Get(hdrVarFromUser), true
 }
 
 // handleCVEMessageEvent is the MESSAGE-event arm of the CVE guard.

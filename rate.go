@@ -126,13 +126,29 @@ func (rm *RateManager) Shutdown() {
 }
 
 // CheckCallRate reports whether the IP is permitted to place another call.
+// The wall clock is read lazily (exempt paths return before any clock read);
+// the per-event path should use CheckCallRateAt with a caller-supplied
+// timestamp.
 func (rm *RateManager) CheckCallRate(ip, userID, domain string) bool {
 	return rm.checkRate(ip, userID, domain, true)
 }
 
-// CheckRegistrationRate reports whether the IP is permitted to register again.
+// CheckCallRateAt is CheckCallRate with a caller-supplied clock: the
+// per-event path passes the single time.Now() read by the handler.
+func (rm *RateManager) CheckCallRateAt(ip, userID, domain string, now time.Time) bool {
+	return rm.checkRateAt(ip, userID, domain, true, now)
+}
+
+// CheckRegistrationRate reports whether the IP is permitted to register
+// again. The wall clock is read lazily; the per-event path should use
+// CheckRegistrationRateAt with a caller-supplied timestamp.
 func (rm *RateManager) CheckRegistrationRate(ip, userID, domain string) bool {
 	return rm.checkRate(ip, userID, domain, false)
+}
+
+// CheckRegistrationRateAt is CheckRegistrationRate with a caller-supplied clock.
+func (rm *RateManager) CheckRegistrationRateAt(ip, userID, domain string, now time.Time) bool {
+	return rm.checkRateAt(ip, userID, domain, false, now)
 }
 
 // GetCallRates returns a snapshot of current per-IP call counters.
@@ -234,11 +250,10 @@ func (rm *RateManager) shardFor(ip string) *rateShard {
 	return &rm.shards[h%rateShardCount]
 }
 
-// checkRate is the shared implementation for call and registration rate checks.
-// isCall switches between the call and registration counter buckets / limits.
+// checkRate is the shared implementation for call and registration rate
+// checks with a lazy wall clock: the exempt-status checks run first, so a
+// whitelisted/trusted or blacklisted IP returns before any clock read.
 func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
-	logger := GetLogger()
-
 	if !rm.cfg.Enabled {
 		return true
 	}
@@ -254,6 +269,34 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 	if blacklisted {
 		return false
 	}
+
+	return rm.applyRateWindow(ip, userID, domain, isCall, time.Now())
+}
+
+// checkRateAt is checkRate with a caller-supplied clock: the per-event path
+// reads the clock once in the handler and reuses it for the exempt-status
+// expiry checks, the window arithmetic, and the counter stamps.
+func (rm *RateManager) checkRateAt(ip, userID, domain string, isCall bool, now time.Time) bool {
+	if !rm.cfg.Enabled {
+		return true
+	}
+
+	whitelisted, blacklisted := rm.securityManager.ipListStatusAt(ip, now)
+	if rm.cfg.WhitelistBypass && whitelisted {
+		return true
+	}
+
+	if blacklisted {
+		return false
+	}
+
+	return rm.applyRateWindow(ip, userID, domain, isCall, now)
+}
+
+// applyRateWindow updates the per-IP counter for the call/registration
+// window and reports whether the limit was exceeded.
+func (rm *RateManager) applyRateWindow(ip, userID, domain string, isCall bool, now time.Time) bool {
+	logger := GetLogger()
 
 	var (
 		window   time.Duration
@@ -271,7 +314,6 @@ func (rm *RateManager) checkRate(ip, userID, domain string, isCall bool) bool {
 		bucketID = "registration"
 	}
 
-	now := time.Now()
 	shard := rm.shardFor(ip)
 
 	shard.mu.Lock()

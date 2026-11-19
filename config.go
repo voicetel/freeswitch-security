@@ -280,16 +280,18 @@ func LoadConfig(path string) (*AppConfig, error) {
 	return config, loadErr
 }
 
-// GetConfig returns the current configuration.
+// GetConfig returns the current configuration, loading it from the default
+// file on first use. The load runs under the package sync.Once shared with
+// LoadConfig, so concurrent first-time callers serialize and later calls see
+// the fully initialized config (a bare nil-check here previously raced with
+// the Once body's write).
 func GetConfig() *AppConfig {
-	if config == nil {
-		_, err := LoadConfig("config.json")
-		if err != nil {
-			log.Fatalf("Error loading configuration: %v", err)
-		}
+	cfg, err := LoadConfig("config.json")
+	if err != nil {
+		log.Fatalf("Error loading configuration: %v", err)
 	}
 
-	return config
+	return cfg
 }
 
 // envBool reads a boolean environment variable. If the variable is set to a

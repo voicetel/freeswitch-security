@@ -141,12 +141,12 @@ func TestCVE116779MessageMatch(t *testing.T) {
 			wantOK: true, wantIP: testCVEAttackerIP,
 		},
 		{
-			name: "lowercase wire headers",
+			name: "lowercase keys are canonicalized on the wire (never seen)",
 			headers: map[string]string{
 				"to_user":     "api+version",
 				"from_sip_ip": testCVEAttackerIP,
 			},
-			wantOK: true, wantIP: testCVEAttackerIP,
+			wantOK: false,
 		},
 		{
 			name: "benign message",

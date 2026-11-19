@@ -1199,6 +1199,50 @@ func BenchmarkIPListStatus_Blacklisted(b *testing.B) {
 	}
 }
 
+// BenchmarkRefreshWhitelistEntry_Fresh measures the steady-state
+// re-registration fast path: the entry was stamped recently, so only the
+// read lock and a time comparison run.
+func BenchmarkRefreshWhitelistEntry_Fresh(b *testing.B) {
+	sm := newTestSecurityManager(b)
+
+	err := sm.AddToWhitelist("203.0.113.101", "u", "d", false)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	now := time.Now()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		sinkBool = sm.RefreshWhitelistEntryAt("203.0.113.101", now)
+	}
+}
+
+// BenchmarkRefreshWhitelistEntry_Stale measures the slow path: the entry's
+// stamp is older than whitelistRefreshInterval, so the write lock and the
+// ExpiresAt extension run. The timestamp advances past the interval on every
+// iteration, so each call sees a freshly-stale entry.
+func BenchmarkRefreshWhitelistEntry_Stale(b *testing.B) {
+	sm := newTestSecurityManager(b)
+
+	err := sm.AddToWhitelist("203.0.113.102", "u", "d", false)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	now := time.Now().Add(whitelistRefreshInterval + time.Minute)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		sinkBool = sm.RefreshWhitelistEntryAt("203.0.113.102", now)
+		now = now.Add(whitelistRefreshInterval + time.Nanosecond)
+	}
+}
+
 func TestIPListStatus(t *testing.T) {
 	t.Parallel()
 	sm := newTestSecurityManager(t)

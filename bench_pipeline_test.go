@@ -101,14 +101,34 @@ func buildPipelineEvents(n int) []*eventsocket.Event {
 // the profiler to when asking where a busy node actually spends its time.
 // ns/op is the pipeline cost per event at 4-way worker concurrency.
 //
-// Auto-whitelist stays off here: handleSuccessfulRegistration performs a
-// synchronous whitelist round-trip that flushes on a 100ms ticker, so with it
-// enabled the pipeline measures ticker latency rather than processing cost.
-// BenchmarkRegistrationAutoWhitelist reports that latency separately.
+// Auto-whitelist and the CVE guard are off here to isolate the dispatch +
+// rate-check cost; BenchmarkEventPipeline_ProductionDefaults runs the same
+// mix with the production defaults enabled and is the steady-state profile
+// target.
 func BenchmarkEventPipeline_RealisticMix(b *testing.B) {
+	benchmarkEventPipeline(b, false, false)
+}
+
+// BenchmarkEventPipeline_ProductionDefaults runs the realistic mix with the
+// production security defaults enabled: auto-whitelist-on-success (the
+// per-registration in-place refresh; its former 100ms batch-ticker stall is
+// guarded by BenchmarkRegistrationAutoWhitelist) and the ESL CVE guard
+// (clean-path signature checks on every CHANNEL_CREATE). This is the
+// steady-state profiling target for a production node.
+func BenchmarkEventPipeline_ProductionDefaults(b *testing.B) {
+	benchmarkEventPipeline(b, true, true)
+}
+
+// benchmarkEventPipeline drives one pipeline benchmark run. autoWhitelist
+// toggles the per-registration whitelist refresh; cveGuard toggles the ESL
+// CVE guard on CHANNEL_CREATE events.
+func benchmarkEventPipeline(b *testing.B, autoWhitelist, cveGuard bool) {
+	b.Helper()
+
 	silenceLogs(b)
 
 	sm := newTestSecurityManager(b)
+	sm.cfg.AutoWhitelistOnSuccess = autoWhitelist
 
 	cfg := defaultTestRateConfig()
 	cfg.CallRateLimit = 20     // production default
@@ -117,13 +137,14 @@ func BenchmarkEventPipeline_RealisticMix(b *testing.B) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	em := &ESLManager{
-		securityManager: sm,
-		rateManager:     rm,
-		queueSize:       eslEventQueueSize,
-		workerCount:     pipelineWorkers,
-		eventPool:       NewEventPool(),
-		ctx:             ctx,
-		cancel:          cancel,
+		securityManager:      sm,
+		rateManager:          rm,
+		queueSize:            eslEventQueueSize,
+		workerCount:          pipelineWorkers,
+		eventPool:            NewEventPool(),
+		cveProtectionEnabled: cveGuard,
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 
 	em.startWorkerPool()

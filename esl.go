@@ -475,7 +475,13 @@ func (w *EventWorker) handleSuccessfulRegistration(pe *ProcessedEvent) {
 		pe.Domain = GetConfig().FreeSWITCH.DefaultDomain
 	}
 
-	if !w.manager.rateManager.CheckRegistrationRate(pe.IPAddress, pe.UserID, pe.Domain) {
+	// A single clock read serves the rate window, the stats stamp, and the
+	// whitelist refresh (each otherwise reads the clock on its own; the
+	// profile showed time.runtimeNow as the top per-event cost on the
+	// registration path).
+	now := time.Now()
+
+	if !w.manager.rateManager.CheckRegistrationRateAt(pe.IPAddress, pe.UserID, pe.Domain, now) {
 		if w.logger.enabled(LogLevelInfo) {
 			w.logger.Info("Worker #%d: registration from %s blocked by rate limit", w.id, pe.IPAddress)
 		}
@@ -489,14 +495,15 @@ func (w *EventWorker) handleSuccessfulRegistration(pe *ProcessedEvent) {
 		w.logger.Info("Worker #%d: registration from %s for %s@%s", w.id, pe.IPAddress, pe.UserID, pe.Domain)
 	}
 
-	w.manager.securityManager.UpdateRegistrationStats(pe.IPAddress, pe.UserID, pe.Domain)
+	w.manager.securityManager.UpdateRegistrationStatsAt(now)
 
 	cfg := w.manager.securityManager.cfg
 	if cfg.AutoWhitelistOnSuccess {
-		// Re-registrations refresh the existing entry in place; new IPs
-		// enqueue without waiting. The previous synchronous round-trip
-		// stalled the worker for the full 100ms batch tick per registration.
-		if !w.manager.securityManager.RefreshWhitelistEntry(pe.IPAddress) {
+		// Re-registrations refresh the existing entry in place (read-lock
+		// fast path when fresh); new IPs enqueue without waiting. The
+		// previous synchronous round-trip stalled the worker for the full
+		// 100ms batch tick per registration.
+		if !w.manager.securityManager.RefreshWhitelistEntryAt(pe.IPAddress, now) {
 			w.manager.securityManager.AddToWhitelistAsync(pe.IPAddress, pe.UserID, pe.Domain, false)
 		}
 	}
@@ -577,9 +584,13 @@ func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 	}
 
 	// Filter calls from untrusted domains first. Trusted networks and
-	// whitelisted IPs are allowed (checked inside CheckUntrustedCall); a match
-	// blacklists the source IP and the call is torn down.
-	if w.manager.securityManager.CheckUntrustedCall(pe.IPAddress, pe.UserID, pe.Domain) {
+	// whitelisted IPs are allowed (checked inside CheckUntrustedCallAt); a
+	// match blacklists the source IP and the call is torn down. A single
+	// clock read serves the whitelist-expiry check here and the rate window
+	// below.
+	now := time.Now()
+
+	if w.manager.securityManager.CheckUntrustedCallAt(pe.IPAddress, pe.UserID, pe.Domain, now) {
 		if w.logger.enabled(LogLevelInfo) {
 			w.logger.Info("Worker #%d: call from %s blocked — untrusted domain %q", w.id, pe.IPAddress, pe.Domain)
 		}
@@ -589,7 +600,7 @@ func (w *EventWorker) handleChannelCreate(pe *ProcessedEvent) {
 		return
 	}
 
-	if w.manager.rateManager.CheckCallRate(pe.IPAddress, pe.UserID, pe.Domain) {
+	if w.manager.rateManager.CheckCallRateAt(pe.IPAddress, pe.UserID, pe.Domain, now) {
 		if w.logger.enabled(LogLevelDebug) {
 			w.logger.Debug("Worker #%d: call from %s allowed", w.id, pe.IPAddress)
 		}

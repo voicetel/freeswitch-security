@@ -30,6 +30,14 @@ const (
 	// configured value cannot be parsed.
 	defaultWhitelistTTL = 24 * time.Hour
 
+	// whitelistRefreshInterval bounds how often a re-registration rewrites
+	// its whitelist entry. Refreshes within the interval take the read-lock
+	// fast path and leave the entry untouched; the write lock (and the
+	// ExpiresAt extension) is taken at most once per interval per IP. This
+	// bounds the LastSeen granularity of the whitelist API view to the same
+	// interval.
+	whitelistRefreshInterval = 5 * time.Minute
+
 	// defaultCVEBlockDuration is the ban length applied to endpoints caught
 	// by the ESL CVE guard (security.cve.block_duration).
 	defaultCVEBlockDuration = 24 * time.Hour
@@ -461,16 +469,54 @@ func (sm *SecurityManager) AddToWhitelistAsync(ip, userID, domain string, perman
 
 // RefreshWhitelistEntry extends the TTL of an existing whitelist entry and
 // stamps LastSeen, in place and without the queue round-trip. It reports
-// whether the entry existed; re-registrations take this fast path.
+// whether the entry existed; re-registrations take this fast path. This
+// convenience form reads the wall clock; the per-event path should use
+// RefreshWhitelistEntryAt with a caller-supplied timestamp.
 func (sm *SecurityManager) RefreshWhitelistEntry(ip string) bool {
-	now := time.Now()
+	return sm.RefreshWhitelistEntryAt(ip, time.Now())
+}
 
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
+// RefreshWhitelistEntryAt extends the TTL of an existing whitelist entry and
+// stamps LastSeen using the caller-supplied timestamp, and reports whether
+// the entry existed.
+//
+// Steady-state re-registrations take a read-lock fast path: when the entry
+// was stamped within whitelistRefreshInterval, nothing is written, so the
+// security mutex is never held exclusively on the per-event path. The write
+// lock is taken at most once per whitelistRefreshInterval per IP to refresh
+// LastSeen and extend ExpiresAt (permanent entries refresh LastSeen only);
+// the write is re-validated under the lock in case another worker refreshed
+// it in the meantime.
+func (sm *SecurityManager) RefreshWhitelistEntryAt(ip string, now time.Time) bool {
+	sm.mu.RLock()
 
 	entry, ok := sm.whitelist[ip]
 	if !ok {
+		sm.mu.RUnlock()
+
 		return false
+	}
+
+	fresh := now.Sub(entry.LastSeen) < whitelistRefreshInterval
+
+	sm.mu.RUnlock()
+
+	if fresh {
+		return true
+	}
+
+	// Slow path: the entry needs its stamp refreshed. Re-check under the
+	// write lock so a concurrent refresh is not duplicated.
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	entry, ok = sm.whitelist[ip]
+	if !ok {
+		return false
+	}
+
+	if now.Sub(entry.LastSeen) < whitelistRefreshInterval {
+		return true
 	}
 
 	entry.LastSeen = now
@@ -556,6 +602,11 @@ func (sm *SecurityManager) RemoveFromBlacklist(ip string) {
 // parsing the address, which dominates the function under profiling. The parse
 // happens only when the explicit whitelist misses AND there is at least one
 // trusted network configured.
+//
+// The wall clock is read lazily, only when an expiry check needs it: hoisting
+// the read cost the map-miss path a measurable ~25ns in profiling. The
+// per-event path should use isIPWhitelistedAt with a caller-supplied
+// timestamp instead.
 func (sm *SecurityManager) IsIPWhitelisted(ipStr string) bool {
 	sm.mu.RLock()
 	entry, mapHit := sm.whitelist[ipStr]
@@ -618,8 +669,15 @@ func (sm *SecurityManager) IsUntrustedDomain(domain string) bool {
 // returns true so the caller can tear the call down. fromUser is the SIP
 // From-user, forwarded for chanDaemon account attribution.
 func (sm *SecurityManager) CheckUntrustedCall(ip, fromUser, domain string) bool {
+	return sm.CheckUntrustedCallAt(ip, fromUser, domain, time.Now())
+}
+
+// CheckUntrustedCallAt is CheckUntrustedCall with a caller-supplied clock:
+// the per-event path passes the single time.Now() read by the handler so the
+// whitelist expiry check does not read the clock a second time.
+func (sm *SecurityManager) CheckUntrustedCallAt(ip, fromUser, domain string, now time.Time) bool {
 	// Trusted networks and whitelisted IPs win — never filtered.
-	if sm.IsIPWhitelisted(ip) {
+	if sm.isIPWhitelistedAt(ip, now) {
 		return false
 	}
 
@@ -802,9 +860,18 @@ func (sm *SecurityManager) GetWrongCallStates() map[string]WrongCallStateEntry {
 // UpdateRegistrationStats updates statistics for a successful registration.
 // The IP/userID/domain arguments are accepted for API stability but not stored.
 // Lock-free: this runs once per successful registration on the worker hot path.
+// This convenience form reads the wall clock; the per-event path should use
+// UpdateRegistrationStatsAt with a caller-supplied timestamp so a single
+// clock read serves the whole registration handler.
 func (sm *SecurityManager) UpdateRegistrationStats(_, _, _ string) {
+	sm.UpdateRegistrationStatsAt(time.Now())
+}
+
+// UpdateRegistrationStatsAt records a successful registration using the
+// caller-supplied wall-clock timestamp, avoiding a per-event clock read.
+func (sm *SecurityManager) UpdateRegistrationStatsAt(now time.Time) {
 	sm.totalRegistrations.Add(1)
-	sm.lastRegistrationUnix.Store(time.Now().UnixNano())
+	sm.lastRegistrationUnix.Store(now.UnixNano())
 }
 
 // AddToWhitelistBatch adds multiple IPs concurrently with a worker cap.
@@ -969,7 +1036,35 @@ func (sm *SecurityManager) BlockIPImmediate(ip, reason, fromUser string) bool {
 	return true
 }
 
+// isIPWhitelistedAt is IsIPWhitelisted with a caller-supplied clock: the
+// per-event path passes the single time.Now() read by the handler so the
+// expiry check does not read the clock a second time.
+func (sm *SecurityManager) isIPWhitelistedAt(ipStr string, now time.Time) bool {
+	sm.mu.RLock()
+	entry, mapHit := sm.whitelist[ipStr]
+	trustedEmpty := len(sm.trustedNetworks) == 0
+	sm.mu.RUnlock()
+
+	if mapHit {
+		if entry.Permanent || !entry.ExpiresAt.Before(now) {
+			return true
+		}
+	}
+
+	if trustedEmpty {
+		return false
+	}
+
+	addr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return false
+	}
+
+	return sm.ipInTrustedNetwork(addr)
+}
+
 // initChanDaemonReporter builds the chanDaemon (D39) reporter when reporting is
+
 // enabled. Reporting is tied to actually enforcing bans: it is skipped unless
 // auto-block is on (otherwise we would report bans we did not enact) and is
 // suppressed in dry-run (which must produce no external side effects). A failure
@@ -1433,11 +1528,10 @@ func (sm *SecurityManager) enqueueBlacklist(reqs []BlacklistRequest) {
 //
 // The fast paths are equivalent to the public IsIPWhitelisted; the slow path
 // avoids the second RLock that calling IsIPWhitelisted then IsIPBlacklisted
-// would incur.
+// would incur. The wall clock is read lazily inside the hit branches only
+// (hoisting it cost the miss path ~25ns in profiling); the per-event path
+// should use ipListStatusAt with a caller-supplied timestamp instead.
 func (sm *SecurityManager) ipListStatus(ipStr string) (bool, bool) {
-	// time.Now() stays lazy inside the hit branches: hoisting it would add a
-	// clock read to the map-miss path, which never needs one (measured +57%
-	// on the miss benchmark when hoisted).
 	sm.mu.RLock()
 
 	wlEntry, wlHit := sm.whitelist[ipStr]
@@ -1452,6 +1546,38 @@ func (sm *SecurityManager) ipListStatus(ipStr string) (bool, bool) {
 	sm.mu.RUnlock()
 
 	if blHit && (blEntry.Permanent || !blEntry.ExpiresAt.Before(time.Now())) {
+		return false, true
+	}
+
+	if trustedEmpty {
+		return false, false
+	}
+
+	addr, err := netip.ParseAddr(ipStr)
+	if err == nil && sm.ipInTrustedNetwork(addr) {
+		return true, false
+	}
+
+	return false, false
+}
+
+// ipListStatusAt is ipListStatus with a caller-supplied clock for the
+// entry-expiry checks.
+func (sm *SecurityManager) ipListStatusAt(ipStr string, now time.Time) (bool, bool) {
+	sm.mu.RLock()
+
+	wlEntry, wlHit := sm.whitelist[ipStr]
+	if wlHit && (wlEntry.Permanent || !wlEntry.ExpiresAt.Before(now)) {
+		sm.mu.RUnlock()
+
+		return true, false
+	}
+
+	blEntry, blHit := sm.blacklist[ipStr]
+	trustedEmpty := len(sm.trustedNetworks) == 0
+	sm.mu.RUnlock()
+
+	if blHit && (blEntry.Permanent || !blEntry.ExpiresAt.Before(now)) {
 		return false, true
 	}
 

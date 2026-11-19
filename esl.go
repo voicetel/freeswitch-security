@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,14 +29,27 @@ const (
 
 	// FreeSWITCH event names and CUSTOM subclasses dispatched by the worker
 	// pool and subscribed to on connect.
-	eventNameCustom        = "CUSTOM"
-	eventNameChannelCreate = "CHANNEL_CREATE"
-	eventSubRegister       = "sofia::register"
-	eventSubRegisterFail   = "sofia::register_failure"
-	eventSubWrongCallState = "sofia::wrong_call_state"
+	eventNameCustom          = "CUSTOM"
+	eventNameChannelCreate   = "CHANNEL_CREATE"
+	eventNameModuleLoad      = "MODULE_LOAD"
+	eventSubRegister         = "sofia::register"
+	eventSubRegisterFail     = "sofia::register_failure"
+	eventSubWrongCallState   = "sofia::wrong_call_state"
+	modSMSModuleName         = "mod_sms"
+	modSMSExistsCommand      = "api module_exists mod_sms"
+	modSMSUnloadCommand      = "api unload mod_sms"
+	moduleLoadKeyHeader      = "Key"
+	moduleLoadFilenameHeader = "Filename"
+	modSMSExistsTrue         = "true"
+	modSMSExistsFalse        = "false"
 
 	// logLevelInfoStr is the string spelling of the "info" log level.
 	logLevelInfoStr = "info"
+
+	// Channel-variable header names shared by the channel-create extractor
+	// and the CVE guard.
+	hdrVarNetworkIP = "Variable_sip_network_ip"
+	hdrVarFromUser  = "Variable_sip_from_user"
 )
 
 // ESLManager handles FreeSWITCH Event Socket Layer connections.
@@ -46,6 +60,7 @@ type ESLManager struct {
 	clientMu  sync.RWMutex
 	eslClient *eventsocket.Connection
 	connected atomic.Bool
+	commandMu sync.Mutex
 
 	eslDisconnected chan bool
 	rateManager     *RateManager
@@ -77,6 +92,21 @@ type ESLManager struct {
 	readersWg sync.WaitGroup
 	workersWg sync.WaitGroup
 	shutdown  atomic.Bool
+
+	modSMSProtectionEnabled bool
+	modSMSProtectionActive  atomic.Bool
+
+	// cveProtectionEnabled gates the ESL CVE guard (CVE-2026-116779,
+	// CVE-2026-116786): matching events instantly ban the sending endpoint.
+	cveProtectionEnabled bool
+
+	// FreeSWITCH version fingerprint from the `version` API, refreshed on
+	// every (re)connect and reported through GetESLStats. The vulnerable-CVE
+	// slice is replaced wholesale, never mutated in place, so readers need
+	// only the read lock.
+	fsVersionMu      sync.RWMutex
+	fsVersion        string
+	fsVulnerableCVEs []string
 }
 
 // ESLConfig holds ESL-related configuration.
@@ -231,15 +261,17 @@ func InitESLManager(sm *SecurityManager) *ESLManager {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		eslManager = &ESLManager{
-			securityManager: sm,
-			eslConfig:       ec,
-			eslDisconnected: make(chan bool, 1),
-			rateManager:     NewRateManager(sm),
-			queueSize:       eslEventQueueSize,
-			workerCount:     workerCount,
-			eventPool:       NewEventPool(),
-			ctx:             ctx,
-			cancel:          cancel,
+			securityManager:         sm,
+			eslConfig:               ec,
+			eslDisconnected:         make(chan bool, 1),
+			rateManager:             NewRateManager(sm),
+			queueSize:               eslEventQueueSize,
+			workerCount:             workerCount,
+			eventPool:               NewEventPool(),
+			modSMSProtectionEnabled: cfg.Security.ModSMS.ProtectionEnabled,
+			cveProtectionEnabled:    cfg.Security.CVE.ProtectionEnabled,
+			ctx:                     ctx,
+			cancel:                  cancel,
 		}
 
 		logger.Info("Initializing ESL manager: workers=%d, queue=%d", workerCount, eslEventQueueSize)
@@ -315,7 +347,16 @@ func (w *EventWorker) processEventWithPool(ev *eventsocket.Event) {
 		}
 	case eventNameChannelCreate:
 		w.extractChannelCreateData(ev, pe)
+
+		if w.cveChannelCreateGuard(ev, pe) {
+			break
+		}
+
 		w.handleChannelCreate(pe)
+	case eventNameMessage:
+		w.handleCVEMessageEvent(ev)
+	case eventNameModuleLoad:
+		w.handleModuleLoad(ev)
 	default:
 		w.logger.Debug("Worker #%d: unhandled event type: %s", w.id, pe.EventName)
 	}
@@ -323,6 +364,42 @@ func (w *EventWorker) processEventWithPool(ev *eventsocket.Event) {
 	if debugTiming {
 		w.logger.Debug("Worker #%d processed %s in %v", w.id, pe.EventName, time.Since(startTime))
 	}
+}
+
+// handleModuleLoad re-applies the mod_sms guard when the module is loaded
+// after startup. The module name is matched from module metadata only; other
+// module loads do not trigger any action.
+func (w *EventWorker) handleModuleLoad(ev *eventsocket.Event) {
+	if w.manager.modSMSProtectionEnabled && isModSMSModuleEvent(ev) {
+		w.manager.enforceModSMSProtection()
+	}
+}
+
+// isModSMSModuleEvent reports whether a MODULE_LOAD event belongs to mod_sms.
+// FreeSWITCH supplies the module key and filename on these events; accepting
+// either accommodates installations that expose only one of them.
+func isModSMSModuleEvent(ev *eventsocket.Event) bool {
+	for _, header := range []string{
+		moduleLoadKeyHeader,
+		moduleLoadFilenameHeader,
+		strings.ToLower(moduleLoadKeyHeader),
+		strings.ToLower(moduleLoadFilenameHeader),
+	} {
+		name := strings.ToLower(strings.TrimSpace(ev.Get(header)))
+		if idx := strings.LastIndexAny(name, `/\\`); idx >= 0 {
+			name = name[idx+1:]
+		}
+
+		name = strings.TrimSuffix(name, ".so")
+		name = strings.TrimSuffix(name, ".dll")
+		name = strings.TrimSuffix(name, ".dylib")
+
+		if name == modSMSModuleName {
+			return true
+		}
+	}
+
+	return false
 }
 
 // firstNonEmpty returns the first non-empty header value from ev.
@@ -355,8 +432,8 @@ func (w *EventWorker) extractWrongCallStateData(ev *eventsocket.Event, pe *Proce
 }
 
 func (w *EventWorker) extractChannelCreateData(ev *eventsocket.Event, pe *ProcessedEvent) {
-	pe.IPAddress = ev.Get("Variable_sip_network_ip")
-	pe.UserID = ev.Get("Variable_sip_from_user")
+	pe.IPAddress = ev.Get(hdrVarNetworkIP)
+	pe.UserID = ev.Get(hdrVarFromUser)
 	pe.Domain = ev.Get("Variable_sip_from_host")
 	// The eventsocket library capitalizes wire headers ("Unique-ID" arrives
 	// as "Unique-Id"), and Event.Get is an exact-key lookup. Check both
@@ -543,7 +620,7 @@ func (w *EventWorker) terminateCall(pe *ProcessedEvent, reason string) {
 		return
 	}
 
-	_, err := client.Send("uuid_kill " + pe.CallUUID)
+	_, err := w.manager.send(client, "uuid_kill "+pe.CallUUID)
 	if err != nil {
 		w.logger.Error("Worker #%d: error hanging up %s call %s: %v", w.id, reason, pe.CallUUID, err)
 	} else {
@@ -600,19 +677,29 @@ func (em *ESLManager) Port() string { return em.eslConfig.Port }
 
 // GetESLStats returns current ESL statistics.
 func (em *ESLManager) GetESLStats() map[string]any {
+	em.fsVersionMu.RLock()
+	fsVersion := em.fsVersion
+	fsVulnerable := slices.Clone(em.fsVulnerableCVEs)
+	em.fsVersionMu.RUnlock()
+
 	return map[string]any{
-		"connected":          em.connected.Load(),
-		"host":               em.eslConfig.Host,
-		"port":               em.eslConfig.Port,
-		"connectionAttempts": em.statistics.ConnectionAttempts.Load(),
-		"connectionErrors":   em.statistics.ConnectionErrors.Load(),
-		"eventsProcessed":    em.statistics.EventsProcessed.Load(),
-		"eventsQueued":       em.statistics.EventsQueued.Load(),
-		"eventsDropped":      em.statistics.EventsDropped.Load(),
-		"logLevel":           em.eslConfig.LogLevel,
-		"workerCount":        em.workerCount,
-		"queueLength":        em.queueLen(),
-		"queueCapacity":      em.queueCap(),
+		"connected":               em.connected.Load(),
+		"host":                    em.eslConfig.Host,
+		"port":                    em.eslConfig.Port,
+		"connectionAttempts":      em.statistics.ConnectionAttempts.Load(),
+		"connectionErrors":        em.statistics.ConnectionErrors.Load(),
+		"eventsProcessed":         em.statistics.EventsProcessed.Load(),
+		"eventsQueued":            em.statistics.EventsQueued.Load(),
+		"eventsDropped":           em.statistics.EventsDropped.Load(),
+		"logLevel":                em.eslConfig.LogLevel,
+		"workerCount":             em.workerCount,
+		"queueLength":             em.queueLen(),
+		"queueCapacity":           em.queueCap(),
+		"modSMSProtectionEnabled": em.modSMSProtectionEnabled,
+		"modSMSProtectionActive":  em.modSMSProtectionActive.Load(),
+		"cveProtectionEnabled":    em.cveProtectionEnabled,
+		"freeswitchVersion":       fsVersion,
+		"freeswitchVulnerableTo":  fsVulnerable,
 	}
 }
 
@@ -659,21 +746,123 @@ func (em *ESLManager) SendCommand(command string) (string, error) {
 
 	logger.Debug("Sending command to ESL: %s", command)
 
-	ev, err := client.Send("api " + command)
+	ev, err := em.send(client, "api "+command)
 	if err != nil {
 		logger.Error("Error sending command to ESL: %v", err)
 
-		return "", fmt.Errorf("eventsocket send: %w", err)
+		return "", err
 	}
 
-	response := ev.Get("Reply-Text")
-	if response == "" {
-		response = ev.Body
-	}
+	response := eventReplyText(ev)
 
 	logger.Debug("Received response from ESL: %s", response)
 
 	return response, nil
+}
+
+// send serializes commands sent over an ESL connection. The eventsocket
+// client has one response channel per command type and does not support
+// concurrent Send calls safely.
+func (em *ESLManager) send(client *eventsocket.Connection, command string) (*eventsocket.Event, error) {
+	em.commandMu.Lock()
+	defer em.commandMu.Unlock()
+
+	ev, err := client.Send(command)
+	if err != nil {
+		return nil, fmt.Errorf("eventsocket send: %w", err)
+	}
+
+	return ev, nil
+}
+
+// eventReplyText returns the text used by both command/reply and api/response
+// replies.
+func eventReplyText(ev *eventsocket.Event) string {
+	if ev == nil {
+		return ""
+	}
+
+	if response := ev.Get("Reply-Text"); response != "" {
+		return response
+	}
+
+	return ev.Body
+}
+
+// enforceModSMSProtection removes the vulnerable mod_sms module. It uses the
+// module_exists API first so an installation that never loaded mod_sms is
+// considered protected without generating a misleading unload failure. A
+// force unload is deliberately never used because it can interrupt active
+// module users and destabilize FreeSWITCH.
+func (em *ESLManager) enforceModSMSProtection() {
+	if !em.modSMSProtectionEnabled {
+		return
+	}
+
+	em.clientMu.RLock()
+	client := em.eslClient
+	em.clientMu.RUnlock()
+
+	if !em.connected.Load() || client == nil {
+		return
+	}
+
+	logger := GetLogger()
+
+	existsEvent, err := em.send(client, modSMSExistsCommand)
+	if err != nil {
+		em.modSMSProtectionActive.Store(false)
+		logger.Error("mod_sms protection check failed: %v", err)
+
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(eventReplyText(existsEvent))) {
+	case modSMSExistsFalse:
+		em.modSMSProtectionActive.Store(true)
+		logger.Info("mod_sms protection active: module is not loaded")
+
+		return
+	case modSMSExistsTrue:
+		// Continue below and remove the module.
+	default:
+		em.modSMSProtectionActive.Store(false)
+		logger.Error("mod_sms protection check returned unexpected response %q", eventReplyText(existsEvent))
+
+		return
+	}
+
+	unloadEvent, err := em.send(client, modSMSUnloadCommand)
+	if err != nil {
+		em.modSMSProtectionActive.Store(false)
+		logger.Error("mod_sms protection failed: could not unload module: %v", err)
+
+		return
+	}
+
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(eventReplyText(unloadEvent))), "+ok") {
+		em.modSMSProtectionActive.Store(false)
+		logger.Error("mod_sms protection failed: unload returned %q", eventReplyText(unloadEvent))
+
+		return
+	}
+
+	remainingEvent, err := em.send(client, modSMSExistsCommand)
+
+	if err != nil || !strings.EqualFold(strings.TrimSpace(eventReplyText(remainingEvent)), modSMSExistsFalse) {
+		em.modSMSProtectionActive.Store(false)
+
+		if err != nil {
+			logger.Error("mod_sms protection verification failed: %v", err)
+		} else {
+			logger.Error("mod_sms protection failed: module remains loaded")
+		}
+
+		return
+	}
+
+	em.modSMSProtectionActive.Store(true)
+	logger.Info("mod_sms protection active: module unloaded")
 }
 
 // startWorkerPool starts the event-processing workers.
@@ -848,9 +1037,12 @@ func (em *ESLManager) startESLConnection() {
 		em.eslClient = client
 		em.clientMu.Unlock()
 		em.connected.Store(true)
+		em.modSMSProtectionActive.Store(false)
 		em.statistics.ConnectionAttempts.Store(0) // reset on success
 
 		em.subscribeToEvents(client)
+		em.enforceModSMSProtection()
+		em.checkFreeSWITCHVersion(client)
 
 		em.readersWg.Add(1)
 		go em.readEvents(client)
@@ -892,9 +1084,11 @@ func (em *ESLManager) subscribeToEvents(client *eventsocket.Connection) {
 		"event plain " + eventNameCustom + " " + eventSubRegisterFail,
 		"event plain " + eventNameCustom + " " + eventSubWrongCallState,
 		"event plain " + eventNameChannelCreate,
+		"event plain " + eventNameMessage,
+		"event plain " + eventNameModuleLoad,
 	}
 	for _, cmd := range events {
-		_, err := client.Send(cmd)
+		_, err := em.send(client, cmd)
 		if err != nil {
 			logger.Error("Error subscribing to %q: %v", cmd, err)
 		} else {

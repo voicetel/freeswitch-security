@@ -228,6 +228,7 @@ func newReportingSM(tb testing.TB, endpoint, blockerURL string, maxFailed int) *
 			WhitelistTTL:           24 * time.Hour,
 			MaxWrongCallStates:     maxFailed,
 			WrongStateWindow:       10 * time.Minute,
+			CVEBlockDuration:       time.Hour,
 		},
 		blacklistQueue:  make(chan BlacklistRequest, blacklistQueueSize),
 		whitelistQueue:  make(chan WhitelistRequest, whitelistQueueSize),
@@ -396,6 +397,7 @@ func TestBatchBlockIPs_BlockErrorSkipsReport(t *testing.T) {
 			WhitelistTTL:           0,
 			MaxWrongCallStates:     0,
 			WrongStateWindow:       0,
+			CVEBlockDuration:       time.Hour,
 		},
 	}
 
@@ -427,6 +429,7 @@ func TestBatchBlockIPs_EmptyIsNoOp(t *testing.T) {
 			WhitelistTTL:           0,
 			MaxWrongCallStates:     0,
 			WrongStateWindow:       0,
+			CVEBlockDuration:       time.Hour,
 		},
 	}
 

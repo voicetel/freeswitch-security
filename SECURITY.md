@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 1.5.x   | ✅        |
-| < 1.5   | ❌        |
+| 1.6.x   | ✅        |
+| < 1.6   | ❌        |
 
 ## Reporting a Vulnerability
 
@@ -32,4 +32,7 @@ FreeSWITCH Event Socket. Deployment hardening expectations:
 - Bind the HTTP API to a trusted interface (default `127.0.0.1`)
 - Keep the pprof diagnostics listener disabled or loopback-only (the default)
 - Restrict the ESL allowed-command list to read-only commands
+- Keep the ESL CVE guard enabled (`security.cve.protection_enabled`) so
+  CVE-2026-116779 / CVE-2026-116786 exploit attempts ban their endpoints —
+  it is a compensating control, not a substitute for upgrading FreeSWITCH
 - Run with the least privilege required to manage the configured iptables chain

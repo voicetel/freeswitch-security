@@ -30,6 +30,10 @@ const (
 	// configured value cannot be parsed.
 	defaultWhitelistTTL = 24 * time.Hour
 
+	// defaultCVEBlockDuration is the ban length applied to endpoints caught
+	// by the ESL CVE guard (security.cve.block_duration).
+	defaultCVEBlockDuration = 24 * time.Hour
+
 	// trackingBatchSize is the per-flush batch size for failed-attempt and
 	// wrong-state queue draining.
 	trackingBatchSize = 64
@@ -74,6 +78,10 @@ type SecurityManager struct {
 	totalRegistrations   atomic.Int64
 	lastRegistrationUnix atomic.Int64
 
+	// cveBlocks counts endpoints banned by the ESL CVE guard
+	// (BlockIPImmediate).
+	cveBlocks atomic.Uint64
+
 	statsMu sync.RWMutex
 	stats   SecurityStats
 
@@ -101,6 +109,10 @@ type effectiveSecurityConfig struct {
 	WhitelistTTL       time.Duration
 	MaxWrongCallStates int
 	WrongStateWindow   time.Duration
+
+	// CVEBlockDuration is the ban length for endpoints caught by the ESL CVE
+	// guard (security.cve.block_duration).
+	CVEBlockDuration time.Duration
 }
 
 // WhitelistEntry represents a whitelisted IP address.
@@ -155,6 +167,8 @@ type SecurityStats struct {
 	// chanDaemon (D39) reporting counters; both 0 when reporting is disabled.
 	ReportsSent   uint64 `json:"reportsSent"`
 	ReportsFailed uint64 `json:"reportsFailed"`
+	// CVEBlocks counts endpoints banned by the ESL CVE-exploit guard.
+	CVEBlocks uint64 `json:"cveBlocks"`
 }
 
 // BlacklistRequest is a queued request to blacklist an IP. FromUser is the
@@ -260,6 +274,7 @@ func InitSecurityManager() {
 			BlockDuration:          parseDurationOr(cfg.Security.BlockDuration, time.Hour),
 			WhitelistTTL:           parseDurationOr(cfg.Security.WhitelistTTL, defaultWhitelistTTL),
 			WrongStateWindow:       parseDurationOr(cfg.Security.WrongCallStateWindow, 10*time.Minute),
+			CVEBlockDuration:       parseDurationOr(cfg.Security.CVE.BlockDuration, defaultCVEBlockDuration),
 		}
 
 		logger.SetLogLevelFromString(cfg.Security.ESLLogLevel)
@@ -305,6 +320,8 @@ func InitSecurityManager() {
 			eff.WhitelistEnabled, eff.WhitelistTTL, eff.AutoWhitelistOnSuccess)
 		logger.Info("Blacklist - auto-block: %t, max-attempts: %d, window: %s, duration: %s",
 			eff.AutoBlockEnabled, eff.MaxFailedAttempts, eff.FailedWindow, eff.BlockDuration)
+		logger.Info("CVE guard - enabled: %t, block duration: %s",
+			cfg.Security.CVE.ProtectionEnabled, eff.CVEBlockDuration)
 
 		if len(untrusted) > 0 {
 			logger.Info("Untrusted patterns loaded: %d", len(untrusted))
@@ -683,6 +700,8 @@ func (sm *SecurityManager) GetSecurityStats() SecurityStats {
 		stats.ReportsSent, stats.ReportsFailed = sm.reporter.Stats()
 	}
 
+	stats.CVEBlocks = sm.cveBlocks.Load()
+
 	return stats
 }
 
@@ -879,6 +898,75 @@ func (sm *SecurityManager) GetIPTablesInfo() (map[string]any, error) {
 // by routes. Returns (enabled, autoBlockEnabled).
 func (sm *SecurityManager) SecurityConfigView() (bool, bool) {
 	return sm.cfg.Enabled, sm.cfg.AutoBlockEnabled
+}
+
+// BlockIPImmediate blacklists ip synchronously, bypassing the batched
+// blacklist queue so the kernel ipset ban lands before the next packet of an
+// in-progress attack. It is reserved for the ESL CVE guard: exploit-signature
+// events are rare, so the direct ipset call is safe here where it would not
+// be on a per-packet hot path. Whitelisted and trusted-network IPs are never
+// banned, mirroring processBatchBlacklist; an already-active ban is a no-op.
+// It reports whether the ban was newly applied.
+func (sm *SecurityManager) BlockIPImmediate(ip, reason, fromUser string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+
+	now := time.Now()
+
+	sm.mu.Lock()
+	if _, whitelisted := sm.whitelist[ip]; whitelisted {
+		sm.mu.Unlock()
+
+		return false
+	}
+
+	if sm.ipInTrustedNetwork(addr) {
+		sm.mu.Unlock()
+
+		return false
+	}
+
+	if entry, ok := sm.blacklist[ip]; ok && (entry.Permanent || entry.ExpiresAt.After(now)) {
+		sm.mu.Unlock()
+
+		return false
+	}
+
+	entry := BlacklistEntry{
+		IP:        ip,
+		AddedAt:   now,
+		ExpiresAt: now.Add(sm.cfg.CVEBlockDuration),
+		Reason:    reason,
+		Permanent: false,
+	}
+	sm.blacklist[ip] = entry
+	delete(sm.failedAttempts, ip)
+	blacklistCount := len(sm.blacklist)
+	sm.mu.Unlock()
+
+	sm.statsMu.Lock()
+	sm.stats.ActiveBlacklistEntries = blacklistCount
+	sm.stats.BlockedAttempts++
+	sm.statsMu.Unlock()
+
+	sm.cveBlocks.Add(1)
+
+	GetLogger().Info("CVE guard: added IP %s to blacklist: %s", ip, reason)
+
+	if sm.cfg.AutoBlockEnabled && sm.ipset != nil {
+		ttl := sm.cfg.CVEBlockDuration
+
+		err := sm.ipset.BlockIP(ip, reason, ttl)
+		if err != nil {
+			GetLogger().Error("Failed to block IP %s: %v", ip, err)
+		} else if sm.reporter != nil {
+			sm.reporter.Report(ip, fromUser, reason, ttl)
+		}
+	}
+
+	return true
 }
 
 // initChanDaemonReporter builds the chanDaemon (D39) reporter when reporting is

@@ -65,8 +65,6 @@ const (
 	hdrToHost        = "To-Host"
 	hdrWrongStateIP  = "Network_Ip"
 	hdrWrongStateUsr = "From_User"
-	hdrVarNetworkIP  = "Variable_sip_network_ip"
-	hdrVarFromUser   = "Variable_sip_from_user"
 	hdrVarFromHost   = "Variable_sip_from_host"
 	hdrUniqueID      = "Unique-ID"
 )
@@ -95,6 +93,50 @@ func newTestWorker(tb testing.TB) *EventWorker {
 	}
 
 	return &EventWorker{id: 1, manager: em, logger: GetLogger()}
+}
+
+func TestIsModSMSModuleEvent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{name: "key", headers: map[string]string{moduleLoadKeyHeader: modSMSModuleName}, want: true},
+		{name: "filename", headers: map[string]string{moduleLoadFilenameHeader: "/usr/lib/freeswitch/mod_sms.so"}, want: true},
+		{name: "unrelated", headers: map[string]string{moduleLoadFilenameHeader: "mod_sofia.so"}, want: false},
+		{name: "missing", headers: map[string]string{}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := isModSMSModuleEvent(makeEvent(tt.headers)); got != tt.want {
+				t.Errorf("isModSMSModuleEvent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEventReplyText_Nil(t *testing.T) {
+	t.Parallel()
+
+	if got := eventReplyText(nil); got != "" {
+		t.Errorf("eventReplyText(nil) = %q, want empty", got)
+	}
+}
+
+func TestESLManager_ModSMSProtection_NotConnected(t *testing.T) {
+	t.Parallel()
+
+	em := &ESLManager{modSMSProtectionEnabled: true}
+	em.enforceModSMSProtection()
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active without an ESL connection")
+	}
 }
 
 func TestExtractRegistrationData(t *testing.T) {

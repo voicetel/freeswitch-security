@@ -7,6 +7,7 @@ import "time"
 // a package-level variable forces the compiler to keep the work.
 var (
 	sinkBool     bool
+	sinkInt      int
 	sinkString   string
 	sinkStrings  []string
 	sinkDuration time.Duration

@@ -15,6 +15,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 - **Failed Registration Tracking**: Multi-layered detection of authentication attacks
 - **Wrong Call State Detection**: Identify toll fraud and system abuse attempts
 - **Untrusted Network Filtering**: Pattern-based blocking of known malicious domains
+- **ESL CVE Guard**: FreeSWITCH CVE exploit signatures seen on ESL events (CVE-2026-116779's SIP MESSAGE `api+` chat-proto RCE, CVE-2026-116786's REFER variable injection, and the related November 2026 batch) instantly ban the sending endpoint — kernel ipset + fleet-wide chanDaemon report — and a connect-time version fingerprint flags vulnerable FreeSWITCH releases
 - **Bounded Work Queues**: Generously sized fixed buffers with non-blocking enqueue and drop accounting
 
 ### High-Performance Architecture
@@ -57,6 +58,7 @@ A high-performance security application for FreeSWITCH that provides comprehensi
 ├── reporter.go          # chanDaemon ban-reporting client (D39)
 ├── allowlist.go         # Source-IP allow-list middleware for state-changing endpoints
 ├── esl.go               # Event Socket Layer integration with worker pools
+├── cve.go               # ESL CVE guard: exploit signatures ban endpoints instantly
 ├── rate.go              # Sharded per-IP rate limiting with automatic cleanup
 ├── routes.go            # REST API with request processing pipeline
 ├── errors.go            # Sentinel errors
@@ -90,6 +92,10 @@ machine-dependent — the architecture below is the point):
   multi-source traffic
 - **Registration Hot Path**: in-place whitelist refresh + atomic statistics
   keep the worker off the lock and off the batch-ticker stall
+- **ESL CVE Guard**: signature checks on `MESSAGE`/`CHANNEL_CREATE` are
+  allocation-free (~80–100 ns per check; ~112 ns added to the channel-create
+  pipeline with the guard on), and the instant ban is synchronous for the
+  rare exploit event — never on the per-packet hot path
 - **Memory Efficiency**: pooled event objects, ~3 allocs/event in steady state
 - **Firewall**: kernel ipset (O(1) membership, in-kernel ban expiry) behind a
   single iptables rule
@@ -186,6 +192,13 @@ machine-dependent — the architecture below is the point):
     "reconnect_backoff": "5s",
     "max_wrong_call_states": 5,
     "wrong_call_state_window": "10m",
+    "mod_sms": {
+      "protection_enabled": true
+    },
+    "cve": {
+      "protection_enabled": true,
+      "block_duration": "24h"
+    },
     "rate_limit": {
       "enabled": true,
       "call_rate_limit": 20,
@@ -215,6 +228,9 @@ Override any configuration value using environment variables:
 | `SECURITY_MAX_FAILED_ATTEMPTS` | Failed attempts threshold | `10` |
 | `SECURITY_AUTO_BLOCK` | Enable auto-blocking | `true` |
 | `SECURITY_TRUSTED_NETWORKS` | Trusted networks (JSON array) | `["10.0.0.0/8"]` |
+| `SECURITY_MOD_SMS_PROTECTION` | Unload the vulnerable `mod_sms` module and re-apply on reload | `true` |
+| `SECURITY_CVE_PROTECTION` | Ban endpoints whose ESL events carry known CVE exploit signatures | `true` |
+| `SECURITY_CVE_BLOCK_DURATION` | Ban length for CVE guard blocks | `24h` |
 | `SECURITY_IPTABLES_CHAIN` | Chain holding the ipset match-set DROP rule | `INPUT` |
 | `SECURITY_IPSET_NAME` | Name of the managed ipset | `freeswitch-security` |
 | `SECURITY_DRY_RUN` | Log firewall actions without executing them | `true` |
@@ -432,6 +448,36 @@ The application uses **DROP** instead of **REJECT** for superior security:
 2. **Backup Configuration**: Regular config and whitelist backups
 3. **Access Control**: Use strong authentication for API access
 4. **Capacity Planning**: Monitor queue sizes and performance metrics
+
+### ESL CVE Guard
+
+FreeSWITCH advisories (the November 2026 batch) publish exploit markers that
+are visible on the event socket, and this daemon already inspects every ESL
+event on its worker path. When an event matches a known CVE exploit
+signature, the **sending endpoint is banned instantly** — the blacklist entry
+and the kernel ipset add are applied synchronously (no batch ticker) so the
+next packet of the attack dies in the kernel, and the ban is reported to
+chanDaemon for fleet-wide visibility and unban fan-out.
+
+| CVE | Signature | Action |
+|-----|-----------|--------|
+| **CVE-2026-116779** (9.8, CISA KEV, exploited) | `MESSAGE` event whose To user selects the `api` chat proto (`api+…`, case-insensitive) — routes the rest of the To user into `switch_api_execute()` | Ban `from_sip_ip` immediately |
+| **CVE-2026-116786** (8.8) | `CHANNEL_CREATE` with an injected `execute_on_originate=system` / `api_hangup_hook=system` (raw `sip_invite_params` block or applied variable) | Ban the leg's network IP and `uuid_kill` the channel |
+
+On every (re)connect the daemon also fingerprints the FreeSWITCH release via
+the `version` API and reports it — plus the tracked CVEs the release is still
+vulnerable to — in `GET /security/esl` (`freeswitchVersion`,
+`freeswitchVulnerableTo`) and the log. Bans are counted in
+`GET /security/stats` as `cveBlocks`.
+
+This is a compensating control, not the fix: an ESL event fires after the
+offending request already reached FreeSWITCH, so it cannot undo the first
+packet of a chain. It exists to ban the endpoint before the follow-up
+messages land, propagate the ban fleet-wide, and make attempts visible.
+**Upgrade FreeSWITCH to >= 1.11.3** (which closes CVE-2026-116779,
+-116572/-116573/-116783/-116784/-116785/-116786/-116790) and keep
+`enable-chat-api-proto` off on every Sofia profile; see
+[esl.md](esl.md) for the full security model.
 
 ## 📊 Performance Monitoring
 

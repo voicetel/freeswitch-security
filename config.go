@@ -50,6 +50,17 @@ type AppConfig struct {
 		ReconnectBackoff       string   `json:"reconnect_backoff"`
 		MaxWrongCallStates     int      `json:"max_wrong_call_states"`
 		WrongCallStateWindow   string   `json:"wrong_call_state_window"`
+		ModSMS                 struct {
+			ProtectionEnabled bool `json:"protection_enabled"`
+		} `json:"mod_sms"`
+		// CVE is the ESL CVE-exploit guard: when an ESL event carries a
+		// known FreeSWITCH CVE exploit signature (e.g. CVE-2026-116779's
+		// SIP MESSAGE api+ chat-proto selector), the sending endpoint is
+		// banned immediately for block_duration.
+		CVE struct {
+			ProtectionEnabled bool   `json:"protection_enabled"`
+			BlockDuration     string `json:"block_duration"`
+		} `json:"cve"`
 		// ChanDaemon is the D39 central IP-ban repository integration: this
 		// node reports every firewall block to chanDaemon, and chanDaemon
 		// pushes customer/operator unbans back to the unban endpoint
@@ -84,6 +95,11 @@ const defaultFreeSWITCHDomain = "example.com"
 // defaultIPTablesChain is the chain the single ipset match-set DROP rule is
 // inserted into; it must be a chain the kernel actually traverses.
 const defaultIPTablesChain = "INPUT"
+
+const (
+	envBoolTrue  = "true"
+	envBoolFalse = "false"
+)
 
 // projectName is the daemon's identity, reused as the default ipset name and
 // the chanDaemon service identity (D40).
@@ -172,6 +188,11 @@ func defaultConfig() *AppConfig {
 	cfg.Security.ReconnectBackoff = "5s"
 	cfg.Security.MaxWrongCallStates = 5
 	cfg.Security.WrongCallStateWindow = "10m"
+	cfg.Security.ModSMS.ProtectionEnabled = true
+
+	// CVE guard defaults: on, with a 24h ban for caught exploit endpoints.
+	cfg.Security.CVE.ProtectionEnabled = true
+	cfg.Security.CVE.BlockDuration = "24h"
 
 	// chanDaemon (D39) reporting + unban fan-out, on by default (fleet parity).
 	cfg.Security.ChanDaemon.Enabled = true
@@ -282,7 +303,7 @@ func envBool(key string, dst *bool) {
 	}
 
 	switch strings.ToLower(raw) {
-	case "true", "1", "yes":
+	case envBoolTrue, "1", "yes":
 		*dst = true
 	default:
 		*dst = false
@@ -362,6 +383,9 @@ func loadEnvironmentVariables(config *AppConfig) {
 	envString("SECURITY_RECONNECT_BACKOFF", &config.Security.ReconnectBackoff)
 	envInt("SECURITY_MAX_WRONG_CALL_STATES", &config.Security.MaxWrongCallStates)
 	envString("SECURITY_WRONG_CALL_STATE_WINDOW", &config.Security.WrongCallStateWindow)
+	envBool("SECURITY_MOD_SMS_PROTECTION", &config.Security.ModSMS.ProtectionEnabled)
+	envBool("SECURITY_CVE_PROTECTION", &config.Security.CVE.ProtectionEnabled)
+	envString("SECURITY_CVE_BLOCK_DURATION", &config.Security.CVE.BlockDuration)
 	envJSONStringSlice("SECURITY_TRUSTED_NETWORKS", &config.Security.TrustedNetworks)
 	envJSONStringSlice("SECURITY_UNTRUSTED_NETWORKS", &config.Security.UntrustedNetworks)
 

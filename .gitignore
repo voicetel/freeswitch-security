@@ -30,3 +30,4 @@ freeswitch-security
 
 # config file
 config.json
+.aider*

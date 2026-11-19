@@ -114,6 +114,7 @@ freeswitch-user ALL=(ALL) NOPASSWD: /sbin/ipset, /sbin/iptables
 | `ipset_name` | Name of the managed set (`freeswitch-security` by default). |
 | `dry_run` | When true, every `ipset`/`iptables` action is logged but not executed — useful for testing without privileges. |
 | `block_duration` | Default ban TTL, applied as the set entry timeout. Permanent bans use a zero (no-expiry) timeout. |
+| `cve.block_duration` | Ban TTL for endpoints caught by the ESL CVE guard (CVE-2026-116779 et al.); the guard applies it synchronously, bypassing the batch ticker. |
 
 ### Environment variable overrides
 

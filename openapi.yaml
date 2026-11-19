@@ -139,6 +139,7 @@ paths:
                 activeBlacklistEntries: 45
                 reportsSent: 312
                 reportsFailed: 0
+                cveBlocks: 2
 
   /cache/stats:
     get:
@@ -498,6 +499,11 @@ paths:
                 workerCount: 4
                 queueLength: 0
                 queueCapacity: 4096
+                modSMSProtectionEnabled: true
+                modSMSProtectionActive: true
+                cveProtectionEnabled: true
+                freeswitchVersion: "1.11.2"
+                freeswitchVulnerableTo: ["CVE-2026-116779"]
 
   /security/esl/log-level:
     post:
@@ -976,6 +982,9 @@ components:
         workerCount: { type: integer, example: 4, description: "event worker goroutines" }
         queueLength: { type: integer, example: 0, description: "queued events now" }
         queueCapacity: { type: integer, example: 4096, description: "total queue capacity" }
+        cveProtectionEnabled: { type: boolean, example: true, description: "ESL CVE guard on" }
+        freeswitchVersion: { type: string, example: "1.11.2", description: "FreeSWITCH release fingerprint (empty when unknown)" }
+        freeswitchVulnerableTo: { type: array, items: { type: string }, example: ["CVE-2026-116779"], description: "tracked CVEs the running FreeSWITCH release is vulnerable to" }
 
     LogLevelRequest:
       type: object
@@ -1076,3 +1085,4 @@ components:
         activeBlacklistEntries: { type: integer, example: 45, description: "current blacklist size" }
         reportsSent: { type: integer, example: 312, description: "chanDaemon reports accepted (reporting enabled only)" }
         reportsFailed: { type: integer, example: 0, description: "chanDaemon reports failed (reporting enabled only)" }
+        cveBlocks: { type: integer, example: 2, description: "endpoints banned by the ESL CVE guard (CVE-2026-116779 et al.)" }

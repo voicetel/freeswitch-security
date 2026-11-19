@@ -17,11 +17,11 @@ func TestEnvBool(t *testing.T) {
 		init bool
 		want bool
 	}{
-		{"true", false, true},
+		{envBoolTrue, false, true},
 		{"True", false, true},
 		{"YES", false, true},
 		{"1", false, true},
-		{"false", true, false},
+		{envBoolFalse, true, false},
 		{"FALSE", true, false},
 		{"0", true, false},
 		{"no", true, false},
@@ -144,8 +144,8 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("DefaultDomain = %q", cfg.FreeSWITCH.DefaultDomain)
 	}
 
-	if !cfg.Security.Enabled || !cfg.Cache.Enabled || !cfg.Security.RateLimit.Enabled {
-		t.Error("security, cache, and rate limiting must default to enabled")
+	if !cfg.Security.Enabled || !cfg.Cache.Enabled || !cfg.Security.RateLimit.Enabled || !cfg.Security.ModSMS.ProtectionEnabled {
+		t.Error("security, cache, rate limiting, and mod_sms protection must default to enabled")
 	}
 
 	if len(cfg.Security.TrustedNetworks) != 4 {
@@ -277,6 +277,7 @@ func TestBuildConfig_OpenFails(t *testing.T) {
 func TestBuildConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("SERVER_PORT", "7777")
 	t.Setenv("SECURITY_RATE_LIMIT_CALL_LIMIT", "123")
+	t.Setenv("SECURITY_MOD_SMS_PROTECTION", "false")
 
 	path := filepath.Join(t.TempDir(), "config.json")
 
@@ -291,5 +292,9 @@ func TestBuildConfig_EnvOverrides(t *testing.T) {
 
 	if cfg.Security.RateLimit.CallRateLimit != 123 {
 		t.Errorf("rate-limit override not applied: %d", cfg.Security.RateLimit.CallRateLimit)
+	}
+
+	if cfg.Security.ModSMS.ProtectionEnabled {
+		t.Error("SECURITY_MOD_SMS_PROTECTION=false override not applied")
 	}
 }

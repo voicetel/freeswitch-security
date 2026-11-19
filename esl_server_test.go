@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,16 +20,23 @@ import (
 // ESLManager: auth handshake, command/reply for every command, and
 // text/event-plain event delivery.
 type fakeESL struct {
-	tb         testing.TB
-	ln         net.Listener
-	password   string
-	rejectAuth bool
-	replyError bool
-	apiBody    string // when set, "api ..." commands get an api/response with this body
+	tb                     testing.TB
+	ln                     net.Listener
+	password               string
+	rejectAuth             bool
+	replyError             bool
+	apiBody                string // when set, "api ..." commands get an api/response with this body
+	moduleLoaded           bool
+	unloadError            bool
+	unloadReply            string
+	keepLoaded             bool
+	existsBody             string
+	existsErrorAfterUnload bool
 
-	mu       sync.Mutex
-	conns    []net.Conn
-	commands []string
+	mu          sync.Mutex
+	conns       []net.Conn
+	commands    []string
+	existsCalls int
 }
 
 func newFakeESL(tb testing.TB) *fakeESL {
@@ -41,7 +49,7 @@ func newFakeESL(tb testing.TB) *fakeESL {
 		tb.Fatalf("fake ESL listen: %v", err)
 	}
 
-	srv := &fakeESL{tb: tb, ln: ln, password: testESLPassword}
+	srv := &fakeESL{tb: tb, ln: ln, password: testESLPassword, moduleLoaded: true}
 
 	go srv.acceptLoop()
 
@@ -144,15 +152,87 @@ func (s *fakeESL) handle(conn net.Conn) {
 		s.commands = append(s.commands, cmd)
 		s.mu.Unlock()
 
+		if s.replyError {
+			s.writef(conn, "Content-Type: command/reply\nReply-Text: -ERR denied\n\n")
+
+			continue
+		}
+
 		switch {
+		case cmd == modSMSExistsCommand:
+			if !s.handleModuleExists(conn) {
+				return
+			}
+		case cmd == modSMSUnloadCommand:
+			s.handleModuleUnload(conn)
 		case s.apiBody != "" && strings.HasPrefix(cmd, "api "):
 			s.writef(conn, "Content-Type: api/response\nContent-Length: %d\n\n%s", len(s.apiBody), s.apiBody)
-		case s.replyError:
-			s.writef(conn, "Content-Type: command/reply\nReply-Text: -ERR denied\n\n")
 		default:
 			s.writef(conn, "Content-Type: command/reply\nReply-Text: +OK %s\n\n", cmd)
 		}
 	}
+}
+
+func (s *fakeESL) handleModuleExists(conn net.Conn) bool {
+	s.mu.Lock()
+	loaded := s.moduleLoaded
+	s.existsCalls++
+	existsError := s.existsErrorAfterUnload && s.existsCalls > 1
+	response := s.existsBody
+	s.mu.Unlock()
+
+	if existsError {
+		_ = conn.Close()
+
+		return false
+	}
+
+	if response == "" {
+		response = strconv.FormatBool(loaded)
+	}
+
+	s.writef(conn, "Content-Type: api/response\nContent-Length: %d\n\n%s", len(response), response)
+
+	return true
+}
+
+func (s *fakeESL) handleModuleUnload(conn net.Conn) {
+	if s.unloadError {
+		s.writeAPIResponse(conn, "-ERR unload denied")
+
+		return
+	}
+
+	if s.unloadReply != "" {
+		s.writeAPIResponse(conn, s.unloadReply)
+
+		return
+	}
+
+	if !s.keepLoaded {
+		s.mu.Lock()
+		s.moduleLoaded = false
+		s.mu.Unlock()
+	}
+
+	s.writeAPIResponse(conn, "+OK\n")
+}
+
+func (s *fakeESL) writeAPIResponse(conn net.Conn, body string) {
+	s.writef(conn, "Content-Type: api/response\nContent-Length: %d\n\n%s", len(body), body)
+}
+
+func (s *fakeESL) setModuleLoaded(loaded bool) {
+	s.mu.Lock()
+	s.moduleLoaded = loaded
+	s.mu.Unlock()
+}
+
+func (s *fakeESL) isModuleLoaded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.moduleLoaded
 }
 
 // sendEvent pushes a text/event-plain message to the most recent connection.
@@ -192,9 +272,36 @@ func (s *fakeESL) commandSeen(substr string) bool {
 	return false
 }
 
+func (s *fakeESL) commandCount(substr string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+
+	for _, command := range s.commands {
+		if strings.Contains(command, substr) {
+			count++
+		}
+	}
+
+	return count
+}
+
 // newServerESLManager builds an ESLManager wired to the fake server and runs
 // its real connection loop and worker pool.
 func newServerESLManager(tb testing.TB, srv *fakeESL, workers, queueSize int) *ESLManager {
+	tb.Helper()
+
+	return newServerESLManagerWithProtection(tb, srv, workers, queueSize, false)
+}
+
+func newProtectedServerESLManager(tb testing.TB, srv *fakeESL) *ESLManager {
+	tb.Helper()
+
+	return newServerESLManagerWithProtection(tb, srv, 1, 16, true)
+}
+
+func newServerESLManagerWithProtection(tb testing.TB, srv *fakeESL, workers, queueSize int, protectionEnabled bool) *ESLManager {
 	tb.Helper()
 
 	sm := newTestSecurityManager(tb)
@@ -212,13 +319,15 @@ func newServerESLManager(tb testing.TB, srv *fakeESL, workers, queueSize int) *E
 			ReconnectBackoff: "50ms",
 			WorkerCount:      workers,
 		},
-		eslDisconnected: make(chan bool, 1),
-		rateManager:     rm,
-		queueSize:       queueSize,
-		workerCount:     workers,
-		eventPool:       NewEventPool(),
-		ctx:             ctx,
-		cancel:          cancel,
+		eslDisconnected:         make(chan bool, 1),
+		rateManager:             rm,
+		queueSize:               queueSize,
+		workerCount:             workers,
+		eventPool:               NewEventPool(),
+		modSMSProtectionEnabled: protectionEnabled,
+		cveProtectionEnabled:    true,
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
 
 	em.startWorkerPool()
@@ -241,13 +350,18 @@ func TestESLManager_ConnectSubscribeProcess(t *testing.T) {
 		t.Fatal("manager never connected to fake ESL server")
 	}
 
-	// subscribeToEvents must have registered all four event subscriptions.
+	// subscribeToEvents must have registered every event subscription
+	// (three CUSTOM subclasses plus CHANNEL_CREATE, MESSAGE, MODULE_LOAD).
 	if !waitFor(func() bool { return srv.commandSeen(eventSubRegisterFail) }) {
 		t.Error("expected register_failure subscription")
 	}
 
 	if !srv.commandSeen(eventNameChannelCreate) {
 		t.Error("expected CHANNEL_CREATE subscription")
+	}
+
+	if !srv.commandSeen("event plain " + eventNameMessage) {
+		t.Error("expected MESSAGE subscription")
 	}
 
 	// Deliver a failed-registration event through the real read path and
@@ -275,6 +389,230 @@ func TestESLManager_ConnectSubscribeProcess(t *testing.T) {
 	stats := em.GetESLStats()
 	if stats["connected"] != true {
 		t.Errorf("GetESLStats connected = %v, want true", stats["connected"])
+	}
+}
+
+func TestESLManager_ModSMSProtection_UnloadsAndVerifies(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool {
+		return em.modSMSProtectionActive.Load()
+	}) {
+		t.Fatal("mod_sms protection did not become active")
+	}
+
+	if srv.isModuleLoaded() {
+		t.Error("mod_sms remained loaded")
+	}
+
+	if got := srv.commandCount(modSMSUnloadCommand); got != 1 {
+		t.Errorf("unload command count = %d, want 1", got)
+	}
+
+	if got := srv.commandCount(modSMSExistsCommand); got != 2 {
+		t.Errorf("module_exists command count = %d, want 2", got)
+	}
+
+	if srv.commandSeen("unload -f") {
+		t.Error("mod_sms protection must not use force unload")
+	}
+
+	stats := em.GetESLStats()
+	if stats["modSMSProtectionEnabled"] != true || stats["modSMSProtectionActive"] != true {
+		t.Errorf("unexpected mod_sms stats: %#v", stats)
+	}
+}
+
+func TestESLManager_ModSMSProtection_HandlesReload(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool { return em.modSMSProtectionActive.Load() }) {
+		t.Fatal("mod_sms protection did not become active")
+	}
+
+	initialUnloads := srv.commandCount(modSMSUnloadCommand)
+
+	srv.setModuleLoaded(true)
+	srv.sendEvent(map[string]string{
+		hdrEventName:        eventNameModuleLoad,
+		moduleLoadKeyHeader: modSMSModuleName,
+	})
+
+	if !waitFor(func() bool {
+		return srv.commandCount(modSMSUnloadCommand) > initialUnloads &&
+			!srv.isModuleLoaded() && em.modSMSProtectionActive.Load()
+	}) {
+		t.Fatal("mod_sms protection did not re-apply after module load")
+	}
+}
+
+func TestESLManager_ModSMSProtection_IgnoresOtherModuleLoads(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool { return em.modSMSProtectionActive.Load() }) {
+		t.Fatal("mod_sms protection did not become active")
+	}
+
+	initialUnloads := srv.commandCount(modSMSUnloadCommand)
+	initialEvents := em.statistics.EventsProcessed.Load()
+
+	srv.sendEvent(map[string]string{
+		hdrEventName:             eventNameModuleLoad,
+		moduleLoadFilenameHeader: "/usr/lib/freeswitch/mod_sofia.so",
+	})
+
+	if !waitFor(func() bool {
+		return em.statistics.EventsProcessed.Load() > initialEvents
+	}) {
+		t.Fatal("unrelated MODULE_LOAD event was not processed")
+	}
+
+	if got := srv.commandCount(modSMSUnloadCommand); got != initialUnloads {
+		t.Errorf("unrelated module load triggered unload: count=%d, want %d", got, initialUnloads)
+	}
+}
+
+func TestESLManager_ModSMSProtection_ModuleAbsent(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.setModuleLoaded(false)
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool { return em.modSMSProtectionActive.Load() }) {
+		t.Fatal("protection did not become active when mod_sms was absent")
+	}
+
+	if got := srv.commandCount(modSMSUnloadCommand); got != 0 {
+		t.Errorf("unload command count = %d, want 0", got)
+	}
+}
+
+func TestESLManager_ModSMSProtection_UnloadFailureIsInactive(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.unloadError = true
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool {
+		return srv.commandCount(modSMSUnloadCommand) > 0
+	}) {
+		t.Fatal("protection did not attempt to unload mod_sms")
+	}
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active after unload failure")
+	}
+
+	if !srv.isModuleLoaded() {
+		t.Error("fake module should remain loaded after unload failure")
+	}
+}
+
+func TestESLManager_ModSMSProtection_UnexpectedExistsResponse(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.existsBody = unknownUser
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool { return srv.commandSeen(modSMSExistsCommand) }) {
+		t.Fatal("protection did not check mod_sms")
+	}
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active for an unexpected module_exists response")
+	}
+
+	if srv.commandSeen(modSMSUnloadCommand) {
+		t.Error("unexpected module_exists response must not trigger unload")
+	}
+}
+
+func TestESLManager_ModSMSProtection_UnloadReplyFailureIsInactive(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.unloadReply = "denied"
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool { return srv.commandSeen(modSMSUnloadCommand) }) {
+		t.Fatal("protection did not attempt to unload mod_sms")
+	}
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active after a non-success unload reply")
+	}
+
+	if !srv.isModuleLoaded() {
+		t.Error("fake module should remain loaded after a non-success unload reply")
+	}
+}
+
+func TestESLManager_ModSMSProtection_VerificationFailureIsInactive(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.keepLoaded = true
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool {
+		return srv.commandCount(modSMSExistsCommand) >= 2
+	}) {
+		t.Fatal("protection did not verify the unload")
+	}
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active while mod_sms remained loaded")
+	}
+}
+
+func TestESLManager_ModSMSProtection_VerificationErrorIsInactive(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	srv.existsErrorAfterUnload = true
+	em := newProtectedServerESLManager(t, srv)
+
+	if !waitFor(func() bool {
+		return srv.commandCount(modSMSExistsCommand) >= 2
+	}) {
+		t.Fatal("protection did not issue the verification query")
+	}
+
+	if em.modSMSProtectionActive.Load() {
+		t.Error("protection reported active after verification error")
+	}
+}
+
+func TestESLManager_ModSMSProtection_Disabled(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeESL(t)
+	em := newServerESLManager(t, srv, 1, 16)
+
+	if !waitFor(func() bool {
+		return em.IsConnected() && srv.commandSeen("event plain "+eventNameModuleLoad)
+	}) {
+		t.Fatal("manager did not connect and subscribe to MODULE_LOAD")
+	}
+
+	if srv.commandSeen(modSMSExistsCommand) || srv.commandSeen(modSMSUnloadCommand) {
+		t.Error("disabled mod_sms protection sent module guard commands")
+	}
+
+	if !srv.isModuleLoaded() {
+		t.Error("disabled mod_sms protection altered module state")
 	}
 }
 
@@ -564,7 +902,7 @@ func TestESLManager_SendCommand_BodyFallback(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeESL(t)
-	srv.apiBody = "FreeSWITCH is ready"
+	srv.apiBody = testFSReady
 
 	em := newServerESLManager(t, srv, 1, 8)
 
@@ -577,7 +915,7 @@ func TestESLManager_SendCommand_BodyFallback(t *testing.T) {
 		t.Fatalf("SendCommand: %v", err)
 	}
 
-	if resp != "FreeSWITCH is ready" {
+	if resp != testFSReady {
 		t.Errorf("response = %q, want api body", resp)
 	}
 }

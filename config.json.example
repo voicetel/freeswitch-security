@@ -46,6 +46,13 @@
     "reconnect_backoff": "5s",
     "max_wrong_call_states": 5,
     "wrong_call_state_window": "10m",
+    "mod_sms": {
+      "protection_enabled": true
+    },
+    "cve": {
+      "protection_enabled": true,
+      "block_duration": "24h"
+    },
     "chandaemon": {
       "enabled": true,
       "report_url": "https://ipban.support.voicetel.com/api/v1/ip-bans/report",

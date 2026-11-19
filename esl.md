@@ -234,6 +234,70 @@ done
 
 ## 🔒 Security Model
 
+### `mod_sms` protection
+
+The security manager protects legacy FreeSWITCH installations from the
+`mod_sms` SIP `MESSAGE` to `api+system` command path by default. On each ESL
+connection it checks for `mod_sms`, unloads exactly that module without force,
+and verifies that it is absent. It also watches `MODULE_LOAD` events and
+re-applies the same guard if `mod_sms` is loaded later.
+
+This deliberately affects only `mod_sms`; it does not block SIP profiles,
+Sofia, calls, registrations, or other FreeSWITCH modules. The tradeoff is that
+the `mod_sms` messaging functionality is unavailable while protection is
+enabled. Set `security.mod_sms.protection_enabled` to `false` only when the
+operator has separately upgraded/configured FreeSWITCH to deny the SIP API chat
+protocol. A failed check or unload is reported as inactive protection in ESL
+stats and the log; the daemon does not claim the module is protected.
+
+For supported current FreeSWITCH releases, the narrower native mitigation is
+preferred: keep `enable-chat-api-proto` disabled on every Sofia profile. The
+external guard remains useful as a compensating control for the confirmed
+1.10.2 behavior, where that profile setting is not available.
+
+### ESL CVE guard
+
+FreeSWITCH's November 2026 advisory batch (CVE-2026-116779, the exploited
+SIP `MESSAGE` → `api` chat-proto RCE, and its relatives CVE-2026-116572,
+-116573, -116783, -116784, -116785, -116786, -116790) publishes exploit
+markers that are visible on the event socket. The daemon subscribes to the
+first-class `MESSAGE` event and inspects every `CHANNEL_CREATE`; when an
+event matches a known signature, the sending endpoint is banned
+**instantly** — the blacklist entry and kernel ipset add are applied
+synchronously, bypassing the 100ms batch ticker, because the next packet of
+an exploit chain can be the one that executes code.
+
+| Signature | Event | What is banned |
+|-----------|-------|----------------|
+| CVE-2026-116779: To user with the literal `api+` prefix (case-insensitive) | `MESSAGE` | the SIP peer (`from_sip_ip`) |
+| CVE-2026-116786: applied `execute_on_originate` starting with `system`, or a raw `sip_invite_params` block containing `execute_on_originate=system` / `api_hangup_hook=system` | `CHANNEL_CREATE` | the leg's network IP; the channel is also `uuid_kill`ed |
+
+Whitelisted and trusted-network IPs are never banned; repeat attempts are
+no-ops; every ban is mirrored to chanDaemon (when reporting is enabled) and
+counted as `cveBlocks` in `/security/stats`. On every connect the daemon
+fingerprints the FreeSWITCH release (`api version`) and exposes it — with the
+tracked CVEs it is still vulnerable to — via `/security/esl`
+(`freeswitchVersion`, `freeswitchVulnerableTo`, `cveProtectionEnabled`).
+
+Configuration (`security.cve`):
+
+```json
+"cve": {
+  "protection_enabled": true,
+  "block_duration": "24h"
+}
+```
+
+Scope and limits: an ESL event fires after the offending request already
+reached FreeSWITCH, so the guard cannot undo the first packet of an exploit
+chain — it bans the endpoint before the follow-up messages land. For
+CVE-2026-116786 the ban applies to the leg carrying the markers (for the
+off-box transfer case that is the transfer target's endpoint, which the
+attacker controls); the REFER sender itself is a registered account and is
+best contained by upgrading. Upgrading FreeSWITCH to >= 1.11.3 and keeping
+`enable-chat-api-proto` disabled on every Sofia profile is the required
+remediation; this guard is the compensating control in front of it.
+
 ### Command Validation Process
 
 1. **Whitelist Check**: Verify command is in allowed list
@@ -434,7 +498,12 @@ curl -s http://127.0.0.1:8088/security/esl | jq '.'
   "logLevel": "info",
   "workerCount": 4,
   "queueLength": 15,
-  "queueCapacity": 4096
+  "queueCapacity": 4096,
+  "modSMSProtectionEnabled": true,
+  "modSMSProtectionActive": true,
+  "cveProtectionEnabled": true,
+  "freeswitchVersion": "1.11.2",
+  "freeswitchVulnerableTo": ["CVE-2026-116779"]
 }
 ```
 
